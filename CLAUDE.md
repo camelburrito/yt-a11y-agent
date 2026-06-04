@@ -65,13 +65,16 @@ surface + pathname so the agent can orient itself.
 
 ## Open questions — resolve empirically, not by reading specs
 
-1. **API namespace: `document.modelContext` vs `navigator.modelContext`.** Spec draft and
-   Chrome docs disagree. We probe both. Confirm which one Chrome actually populates today
-   and note the build/flag.
-2. **Permissions Policy for `tools` on youtube.com.** The `tools` policy defaults to
-   `self`. Does a *main-world-injected* script (us, not YouTube's own code) count as
-   same-origin for registration, or does YouTube need to delegate? Should pass, but it's a
-   **day-one spike** — if `registerTool` throws/no-ops, this is why.
+1. ~~**API namespace: `document.modelContext` vs `navigator.modelContext`.**~~
+   **RESOLVED (2026-06-04, Chrome + `#enable-webmcp-testing`):** Chrome populates
+   **`navigator.modelContext`**; `document.modelContext` is `undefined`. The provider
+   object is a `ModelContext` whose only method is **`registerTool(tool, { signal })`** —
+   there is no `listTools`/`callTool` on the provider side; invocation is the MCP
+   consumer's job. We keep the `??` probe in case Chrome relocates it.
+2. ~~**Permissions Policy for `tools` on youtube.com.**~~
+   **RESOLVED (2026-06-04):** A main-world-injected script registers fine on youtube.com
+   under the default `tools` policy — `registered 5 tool(s)` on home, no throw. The
+   day-one spike passed.
 3. **PiP transient user activation.** `requestPictureInPicture()` needs a real gesture. A
    tool call may not carry activation. Measure `navigator.userActivation.isActive` inside
    an `enter_pip` tool; if false, fall back to actuating the real PiP button

@@ -44,18 +44,27 @@
   // ---------------------------------------------------------------------------
   const SEL = {
     home: {
-      // A feed tile on the home grid (and most /feed surfaces).
+      // A feed tile on the home grid (and most /feed surfaces). The tile wrapper is
+      // still ytd-rich-item-renderer, but its CONTENTS are now the newer
+      // yt-lockup-view-model component, whose classes are camelCase (no hyphens),
+      // e.g. ytLockupMetadataViewModelTitle. Old #video-title ids no longer exist
+      // here; they're kept below only as fallbacks for other/older surfaces.
       feedItem: "ytd-rich-item-renderer",
-      title: "#video-title, a#video-title-link, yt-formatted-string#video-title",
-      // Anchor we read the canonical /watch URL from.
-      link: "a#video-title-link, a#thumbnail",
+      // Title text AND canonical /watch link — in the lockup the title is the anchor.
+      title: "a.ytLockupMetadataViewModelTitle, a#video-title-link, #video-title",
+      // Fallback link selectors if the title element isn't itself an <a>.
+      link: "a.ytLockupMetadataViewModelTitle, a#video-title-link, a#thumbnail",
+      // Channel link, found inside a metadata row.
       channel:
-        "ytd-channel-name #text, #channel-name #text, #text.ytd-channel-name a",
-      // Two spans: typically [views, age].
-      meta: "#metadata-line span",
-      // Thumbnail duration overlay.
+        "a[href^='/@'], a[href*='/channel/'], a[href*='/c/'], ytd-channel-name #text",
+      // Each metadata line span (e.g. "12K views", "2 hours ago"). The channel row is
+      // also a MetadataText span; readHomeFeed filters it out of the meta string.
+      meta: ".ytContentMetadataViewModelMetadataText, #metadata-line span",
+      // Thumbnail badges. Broad on purpose (case-insensitive) because the duration
+      // badge container class is volatile; readHomeFeed keeps only the mm:ss value,
+      // which also skips "LIVE"/"4K"/"NEW" badges.
       duration:
-        "ytd-thumbnail-overlay-time-status-renderer #text, #time-status #text, badge-shape div.badge-shape__text",
+        "[class*='Badge' i], ytd-thumbnail-overlay-time-status-renderer #text, .badge-shape__text",
     },
 
     search: {
@@ -127,20 +136,29 @@
     const out = [];
     for (let i = 0; i < items.length && out.length < limit; i++) {
       const el = items[i];
-      const linkEl = el.querySelector(SEL.home.link);
-      const title = qsText(el, SEL.home.title);
+      const titleEl = el.querySelector(SEL.home.title);
+      const title = txt(titleEl);
       if (!title) continue; // skip ads / shelves / non-video tiles
-      const metaSpans = Array.from(el.querySelectorAll(SEL.home.meta)).map(txt).filter(Boolean);
+      // In the lockup component the title element IS the /watch anchor; older layouts
+      // use a separate link. Fall back to any /watch anchor in the tile.
+      const linkEl =
+        (titleEl && titleEl.tagName === "A" ? titleEl : null) ||
+        el.querySelector(SEL.home.link) ||
+        el.querySelector('a[href*="/watch"]');
       let url = linkEl ? linkEl.getAttribute("href") : "";
       if (url && url.startsWith("/")) url = "https://www.youtube.com" + url;
-      out.push({
-        index: out.length,
-        title,
-        channel: qsText(el, SEL.home.channel),
-        meta: metaSpans.join(" · "),
-        duration: qsText(el, SEL.home.duration),
-        url,
-      });
+      const channel = qsText(el, SEL.home.channel);
+      // Metadata rows minus the channel row -> "12K views · 2 hours ago".
+      const meta = Array.from(el.querySelectorAll(SEL.home.meta))
+        .map(txt)
+        .filter((t) => t && t !== channel)
+        .join(" · ");
+      // Thumbnail badges include duration; keep only an mm:ss value (skips "LIVE" etc.).
+      const duration =
+        Array.from(el.querySelectorAll(SEL.home.duration))
+          .map(txt)
+          .find((t) => /^\d+:\d{2}/.test(t)) || "";
+      out.push({ index: out.length, title, channel, meta, duration, url });
     }
     return out;
   }
