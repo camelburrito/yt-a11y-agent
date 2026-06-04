@@ -37,9 +37,10 @@ user's existing assistive tech reports stays authoritative.
   text; the speaking happens elsewhere.
 - **Three layers.** (1) *Discovery/opt-in* — browser/AT surfaces the agent to a screen-
   reader user, who opts in (platform-owned; harness simulates via `ytAgent.activate()`).
-  (2) *Consumer agent* — the MCP client (LLM + voice) that lists/calls our tools; dev
-  harness at `src/agent/dev-agent.user.js`, production = MV3 extension (LLM call off-page
-  to dodge YouTube CSP). (3) *Provider* — this userscript. The agent UX is **orient →
+  (2) *Consumer agent* — the MCP client (on-device Gemini Nano via the Prompt API + Web
+  Speech) that lists/calls our tools; dev harness at `src/agent/dev-agent.user.js`,
+  production = MV3 extension (for persistence across navigations + out-of-page UI; the
+  model is on-device so CSP is a non-issue). (3) *Provider* — this userscript. UX is **orient →
   offer a short spoken menu → act on confirmation → don't autoplay**. Full flow + gotchas
   (CSP, in-page nav reset) in `docs/HANDOFF.md`.
 

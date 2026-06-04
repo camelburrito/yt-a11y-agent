@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         YouTube A11y Agent — Dev Consumer + Voice
+// @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.1.0
-// @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Claude + Web Speech. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md (the real consumer is an MV3 extension).
+// @version      0.2.0
+// @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
 // @run-at       document-idle
@@ -16,18 +16,17 @@
 // provider's initial registrations. If loaded after, just navigate once (route changes
 // re-register, and the wrapper catches them then).
 //
-// CSP NOTE: YouTube's Content-Security-Policy may block fetch() to api.anthropic.com from
-// the page. If the Claude transport fails, exercise the loop with ytAgent.useTransport().
-// The production fix is the MV3 extension (LLM call in the background worker, off-page).
+// ENGINE: Chrome built-in Gemini Nano via the Prompt API (LanguageModel). On-device, so
+// there is NO API key and NO external network call — which also means YouTube's CSP is a
+// non-issue here. Requires Chrome flags:
+//   chrome://flags/#prompt-api-for-gemini-nano
+//   chrome://flags/#optimization-guide-on-device-model   (set to "Enabled BypassPerfRequirement")
+// The model may download on first use (watch the console for progress).
 
 (function () {
   "use strict";
 
   const LOG = "[yt-a11y-agent]";
-  const KEY_STORE = "ytA11yAnthropicKey";
-  const DEFAULT_MODEL = "claude-opus-4-8"; // swap to claude-haiku-4-5 / sonnet for lower latency
-  const MAX_HOPS = 6; // max tool-use round trips per ask()
-
   const log = (...a) => console.log(LOG, ...a);
 
   function getModelContext() {
@@ -38,9 +37,18 @@
     );
   }
 
+  // Resolve the Prompt API across naming generations: the current `LanguageModel` global,
+  // and the older `ai.languageModel` namespaces.
+  function getLanguageModel() {
+    if (typeof LanguageModel !== "undefined") return LanguageModel;
+    if (typeof self !== "undefined" && self.ai && self.ai.languageModel) return self.ai.languageModel;
+    if (typeof window !== "undefined" && window.ai && window.ai.languageModel) return window.ai.languageModel;
+    return null;
+  }
+
   // ---------------------------------------------------------------------------
-  // System prompt — defines the agent's behavior, including the proactive,
-  // orient-first greeting and the "offer a short spoken menu, don't autoplay" stance.
+  // System prompt — defines behavior, including the proactive, orient-first greeting
+  // and the "offer a short spoken menu, don't autoplay" stance.
   // ---------------------------------------------------------------------------
   const SYSTEM = [
     "You are the YouTube Accessibility Agent. A user who relies on a screen reader (such as VoiceOver) has opted to let you help them use YouTube hands-free. They CANNOT see the screen — every reply is read aloud.",
@@ -57,13 +65,13 @@
   ].join("\n");
 
   // ===========================================================================
-  // LAYER 2a — CONSUMER BRIDGE (MCP client side).
-  // The provider's ModelContext only exposes registerTool — there's no list/call. So we
-  // wrap registerTool to capture every tool as it registers, and honor its AbortSignal to
-  // drop it on unregister (route changes). That gives us a live tool registry to drive.
+  // CONSUMER BRIDGE (MCP client side).
+  // The provider's ModelContext only exposes registerTool — no list/call. So we wrap
+  // registerTool to capture every tool as it registers, and honor its AbortSignal to drop
+  // it on unregister (route changes). That gives us a live tool registry to drive.
   // ===========================================================================
   const consumer = (() => {
-    const tools = new Map(); // name -> tool object { name, description, inputSchema, execute }
+    const tools = new Map(); // name -> { name, description, inputSchema, execute }
     let wrapped = false;
 
     function wrap() {
@@ -88,23 +96,28 @@
       wrap,
       isReady: () => wrapped,
       list: () => [...tools.values()],
-      // Anthropic tool-definition shape (note: our tools use inputSchema -> input_schema).
-      asAnthropicTools: () =>
+      signature: () => [...tools.keys()].sort().join(","),
+      // Wrap captured WebMCP tools into Prompt-API tools. The shapes nearly match; we only
+      // flatten the WebMCP { content:[{text}] } envelope down to a string for the model.
+      asPromptApiTools: () =>
         [...tools.values()].map((t) => ({
           name: t.name,
           description: t.description,
-          input_schema: t.inputSchema || { type: "object", properties: {} },
+          inputSchema: t.inputSchema || { type: "object", properties: {} },
+          async execute(args) {
+            const out = await t.execute(args || {});
+            const text = (out && out.content ? out.content : [])
+              .map((c) => c.text)
+              .filter(Boolean)
+              .join("\n");
+            return text || "(no textual result)";
+          },
         })),
-      call: async (name, args) => {
-        const t = tools.get(name);
-        if (!t) throw new Error(`Tool not registered: ${name}`);
-        return t.execute(args || {});
-      },
     };
   })();
 
   // ===========================================================================
-  // LAYER 2-voice — VOICE (Web Speech). Out-of-band from tools; tools stay text-only.
+  // VOICE (Web Speech). Out-of-band from tools; tools stay text-only.
   // ===========================================================================
   const voice = (() => {
     const synth = typeof window !== "undefined" ? window.speechSynthesis : null;
@@ -148,98 +161,91 @@
   })();
 
   // ===========================================================================
-  // LAYER 2b — LLM TRANSPORT (Claude Messages API w/ tool use + prompt caching).
-  // Pluggable: ytAgent.useTransport(fn) swaps it (mock for testing, or an extension bridge
-  // that calls the model off-page to dodge YouTube's CSP).
-  // ===========================================================================
-  function getKey() {
-    try {
-      return sessionStorage.getItem(KEY_STORE) || "";
-    } catch (_) {
-      return "";
-    }
-  }
-
-  async function claudeTransport({ system, messages, tools }) {
-    const key = getKey();
-    if (!key) throw new Error("No Anthropic key. Call ytAgent.setKey('sk-ant-...') first.");
-    // Cache the (stable) system prompt and tool definitions across turns.
-    const body = {
-      model: state.model,
-      max_tokens: 1024,
-      system: [{ type: "text", text: system, cache_control: { type: "ephemeral" } }],
-      tools: tools.map((t, i) =>
-        i === tools.length - 1 ? { ...t, cache_control: { type: "ephemeral" } } : t
-      ),
-      messages,
-    };
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": key,
-        "anthropic-version": "2023-06-01",
-        // Required for direct browser calls; also why this is dev-only (key is in the page).
-        "anthropic-dangerous-direct-browser-access": "true",
-      },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      const detail = await res.text().catch(() => "");
-      throw new Error(`Anthropic ${res.status}: ${detail.slice(0, 300)}`);
-    }
-    return res.json();
-  }
-
-  // ===========================================================================
-  // LAYER 2c — AGENT LOOP.
+  // ENGINE — Chrome built-in Gemini Nano (Prompt API) with native tool calling.
+  // The session is bound to the tools captured at creation time; tools are route-scoped,
+  // so we rebuild the session when the captured tool set changes. Pluggable via
+  // ytAgent.useEngine(fn) for mock testing.
   // ===========================================================================
   const state = {
-    model: DEFAULT_MODEL,
-    transport: claudeTransport,
-    messages: [], // running conversation (Anthropic format)
+    engine: null, // set to geminiEngine below
+    session: null,
+    sessionSig: null,
   };
 
-  async function ask(utterance) {
-    if (!utterance || !utterance.trim()) return "";
-    state.messages.push({ role: "user", content: utterance });
-
-    for (let hop = 0; hop < MAX_HOPS; hop++) {
-      const tools = consumer.asAnthropicTools();
-      const resp = await state.transport({ system: SYSTEM, messages: state.messages, tools });
-      state.messages.push({ role: "assistant", content: resp.content });
-
-      const toolUses = (resp.content || []).filter((b) => b.type === "tool_use");
-      if (resp.stop_reason !== "tool_use" || toolUses.length === 0) {
-        const text = (resp.content || [])
-          .filter((b) => b.type === "text")
-          .map((b) => b.text)
-          .join(" ")
-          .trim();
-        log(`reply: ${text}`);
-        return text;
-      }
-
-      const toolResults = [];
-      for (const tu of toolUses) {
-        log(`tool_use: ${tu.name}(${JSON.stringify(tu.input || {})})`);
-        let content;
-        try {
-          const out = await consumer.call(tu.name, tu.input || {});
-          content = out && out.content ? out.content : [{ type: "text", text: String(out) }];
-        } catch (e) {
-          content = [{ type: "text", text: "Tool error: " + e.message }];
-        }
-        toolResults.push({ type: "tool_result", tool_use_id: tu.id, content });
-      }
-      state.messages.push({ role: "user", content: toolResults });
+  async function availability() {
+    const LM = getLanguageModel();
+    if (!LM) return "no-api";
+    try {
+      if (LM.availability) return await LM.availability(); // available|downloadable|downloading|unavailable
+      if (LM.capabilities) return (await LM.capabilities()).available; // readily|after-download|no
+    } catch (e) {
+      return "error: " + e.message;
     }
-    return "Sorry, I couldn't complete that — it took too many steps.";
+    return "unknown";
   }
 
-  // Simulates layer 1 (the browser/AT opt-in handoff): greet + orient proactively.
+  function destroySession() {
+    if (state.session && typeof state.session.destroy === "function") {
+      try {
+        state.session.destroy();
+      } catch (_) {}
+    }
+    state.session = null;
+    state.sessionSig = null;
+  }
+
+  async function ensureSession() {
+    const sig = consumer.signature();
+    if (state.session && state.sessionSig === sig) return state.session;
+    destroySession(); // toolset changed (route change) or first run -> rebuild
+
+    const LM = getLanguageModel();
+    if (!LM) {
+      throw new Error(
+        "Chrome built-in AI (Prompt API) not found. Enable chrome://flags/#prompt-api-for-gemini-nano and #optimization-guide-on-device-model, then restart Chrome."
+      );
+    }
+    const avail = await availability();
+    if (avail === "unavailable" || avail === "no" || avail === "no-api") {
+      throw new Error(`Gemini Nano unavailable on this device (availability="${avail}").`);
+    }
+
+    state.session = await LM.create({
+      initialPrompts: [{ role: "system", content: SYSTEM }],
+      tools: consumer.asPromptApiTools(),
+      monitor(m) {
+        if (m && m.addEventListener) {
+          m.addEventListener("downloadprogress", (e) =>
+            log(`Gemini Nano download: ${Math.round((e.loaded || 0) * 100)}%`)
+          );
+        }
+      },
+    });
+    state.sessionSig = sig;
+    log(`Gemini session ready (availability="${avail}"); tools: ${sig || "(none)"}`);
+    return state.session;
+  }
+
+  async function geminiEngine(utterance) {
+    const session = await ensureSession();
+    // The Prompt API runs the tool-call loop internally and returns the final text.
+    return await session.prompt(utterance);
+  }
+  state.engine = geminiEngine;
+
+  // ===========================================================================
+  // AGENT entry points.
+  // ===========================================================================
+  async function ask(utterance) {
+    if (!utterance || !utterance.trim()) return "";
+    const reply = await state.engine(utterance);
+    log("reply:", reply);
+    return reply;
+  }
+
+  // Simulates the browser/AT opt-in handoff: greet + orient proactively (fresh session).
   async function activate() {
-    state.messages = []; // fresh session
+    destroySession();
     const reply = await ask(
       "[The user just switched to you from their screen reader and opted in. Greet them, tell them what page they're on and briefly what's available, and offer their main choices, ending with a question.]"
     );
@@ -257,48 +263,40 @@
   }
 
   // ===========================================================================
-  // PUBLIC API — headless on purpose (no DOM injection; AT-safe). Drive from console
-  // or wire to a key in your own snippet.
+  // PUBLIC API — headless on purpose (no DOM injection; AT-safe).
   // ===========================================================================
   const ytAgent = {
-    setKey(k) {
-      try {
-        sessionStorage.setItem(KEY_STORE, k || "");
-        log("Anthropic key stored for this tab (dev only).");
-      } catch (e) {
-        log("could not store key:", e.message);
-      }
-    },
-    setModel(m) {
-      state.model = m;
-      log("model:", m);
-    },
-    useTransport(fn) {
-      state.transport = typeof fn === "function" ? fn : claudeTransport;
-      log("transport overridden:", state.transport === claudeTransport ? "default Claude" : "custom");
-    },
+    availability, // -> "available" | "downloadable" | "downloading" | "unavailable" | ...
     ask, // ask(text) -> reply text
     activate, // proactive greeting (simulated opt-in handoff)
     converse, // listen -> ask -> speak (one turn)
+    useEngine(fn) {
+      state.engine = typeof fn === "function" ? fn : geminiEngine;
+      destroySession();
+      log("engine:", state.engine === geminiEngine ? "Gemini Nano (default)" : "custom");
+    },
     speak: voice.speak,
     listen: voice.listenOnce,
     listTools: () => consumer.list().map((t) => ({ name: t.name, description: t.description })),
     reset() {
-      state.messages = [];
-      log("conversation reset.");
+      destroySession();
+      log("session reset.");
     },
-    _state: state, // for debugging
+    _state: state,
   };
   if (typeof window !== "undefined") window.ytAgent = ytAgent;
 
   // ---------------------------------------------------------------------------
-  // Bootstrap: install the registerTool wrapper ASAP (retry until modelContext exists).
+  // Bootstrap: install the registerTool wrapper ASAP (retry until modelContext exists),
+  // then report Prompt API availability so the user knows if Gemini Nano is ready.
   // ---------------------------------------------------------------------------
   (function bootstrap(attempt) {
     if (consumer.wrap()) {
-      log(
-        `ready. voice: tts=${voice.supported.tts} stt=${voice.supported.stt}. ` +
-          `Try: ytAgent.setKey('sk-ant-...') then await ytAgent.activate()`
+      availability().then((a) =>
+        log(
+          `ready. Gemini Nano: ${a}. voice: tts=${voice.supported.tts} stt=${voice.supported.stt}. ` +
+            `Try: await ytAgent.activate()  (or ytAgent.ask("what's on my home feed?"))`
+        )
       );
       return;
     }

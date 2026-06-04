@@ -21,10 +21,11 @@ NVDA, etc.) stays authoritative for the page itself.
  │   registering tools. In the dev harness this is ytAgent.activate())│
  └───────────────────────────────────────────────────────────────────┘
  ┌── 2. CONSUMER AGENT (MCP client) ────────────────────────────────┐
- │  LLM (Claude) with the page's tools. Listens, decides which tool  │
- │  to call, calls it, loops, speaks the result.                     │
+ │  Chrome built-in Gemini Nano (Prompt API, ON-DEVICE) with the     │
+ │  page's tools. Listens, calls tools (native function calling),    │
+ │  speaks the result. No API key, no network, no CSP issue.         │
  │  Dev harness: src/agent/dev-agent.user.js (in-page).              │
- │  Production: MV3 extension (background worker + MAIN-world bridge).│
+ │  Production: MV3 extension (for persistence + out-of-page UI).     │
  └───────────────────────────────────────────────────────────────────┘
  ┌── 3. PROVIDER (MCP server) ──────────────────────────────────────┐
  │  Our userscript on YouTube registers tools on                     │
@@ -84,19 +85,19 @@ control (offer, don't autoplay).**
 
 ## Known limitations / gotchas
 
-- **CSP blocks the in-page LLM call.** YouTube's Content-Security-Policy (`connect-src`)
-  will likely block `fetch` to `api.anthropic.com` from the MAIN world. The dev harness's
-  Claude transport therefore may fail on youtube.com. Mitigations: (a) test the agent loop
-  with `ytAgent.useTransport(mockFn)`; (b) the real fix is the **MV3 extension** — the LLM
-  call runs in the background service worker (not subject to page CSP), while a
-  MAIN-world content script bridges to `navigator.modelContext`. This is the strongest
-  argument for the extension being the production consumer.
+- **Engine is on-device Gemini Nano (Prompt API) — by user decision, no external LLM.**
+  This removes the API key and the CSP problem entirely (the page never fetches a model
+  endpoint). Requires Chrome flags `#prompt-api-for-gemini-nano` and
+  `#optimization-guide-on-device-model`; the model downloads on first use. Check with
+  `await ytAgent.availability()`. Caveat: Nano is small — native multi-tool function
+  calling may be less reliable than a frontier model; if it misbehaves, the fallback is a
+  manual JSON tool-selection loop using the Prompt API's `responseConstraint` (structured
+  output) — documented option, not yet built. Engine is pluggable: `ytAgent.useEngine(fn)`.
 - **In-page agent doesn't survive full navigations.** `open_video` sets
   `location.href` → cross-document load → the harness (living in the page) resets. SPA
   nav within YouTube survives; cross-document nav doesn't. A real extension consumer lives
-  outside the page and persists. Acceptable for the harness; note it.
-- **Browser key exposure.** The harness puts the Anthropic key in `sessionStorage` — dev
-  only. Production: key lives in the extension background / a backend proxy, never the page.
+  outside the page and persists. This — plus out-of-page UI — is now the main reason the
+  production consumer is an extension (CSP no longer is, since the model is on-device).
 - **No DOM injection by design.** The harness is headless (console + voice); it does NOT
   add visible/AT-visible UI to YouTube, to honor the AT-safe principle. Real client UI
   lives in the extension popup/side panel, outside the page's a11y tree.
@@ -152,11 +153,13 @@ PiP**. Search is the natural pair to Home (both are list-and-open).
 2. Provider: paste `src/youtube-a11y-agent.user.js` as a DevTools snippet (or install in
    Tampermonkey with `@grant none`) and Run on youtube.com. Expect
    `[yt-a11y] ... registered N tool(s)`.
+   Also enable `#prompt-api-for-gemini-nano` and `#optimization-guide-on-device-model`
+   for the agent's on-device model.
 3. Consumer/voice: paste `src/agent/dev-agent.user.js` (load it **first** so its
    registerTool wrapper captures the provider's tools — or navigate once after, since
    route changes re-register). See `src/agent/README.md`.
-4. `ytAgent.setKey("sk-ant-...")`, then `await ytAgent.activate()` for the greeting, or
+4. No API key needed. `await ytAgent.availability()` (expect "available"; first run may
+   download the model), then `await ytAgent.activate()` for the greeting, or
    `await ytAgent.ask("what's on my home feed?")`, or `ytAgent.converse()` for voice.
-   If the Anthropic fetch is CSP-blocked, use `ytAgent.useTransport(mockFn)` to exercise
-   the loop. Tool-only smoke test needs no key: `await ytAgent.listTools()` /
-   the capture-shim from CLAUDE.md.
+   Tool-only smoke test: `ytAgent.listTools()`. Wiring/voice check without the model:
+   `ytAgent.useEngine(mockFn)`.
