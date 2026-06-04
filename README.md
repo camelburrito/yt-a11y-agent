@@ -42,32 +42,95 @@ agent doesn't read a preroll ad's timing as the video's.
 itself runs on **Chrome's on-device Gemini Nano** (no API key) — see
 [`src/agent/`](src/agent/).
 
-## Requirements
+## Getting started
 
-- **Google Chrome** with these flags enabled (restart after):
-  - `chrome://flags/#enable-webmcp-testing` — the WebMCP tools
-  - `chrome://flags/#prompt-api-for-gemini-nano` — the on-device agent model
-  - `chrome://flags/#optimization-guide-on-device-model` → "Enabled BypassPerfRequirement"
-- **[Tampermonkey](https://www.tampermonkey.net/)** (or any userscript manager that
-  supports `@grant none`) — or just paste the scripts as DevTools snippets.
-- To call tools manually instead of via the agent, a WebMCP inspector such as the
-  **Model Context Tool Inspector** extension.
+New here? This is a research/preview project that rides on experimental Chrome features,
+so setup is a few manual steps. Follow them in order — it takes about 10 minutes (plus a
+one-time model download).
 
-## Try it
+### What you need
 
-1. Enable the flags above and restart Chrome.
-2. Install the **provider**
-   [`src/youtube-a11y-agent.user.js`](src/youtube-a11y-agent.user.js) in Tampermonkey
-   (the `@grant none` header keeps it in the page's main world, which WebMCP requires).
-3. Open <https://www.youtube.com> and check the console for a `[yt-a11y]` line listing the
-   registered tools.
-4. **Via the agent** (no API key — on-device Gemini Nano): install the consumer harness
-   [`src/agent/dev-agent.user.js`](src/agent/dev-agent.user.js), then in the console run
-   `await ytAgent.activate()` for a spoken greeting, or
-   `await ytAgent.ask("what's on my home feed?")`. See [`src/agent/`](src/agent/).
-5. **Via an inspector** (manual): try `describe_home`, then `list_home_feed`, then
-   `open_video` with an index. Navigate to a video and back — watch the registered tool
-   set change with the route.
+- **Google Chrome** (a recent version — Dev/Canary works best for the experimental APIs).
+- About **2–4 GB free disk** for the on-device model (downloaded once, on first use).
+- A few minutes. No accounts, no API keys, no paid services.
+
+### Step 1 — Turn on three Chrome flags
+
+Flags are Chrome's experimental on/off switches. For each link below: paste it into Chrome's
+address bar, press Enter, set the dropdown as noted, then click **Relaunch** at the bottom
+when prompted (do all three first, then relaunch once).
+
+| Paste into the address bar | Set to |
+|---|---|
+| `chrome://flags/#enable-webmcp-testing` | **Enabled** — turns on the WebMCP tool API |
+| `chrome://flags/#prompt-api-for-gemini-nano` | **Enabled** — the on-device AI model |
+| `chrome://flags/#optimization-guide-on-device-model` | **Enabled BypassPerfRequirement** — lets the model download |
+
+> If a flag isn't found, your Chrome is likely too old — update it, or install
+> [Chrome Canary](https://www.google.com/chrome/canary/).
+
+### Step 2 — Load the two scripts
+
+The project is two scripts that run on YouTube: the **provider** (registers the tools) and
+the **agent** (the AI that uses them). Pick the easier path:
+
+**Option A — DevTools snippets (quickest, nothing to install).**
+1. Open <https://www.youtube.com>, then open DevTools: **⌥⌘J** (Mac) / **Ctrl+Shift+J**
+   (Windows/Linux).
+2. Go to the **Sources** tab → **Snippets** pane (click `»` if hidden) → **+ New snippet**.
+3. Make one snippet per file: copy the contents of
+   [`src/agent/dev-agent.user.js`](src/agent/dev-agent.user.js) into the first and
+   [`src/youtube-a11y-agent.user.js`](src/youtube-a11y-agent.user.js) into the second
+   (save each with **⌘S** / **Ctrl+S**).
+4. **Run the agent snippet first, then the provider snippet** (right-click → Run). Order
+   matters so the agent captures the provider's tools.
+5. You'll re-run them after a full page reload (they survive in-app navigation).
+
+**Option B — Tampermonkey (persists automatically).**
+1. Install the [Tampermonkey](https://www.tampermonkey.net/) extension.
+2. Open each `src/…user.js` file's raw URL in Chrome; Tampermonkey offers an **Install**
+   page — install both. (Keep the `@grant none` header — it's what lets the scripts see the
+   WebMCP API.) They now load on every YouTube page automatically.
+
+### Step 3 — Confirm it loaded
+
+On <https://www.youtube.com>, open the DevTools **Console**. You should see lines like:
+
+```
+[yt-a11y] surface="home" path="/" registered 5 tool(s): where_am_i, list_home_feed, ...
+[yt-a11y-agent] ready. Gemini Nano: available. voice: tts=true stt=true
+```
+
+If Gemini shows `downloadable`/`downloading`, the model is fetching — give it a few minutes
+(it only happens once).
+
+### Step 4 — Use it
+
+In the Console:
+
+```js
+await ytAgent.availability();              // "available" when the model is ready
+await ytAgent.activate();                  // spoken greeting: orients you + offers choices
+await ytAgent.ask("what's on my home feed?");
+await ytAgent.converse();                  // talk to it: listens, answers, speaks back
+```
+
+Try navigating: `await ytAgent.ask("search for lo-fi music")`, then
+`await ytAgent.ask("open the second result")` — watch the Console show the tool set change
+as the page changes.
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| No `[yt-a11y]` line in the console | The provider didn't load. Re-run the snippet, or check Tampermonkey is enabled for youtube.com. Hard-reload and re-run (snippets reset on reload). |
+| `WebMCP API not found` | `#enable-webmcp-testing` isn't on, Chrome wasn't relaunched, or a script lost `@grant none`. |
+| `ytAgent.availability()` says `unavailable` | Gemini Nano flags aren't both on, or your device/Chrome can't run it. Try Chrome Canary. |
+| Tools return blank/empty lists | YouTube changed its page structure (it does, often). Run `npm run verify:selectors` to see what's drifting — see [Development](#development). |
+| Nothing is spoken | Your OS/Chrome may have no speech voice, or the tab isn't focused. `ytAgent.ask(...)` still returns text in the console. |
+
+To call tools by hand instead of through the agent, use a WebMCP inspector such as the
+**Model Context Tool Inspector** extension.
 
 ## How it works
 
