@@ -19,18 +19,24 @@ drives it for you.
 
 ## Status
 
-All journeys are **implemented**. The **Home** journey is verified live against YouTube;
-the others are implemented and **pending live selector verification** (YouTube renames its
-DOM classes often — see [`docs/HANDOFF.md`](docs/HANDOFF.md) for the verify recipe).
+All journeys are **implemented**, and their selectors are **verified against live YouTube**
+via a headless harness (`npm run verify:selectors`). Two paths remain partially verified
+(noted below) because they need flags or a user gesture.
 
 | Journey      | Tools | State |
 |--------------|-------|-------|
 | **Home**     | `list_home_feed`, `describe_home`, `open_video`, `load_more_home` | ✅ verified live |
-| Search       | `run_search`, `list_results`, `refine_search`, `open_result` | ✅ implemented · verify pending |
-| Watch        | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` | ✅ implemented · verify pending |
-| Watch Next   | `list_up_next`, `play_next`, `set_autoplay` | ✅ implemented · verify pending |
-| Comments     | `get_comments`, `summarize_comments`, `get_pinned_comment` | ✅ implemented · verify pending |
-| Picture-in-Picture | `enter_pip`, `exit_pip` | ✅ implemented · verify pending |
+| Search       | `run_search`, `list_results`, `refine_search`, `open_result` | ✅ verified live |
+| Watch        | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` | ✅ verified live¹ |
+| Watch Next   | `list_up_next`, `play_next`, `set_autoplay` | ✅ verified live |
+| Comments     | `get_comments`, `summarize_comments`, `get_pinned_comment` | ✅ verified live |
+| Picture-in-Picture | `enter_pip`, `exit_pip` | ✅ button + fallback verified² |
+
+¹ Info/playback/captions/native controls verified. `get_transcript` *reads* a transcript
+fine; programmatically *opening* a closed transcript panel is best-effort.
+² The PiP button and fallback are present; the direct-API vs. user-gesture path (open
+question c) needs a flagged interactive run. `get_video_info` now flags `adPlaying` so the
+agent doesn't read a preroll ad's timing as the video's.
 
 `where_am_i` works everywhere and tells the agent which surface you're on. The AI agent
 itself runs on **Chrome's on-device Gemini Nano** (no API key) — see
@@ -79,6 +85,21 @@ itself runs on **Chrome's on-device Gemini Nano** (no API key) — see
 See [`docs/architecture/yt-a11y-agent.md`](docs/architecture/yt-a11y-agent.md) for the
 full architecture (with diagrams), and [`CLAUDE.md`](CLAUDE.md) for conventions and open
 questions.
+
+## Development
+
+The userscripts in `src/` have **no build step** — edit and reload. The only tooling is
+headless selector verification:
+
+```bash
+npm install            # installs puppeteer-core (drives your installed Chrome)
+npm run verify:selectors
+```
+
+This runs the provider's actual extraction logic against live YouTube (`/results` → a real
+`/watch`) and prints what each journey scrapes — the automated version of "open DevTools and
+check the selectors still work." Run it whenever YouTube's DOM might have drifted. It checks
+the DOM layer only (no WebMCP/Gemini flags needed).
 
 ## License
 

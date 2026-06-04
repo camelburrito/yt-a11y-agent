@@ -214,16 +214,25 @@ sequenceDiagram
 
 ## Verified vs. pending
 
-- **Verified live (2026-06-04):** `navigator.modelContext` namespace; main-world
-  registration passes youtube.com's `tools` permissions policy; the **home** journey end
-  to end (lockup selectors).
-- **Implemented, pending live verification:** search / watch / watch-next / comments / pip
-  tool logic. Selectors are best-effort; re-verify per the `docs/HANDOFF.md` recipe (the
-  lockup migration likely affects search/up-next; watch player controls and `<video>`
-  access are more stable).
-- **Open questions:** (c) PiP transient user activation — `enter_pip` now measures
-  `navigator.userActivation.isActive` and falls back to the native button; verify which
-  path fires. (d) multimodal contract when the consumer becomes the extension.
+- **Verified live (2026-06-04):**
+  - `navigator.modelContext` namespace; main-world registration passes youtube.com's
+    `tools` permissions policy (interactive, by the user).
+  - **Home** journey end to end (interactive).
+  - **Search / Watch / Watch-Next / Comments selectors** — via the headless harness
+    `scripts/verify-selectors.mjs` (`npm run verify:selectors`), which runs the provider's
+    real `readVideoCards`/`SEL.card` + watch/`<video>` + comments logic against live
+    YouTube. All fields populate. The harness caught a watch-next channel-extraction bug
+    (channel isn't a `/@` link in the sidebar lockup) — fixed with a first-metadata-line
+    fallback in `readVideoCards`.
+- **Partial / needs a flagged interactive run:**
+  - **PiP (open question c)** — button + fallback are present; which path actually fires
+    (direct API vs. native-button gesture) needs a real tool call under the flags.
+  - **Transcript open** — reading an open transcript works; opening a closed one is
+    best-effort.
+- **Known caveat:** during a preroll **ad**, `<video>.duration`/`currentTime` are the ad's;
+  `get_video_info` detects the player's `ad-showing` class and reports `adPlaying` instead
+  of ad timing.
+- **Open question (d):** multimodal contract when the consumer becomes the extension.
 
 ## Production trajectory
 
@@ -237,6 +246,9 @@ Update this file in the **same change** that touches:
 - `src/youtube-a11y-agent.user.js` — tools, `SEL`, surface detection, registration
 - `src/agent/dev-agent.user.js` — bridge, engine, voice, public API
 - the engine choice, the three-layer model, or the production trajectory
+
+When changing `SEL` or `readVideoCards`, re-run `npm run verify:selectors` and update the
+"Verified vs. pending" section with what the harness found.
 
 The diagrams reference real symbols (`readVideoCards`, `detectSurface`, `ytAgent`,
 `navigator.modelContext`); if you rename them, update the diagrams too.

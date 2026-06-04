@@ -80,6 +80,9 @@
       channel: "ytd-channel-name#channel-name a, #owner #channel-name a, #upload-info #channel-name a",
       info: "ytd-watch-metadata #info, #info-container, ytd-watch-info-text",
       video: "video.html5-main-video, video",
+      // Player container; gets an "ad-showing"/"ad-interrupting" class during ads, when
+      // <video>.duration reflects the AD, not the real video.
+      player: "#movie_player, .html5-video-player",
       // Native player controls we actuate when a Web API needs a real gesture or for toggles.
       ccButton: "button.ytp-subtitles-button",
       pipButton: "button.ytp-pip-button",
@@ -170,11 +173,12 @@
       if (url && url.startsWith("/")) url = "https://www.youtube.com" + url;
       if (url && seen.has(url)) continue; // dedupe nested matches
       if (url) seen.add(url);
-      const channel = qsText(el, SEL.card.channel);
-      const meta = Array.from(el.querySelectorAll(SEL.card.meta))
-        .map(txt)
-        .filter((t) => t && t !== channel)
-        .join(" · ");
+      const metaParts = Array.from(el.querySelectorAll(SEL.card.meta)).map(txt).filter(Boolean);
+      // Channel is usually a /@ link; in the watch-next sidebar lockup it isn't, so it
+      // shows up as the first metadata line instead. Fall back to that.
+      let channel = qsText(el, SEL.card.channel);
+      if (!channel && metaParts.length) channel = metaParts[0];
+      const meta = metaParts.filter((t) => t !== channel).join(" · ");
       const duration =
         Array.from(el.querySelectorAll(SEL.card.duration))
           .map(txt)
@@ -429,12 +433,16 @@
         inputSchema: { type: "object", properties: {} },
         async execute() {
           const v = getVideo();
+          const player = document.querySelector(SEL.watch.player);
+          const adShowing = !!(player && /ad-showing|ad-interrupting/.test(player.className));
           return okJSON({
             title: watchTitle(),
             channel: qsText(document, SEL.watch.channel),
             info: qsText(document, SEL.watch.info),
-            position: v ? mmss(v.currentTime) : null,
-            duration: v ? mmss(v.duration) : null,
+            // During an ad, the <video> reports the ad's timing, not the video's.
+            adPlaying: adShowing,
+            position: v && !adShowing ? mmss(v.currentTime) : null,
+            duration: v && !adShowing ? mmss(v.duration) : null,
             paused: v ? v.paused : null,
             playbackRate: v ? v.playbackRate : null,
           });

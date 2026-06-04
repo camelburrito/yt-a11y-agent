@@ -61,9 +61,10 @@ control (offer, don't autoplay).**
 | Consumer agent (dev harness, on-device Gemini Nano) | ✅ `src/agent/dev-agent.user.js` |
 | Voice layer (Web Speech STT/TTS) | ✅ in the harness |
 | Proactive `activate()` greeting | ✅ |
-| Search / Watch / Watch-Next / Comments / PiP journeys | ✅ **implemented** — pending live selector verification |
+| Search / Watch / Watch-Next / Comments / PiP journeys | ✅ **implemented + selectors verified live** (headless harness) |
 | Architecture doc with diagrams | ✅ `docs/architecture/yt-a11y-agent.md` |
-| **Live verification of non-home journeys** | ⬜ **NEXT** — run the per-journey recipe below |
+| Headless selector verification | ✅ `scripts/verify-selectors.mjs` (`npm run verify:selectors`) |
+| PiP gesture path (open q. c) + transcript-open path | 🟡 partial — need a flagged interactive run |
 | Production extension (MV3, world:"MAIN") | ⬜ later |
 
 ## Verified facts (don't re-litigate)
@@ -108,11 +109,11 @@ control (offer, don't autoplay).**
 | Surface | Detect | Tools | Status |
 |---------|--------|-------|--------|
 | home | `/` or `/feed*` | `list_home_feed`, `describe_home`, `open_video`, `load_more_home` | ✅ verified live |
-| search | `/results` | `run_search`, `list_results`, `refine_search`, `open_result` | ✅ implemented · verify |
-| watch | `/watch` | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` | ✅ implemented · verify |
-| watch-next | `/watch` | `list_up_next`, `play_next`, `set_autoplay` | ✅ implemented · verify |
-| comments | `/watch` | `get_comments`, `summarize_comments`, `get_pinned_comment` | ✅ implemented · verify |
-| pip | `/watch` | `enter_pip`, `exit_pip` | ✅ implemented · verify (open q. c) |
+| search | `/results` | `run_search`, `list_results`, `refine_search`, `open_result` | ✅ verified live |
+| watch | `/watch` | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` | ✅ verified live (transcript-open best-effort) |
+| watch-next | `/watch` | `list_up_next`, `play_next`, `set_autoplay` | ✅ verified live |
+| comments | `/watch` | `get_comments`, `summarize_comments`, `get_pinned_comment` | ✅ verified live |
+| pip | `/watch` | `enter_pip`, `exit_pip` | 🟡 button+fallback present; gesture path (q. c) needs flagged run |
 | (every route) | — | `where_am_i` | ✅ |
 | home (planned) | | `list_categories`, `open_category` (filter chip bar) | ⬜ |
 
@@ -122,31 +123,28 @@ controls (`set_captions`, `set_autoplay`, PiP fallback) rather than scraping whe
 
 ## NEXT STEPS
 
-All journeys are now **implemented** (tool logic + selectors in `SEL`). What remains is
-**live verification** of the non-home journeys, then the extension.
+All journeys are implemented and their **selectors are verified live** (headless harness,
+`scripts/verify-selectors.mjs`). What remains needs flags or a user gesture, or is the
+extension.
 
-### Live-verify each journey (the recipe that worked for Home)
-Per surface, in the console with both scripts loaded:
-1. Navigate to the surface live. Probe selectors (structure/attribute-based,
-   case-insensitive `[class*="..." i]`) to confirm the real classes — the search/up-next
-   selectors in `SEL.card`/`SEL.watchNext` are best-effort and the lockup migration likely
-   moved things.
-2. Call the tools directly via the capture-shim (CLAUDE.md) or `ytAgent.ask(...)`; confirm
-   populated results.
-3. Fix any drift in `SEL` only (logic shouldn't need changes). Re-run.
-4. Commit per journey. **Update the status tables here, in `README.md`, and the "Verified
-   vs pending" section of `docs/architecture/yt-a11y-agent.md` as each is confirmed.**
+### Re-running selector verification
+`npm run verify:selectors` launches the installed Chrome headless, hits live YouTube
+(`/results` → a real `/watch`), and runs the provider's actual extraction logic
+(`readVideoCards`/`SEL.card`, watch/`<video>`, comments). Use it whenever YouTube might have
+drifted — it's the automated version of the manual probe loop. Findings so far:
+- Search / Watch-Next / Comments: all fields populate. (Watch-Next channel needed a
+  first-metadata-line fallback — fixed in `readVideoCards`.)
+- Watch: title/channel/info/`<video>`/CC+PiP+autoplay buttons all found.
+- Caveat: during a preroll **ad**, `<video>.duration` is the ad's — `get_video_info` now
+  reports `adPlaying` and suppresses ad timing.
 
-Suggested order: **Search → Watch → Watch-Next → Comments → PiP**.
-
-Watch-specifics to check live: transcript needs the panel open (`get_transcript` tries to
-click `SEL.watch.transcriptOpenButton` — verify that selector); `set_captions`/`set_autoplay`
-read `aria-pressed`/`aria-checked` on native buttons — confirm those attributes exist.
-
-### PiP — open question (c), resolve empirically
-`enter_pip` already measures `navigator.userActivation.isActive` and falls back to clicking
-`SEL.watch.pipButton`. Run it from a tool call and **record here** whether the direct API
-succeeds (activation present) or the button fallback is what actually works.
+### Still needs a flagged, interactive (gesture) run
+- **PiP — open question (c).** `enter_pip` measures `navigator.userActivation.isActive` and
+  falls back to clicking `SEL.watch.pipButton`. Run it from a real tool call and **record
+  here** whether the direct API succeeds or the button fallback is what fires.
+- **Transcript open.** `get_transcript` *reads* segments fine; opening a *closed* transcript
+  (expand description → "Show transcript") is best-effort. Verify `SEL.watch.transcriptOpenButton`
+  interactively (headless starts with it closed and 0 segments).
 
 ### Then: production MV3 extension
 Provider → `world:"MAIN"` content script; consumer → background worker (persists across

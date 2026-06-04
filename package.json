@@ -1,0 +1,18 @@
+{
+  "name": "yt-a11y-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "WebMCP accessibility tool provider + on-device agent for YouTube. The userscripts in src/ have no build step; this package.json exists only for dev tooling (headless selector verification).",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "verify:selectors": "node scripts/verify-selectors.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/camelburrito/yt-a11y-agent.git"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^25.1.0"
+  }
+}

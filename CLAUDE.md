@@ -49,11 +49,11 @@ user's existing assistive tech reports stays authoritative.
 | Surface | Detect (pathname)            | Tools |
 |---------|------------------------------|-------|
 | home    | `/` or `/feed*`              | `list_home_feed`, `describe_home`, `open_video`, `load_more_home` ✅ verified live |
-| search  | `/results`                   | `run_search`, `list_results`, `refine_search`, `open_result` ✅ impl · verify |
-| watch   | `/watch`                     | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` ✅ impl · verify |
-| watch-next | `/watch` (same surface)   | `list_up_next`, `play_next`, `set_autoplay` ✅ impl · verify |
-| comments | `/watch` (same surface)    | `get_comments`, `summarize_comments`, `get_pinned_comment` ✅ impl · verify |
-| pip     | `/watch` (same surface)      | `enter_pip`, `exit_pip` ✅ impl · verify (measures `userActivation`, falls back to native button) |
+| search  | `/results`                   | `run_search`, `list_results`, `refine_search`, `open_result` ✅ verified live |
+| watch   | `/watch`                     | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` ✅ verified live (transcript-open best-effort) |
+| watch-next | `/watch` (same surface)   | `list_up_next`, `play_next`, `set_autoplay` ✅ verified live |
+| comments | `/watch` (same surface)    | `get_comments`, `summarize_comments`, `get_pinned_comment` ✅ verified live |
+| pip     | `/watch` (same surface)      | `enter_pip`, `exit_pip` 🟡 button+fallback present; gesture path needs flagged run |
 | channel | `/@*`, `/channel/*`, `/c/*`  | (cross-cutting only for now) |
 | other   | anything else                | (cross-cutting only) |
 
@@ -106,8 +106,13 @@ surface + pathname so the agent can orient itself.
 3. **Model Context Tool Inspector** extension: use it to see which tools are registered on
    the current page and to invoke them by hand. Navigate home → watch → back and watch the
    registered set change (route-scoped registration) and the `[yt-a11y]` console lines.
+4. **Headless selector verification:** `npm run verify:selectors` (uses `puppeteer-core`
+   against the installed Chrome) runs the provider's real extraction logic against live
+   YouTube and prints what each journey scrapes. Run it after any `SEL`/`readVideoCards`
+   change; no flags needed (it checks the DOM layer, not WebMCP/Gemini).
 
 ## Status
 
-- Home journey: **done**. Everything else: **stubbed** (returns no tools; backbone
-  already routes to them). Cross-cutting `where_am_i`: done.
+All journeys **implemented**; selectors **verified live** (home interactively, others via
+the headless harness). PiP gesture path + transcript-open are partial (need a flagged
+interactive run). Agent engine: on-device Gemini Nano. See `docs/HANDOFF.md` for details.
