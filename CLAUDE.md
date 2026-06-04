@@ -48,12 +48,12 @@ user's existing assistive tech reports stays authoritative.
 
 | Surface | Detect (pathname)            | Tools |
 |---------|------------------------------|-------|
-| home    | `/` or `/feed*`              | `list_home_feed`, `describe_home`, `open_video`, `load_more_home` ✅ done |
-| search  | `/results`                   | `run_search`, `list_results`, `refine_search`, `open_result` — _stub_ |
-| watch   | `/watch`                     | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` — _stub_ |
-| watch-next | `/watch` (same surface)   | `list_up_next`, `play_next`, `set_autoplay` — _stub_ |
-| comments | `/watch` (same surface)    | `get_comments`, `summarize_comments`, `get_pinned_comment` — _stub_ |
-| pip     | `/watch` (same surface)      | `enter_pip`, `exit_pip` — _stub_ (PiP needs a user gesture) |
+| home    | `/` or `/feed*`              | `list_home_feed`, `describe_home`, `open_video`, `load_more_home` ✅ verified live |
+| search  | `/results`                   | `run_search`, `list_results`, `refine_search`, `open_result` ✅ impl · verify |
+| watch   | `/watch`                     | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` ✅ impl · verify |
+| watch-next | `/watch` (same surface)   | `list_up_next`, `play_next`, `set_autoplay` ✅ impl · verify |
+| comments | `/watch` (same surface)    | `get_comments`, `summarize_comments`, `get_pinned_comment` ✅ impl · verify |
+| pip     | `/watch` (same surface)      | `enter_pip`, `exit_pip` ✅ impl · verify (measures `userActivation`, falls back to native button) |
 | channel | `/@*`, `/channel/*`, `/c/*`  | (cross-cutting only for now) |
 | other   | anything else                | (cross-cutting only) |
 
@@ -69,7 +69,12 @@ surface + pathname so the agent can orient itself.
   do-everything tool. The agent composes them.
 - **Descriptions are model-facing instructions**, not user docs. Say when to call it and
   what the args mean.
+- **Shared `readVideoCards`** over `SEL.card` backs every video list (home/search/up-next).
+  Watch tools read the `<video>` element and actuate native controls rather than scraping.
 - **`[yt-a11y]` log prefix** for all console output.
+- **Docs stay current with code.** Update `README.md`, `docs/HANDOFF.md`, and
+  `docs/architecture/yt-a11y-agent.md` (diagrams included) in the *same change* that
+  alters tools, `SEL`, the engine, or the architecture. Treat stale docs as a bug.
 
 ## Open questions — resolve empirically, not by reading specs
 

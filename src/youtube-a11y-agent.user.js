@@ -43,55 +43,64 @@
   // couple of fallbacks per field without scattering them through the code.
   // ---------------------------------------------------------------------------
   const SEL = {
-    home: {
-      // A feed tile on the home grid (and most /feed surfaces). The tile wrapper is
-      // still ytd-rich-item-renderer, but its CONTENTS are now the newer
-      // yt-lockup-view-model component, whose classes are camelCase (no hyphens),
-      // e.g. ytLockupMetadataViewModelTitle. Old #video-title ids no longer exist
-      // here; they're kept below only as fallbacks for other/older surfaces.
-      feedItem: "ytd-rich-item-renderer",
-      // Title text AND canonical /watch link — in the lockup the title is the anchor.
-      title: "a.ytLockupMetadataViewModelTitle, a#video-title-link, #video-title",
-      // Fallback link selectors if the title element isn't itself an <a>.
-      link: "a.ytLockupMetadataViewModelTitle, a#video-title-link, a#thumbnail",
-      // Channel link, found inside a metadata row.
-      channel:
-        "a[href^='/@'], a[href*='/channel/'], a[href*='/c/'], ytd-channel-name #text",
-      // Each metadata line span (e.g. "12K views", "2 hours ago"). The channel row is
-      // also a MetadataText span; readHomeFeed filters it out of the meta string.
+    // Shared fields for a video "card" in ANY list (home grid, search results, up-next).
+    // YouTube's lockup component (yt-lockup-view-model) uses camelCase classes (no
+    // hyphens), e.g. ytLockupMetadataViewModelTitle; older layouts use #video-title ids.
+    // Both are covered as comma-list fallbacks. readVideoCards() consumes these.
+    // Verified live on the HOME grid (2026-06-04); search/up-next reuse the same lockup
+    // structure but should be re-verified live per the docs/HANDOFF.md recipe.
+    card: {
+      // Title text AND (when it's an <a>) the canonical /watch link.
+      title: "a.ytLockupMetadataViewModelTitle, h3 a, a#video-title-link, #video-title",
+      // Fallback link if the title element isn't itself an anchor.
+      watchLink:
+        "a.ytLockupMetadataViewModelTitle, a#video-title-link, a#thumbnail, a[href*='/watch']",
+      channel: "a[href^='/@'], a[href*='/channel/'], a[href*='/c/'], ytd-channel-name #text",
+      // Metadata line spans ("12K views", "2 hours ago"). The channel is also one of
+      // these; readVideoCards filters it out of the meta string.
       meta: ".ytContentMetadataViewModelMetadataText, #metadata-line span",
-      // Thumbnail badges. Broad on purpose (case-insensitive) because the duration
-      // badge container class is volatile; readHomeFeed keeps only the mm:ss value,
-      // which also skips "LIVE"/"4K"/"NEW" badges.
+      // Thumbnail badges. Broad + case-insensitive because the duration badge class is
+      // volatile; readVideoCards keeps only the mm:ss value (skips "LIVE"/"4K"/"NEW").
       duration:
         "[class*='Badge' i], ytd-thumbnail-overlay-time-status-renderer #text, .badge-shape__text",
     },
 
+    home: {
+      // The tile wrapper. Contents are a yt-lockup-view-model (see SEL.card).
+      container: "ytd-rich-item-renderer",
+    },
+
     search: {
-      // Placeholder selectors for the search journey (tools still stubbed).
-      result: "ytd-video-renderer, ytd-reel-item-renderer",
-      title: "#video-title, a#video-title-link",
-      searchBox: "input#search, ytd-searchbox input",
+      container: "ytd-video-renderer, ytd-rich-item-renderer, yt-lockup-view-model",
+      box: "input#search, ytd-searchbox input, input[name='search_query']",
     },
 
     watch: {
-      title: "h1.ytd-watch-metadata yt-formatted-string, h1.title yt-formatted-string",
-      channel: "ytd-channel-name#channel-name #text a, #owner #channel-name a",
+      title: "h1.ytd-watch-metadata yt-formatted-string, h1.title yt-formatted-string, #title h1",
+      channel: "ytd-channel-name#channel-name a, #owner #channel-name a, #upload-info #channel-name a",
+      info: "ytd-watch-metadata #info, #info-container, ytd-watch-info-text",
       video: "video.html5-main-video, video",
-      // Player control buttons we may have to actuate when a Web API needs a real gesture.
-      playButton: "button.ytp-play-button",
+      // Native player controls we actuate when a Web API needs a real gesture or for toggles.
       ccButton: "button.ytp-subtitles-button",
       pipButton: "button.ytp-pip-button",
-      // Up-next / autoplay (watch-next journey).
-      upNextItem: "ytd-compact-video-renderer, yt-lockup-view-model",
-      autoplayToggle: "#toggle.ytd-compact-autoplay-renderer, .ytp-autonav-toggle-button",
+      autoplayToggle: ".ytp-autonav-toggle-button button, .ytp-autonav-toggle-button",
+      // Transcript panel (opened from the description's "Show transcript").
+      transcriptSegment: "ytd-transcript-segment-renderer",
+      transcriptText: ".segment-text, yt-formatted-string.segment-text",
+      transcriptTime: ".segment-timestamp",
+      transcriptOpenButton: "button[aria-label*='transcript' i]",
+    },
+
+    watchNext: {
+      scope: "#secondary, #related, ytd-watch-next-secondary-results-renderer",
+      container: "yt-lockup-view-model, ytd-compact-video-renderer",
     },
 
     comments: {
       thread: "ytd-comment-thread-renderer",
       content: "#content-text",
       author: "#author-text",
-      pinned: "ytd-comment-thread-renderer:has(#pinned-comment-badge)",
+      pinned: "ytd-comment-thread-renderer:has(#pinned-comment-badge), ytd-comment-thread-renderer:has([pinned-comment-badge])",
     },
   };
 
@@ -106,6 +115,74 @@
   // handled out-of-band in this script, never shoved through the tool boundary.
   const ok = (text) => ({ content: [{ type: "text", text }] });
   const okJSON = (obj) => ok(JSON.stringify(obj, null, 2));
+
+  // Format seconds -> "m:ss" / "h:mm:ss".
+  const mmss = (s) => {
+    if (s == null || isNaN(s)) return "";
+    s = Math.floor(s);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    const pad = (n) => String(n).padStart(2, "0");
+    return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
+  };
+
+  // Parse a timecode: number of seconds, or "ss" / "m:ss" / "h:mm:ss".
+  function parseTimecode(v) {
+    if (typeof v === "number") return v;
+    if (typeof v !== "string") return NaN;
+    const t = v.trim();
+    if (/^\d+(\.\d+)?$/.test(t)) return parseFloat(t);
+    const parts = t.split(":").map(Number);
+    if (parts.some((n) => isNaN(n))) return NaN;
+    return parts.reduce((acc, p) => acc * 60 + p, 0);
+  }
+
+  const getVideo = () => document.querySelector(SEL.watch.video);
+
+  // Actuate a native control (read-and-act; we click YouTube's own button, never build
+  // our own UI). Returns whether something was clicked.
+  function actuate(sel) {
+    const el = document.querySelector(sel);
+    if (el) {
+      el.click();
+      return true;
+    }
+    return false;
+  }
+
+  // Generic reader for a list of video cards (home, search, up-next). Uses SEL.card for
+  // fields; dedupes by URL so nested lockup matches don't double-count.
+  function readVideoCards(scope, containerSel, limit) {
+    const root = scope || document;
+    const items = Array.from(root.querySelectorAll(containerSel));
+    const out = [];
+    const seen = new Set();
+    for (let i = 0; i < items.length && out.length < limit; i++) {
+      const el = items[i];
+      const titleEl = el.querySelector(SEL.card.title);
+      const title = txt(titleEl);
+      if (!title) continue; // skip ads / shelves / non-video tiles
+      const linkEl =
+        (titleEl && titleEl.tagName === "A" ? titleEl : null) ||
+        el.querySelector(SEL.card.watchLink);
+      let url = linkEl ? linkEl.getAttribute("href") || "" : "";
+      if (url && url.startsWith("/")) url = "https://www.youtube.com" + url;
+      if (url && seen.has(url)) continue; // dedupe nested matches
+      if (url) seen.add(url);
+      const channel = qsText(el, SEL.card.channel);
+      const meta = Array.from(el.querySelectorAll(SEL.card.meta))
+        .map(txt)
+        .filter((t) => t && t !== channel)
+        .join(" · ");
+      const duration =
+        Array.from(el.querySelectorAll(SEL.card.duration))
+          .map(txt)
+          .find((t) => /^\d+:\d{2}/.test(t)) || "";
+      out.push({ index: out.length, title, channel, meta, duration, url });
+    }
+    return out;
+  }
 
   // ---------------------------------------------------------------------------
   // Surface detection from the path. Used to scope which tools are registered.
@@ -131,36 +208,9 @@
   // ===========================================================================
 
   // Read the home grid into plain objects. Shared by list/describe/open.
+  // Delegates to the generic card reader (same logic verified live on home 2026-06-04).
   function readHomeFeed(limit) {
-    const items = Array.from(document.querySelectorAll(SEL.home.feedItem));
-    const out = [];
-    for (let i = 0; i < items.length && out.length < limit; i++) {
-      const el = items[i];
-      const titleEl = el.querySelector(SEL.home.title);
-      const title = txt(titleEl);
-      if (!title) continue; // skip ads / shelves / non-video tiles
-      // In the lockup component the title element IS the /watch anchor; older layouts
-      // use a separate link. Fall back to any /watch anchor in the tile.
-      const linkEl =
-        (titleEl && titleEl.tagName === "A" ? titleEl : null) ||
-        el.querySelector(SEL.home.link) ||
-        el.querySelector('a[href*="/watch"]');
-      let url = linkEl ? linkEl.getAttribute("href") : "";
-      if (url && url.startsWith("/")) url = "https://www.youtube.com" + url;
-      const channel = qsText(el, SEL.home.channel);
-      // Metadata rows minus the channel row -> "12K views · 2 hours ago".
-      const meta = Array.from(el.querySelectorAll(SEL.home.meta))
-        .map(txt)
-        .filter((t) => t && t !== channel)
-        .join(" · ");
-      // Thumbnail badges include duration; keep only an mm:ss value (skips "LIVE" etc.).
-      const duration =
-        Array.from(el.querySelectorAll(SEL.home.duration))
-          .map(txt)
-          .find((t) => /^\d+:\d{2}/.test(t)) || "";
-      out.push({ index: out.length, title, channel, meta, duration, url });
-    }
-    return out;
+    return readVideoCards(document, SEL.home.container, limit);
   }
 
   function homeTools() {
@@ -250,10 +300,10 @@
           "Load more videos onto the home feed by scrolling to the bottom and waiting for YouTube to fetch the next batch. Use when the user wants more options than list_home_feed currently shows. Reports how many new videos appeared.",
         inputSchema: { type: "object", properties: {} },
         async execute() {
-          const before = document.querySelectorAll(SEL.home.feedItem).length;
+          const before = document.querySelectorAll(SEL.home.container).length;
           window.scrollTo(0, document.documentElement.scrollHeight);
           await sleep(1500);
-          const after = document.querySelectorAll(SEL.home.feedItem).length;
+          const after = document.querySelectorAll(SEL.home.container).length;
           const added = Math.max(0, after - before);
           return ok(
             added > 0
@@ -282,37 +332,422 @@
   }
 
   // ===========================================================================
-  // OTHER JOURNEYS — stubbed. Each returns [] (no tools) for now.
-  // Fill these in route by route; the registration backbone already handles them.
+  // OTHER JOURNEYS — implemented. Selectors live in SEL; logic mirrors the verified
+  // home reader. NOTE: search/watch/comments selectors are best-effort and should be
+  // re-verified live per docs/HANDOFF.md (YouTube's lockup migration affects them too).
   // ===========================================================================
 
+  // ---- SEARCH (/results) ----------------------------------------------------
+  function searchUrl(q) {
+    return "https://www.youtube.com/results?search_query=" + encodeURIComponent(q.trim());
+  }
   function searchTools() {
-    // TODO(search journey): run_search, list_results, refine_search, open_result
-    return [];
+    return [
+      {
+        name: "run_search",
+        description:
+          "Search YouTube for a query. Navigates to the results page. After it loads, call list_results to read what came back.",
+        inputSchema: {
+          type: "object",
+          properties: { query: { type: "string", description: "What to search for." } },
+          required: ["query"],
+        },
+        async execute({ query }) {
+          if (!query || !query.trim()) return ok("Please tell me what to search for.");
+          window.location.href = searchUrl(query);
+          return ok(`Searching for "${query.trim()}".`);
+        },
+      },
+      {
+        name: "list_results",
+        description:
+          "List the current YouTube search results. Returns an array of items, each with a stable `index` (for open_result), title, channel, meta, and duration.",
+        inputSchema: {
+          type: "object",
+          properties: { limit: { type: "integer", minimum: 1, maximum: 50, default: 20 } },
+        },
+        async execute({ limit = 20 } = {}) {
+          const r = readVideoCards(document, SEL.search.container, limit);
+          return r.length
+            ? okJSON(r)
+            : ok("No results loaded yet. Try run_search first, or the page may still be loading.");
+        },
+      },
+      {
+        name: "refine_search",
+        description:
+          "Run a new, refined query, replacing the current results. Use when the user wants to narrow or change what they searched for.",
+        inputSchema: {
+          type: "object",
+          properties: { query: { type: "string" } },
+          required: ["query"],
+        },
+        async execute({ query }) {
+          if (!query || !query.trim()) return ok("Tell me the refined search.");
+          window.location.href = searchUrl(query);
+          return ok(`Refining the search to "${query.trim()}".`);
+        },
+      },
+      {
+        name: "open_result",
+        description:
+          "Open a search result by its `index` from list_results. Navigates to that video.",
+        inputSchema: {
+          type: "object",
+          properties: { index: { type: "integer", minimum: 0 } },
+          required: ["index"],
+        },
+        async execute({ index }) {
+          const r = readVideoCards(document, SEL.search.container, 50);
+          const item = r.find((v) => v.index === index);
+          if (!item) return ok(`No result at index ${index}. There are ${r.length} results loaded.`);
+          if (!item.url) return ok(`Found "${item.title}" but couldn't resolve its URL.`);
+          window.location.href = item.url;
+          return ok(`Opening "${item.title}".`);
+        },
+      },
+    ];
   }
 
+  // ---- WATCH (/watch) -------------------------------------------------------
+  function watchTitle() {
+    return qsText(document, SEL.watch.title) || document.title.replace(/\s*-\s*YouTube\s*$/, "");
+  }
+  function readTranscript(limit) {
+    const segs = Array.from(document.querySelectorAll(SEL.watch.transcriptSegment));
+    return segs.slice(0, limit).map((s) => ({
+      time: txt(s.querySelector(SEL.watch.transcriptTime)),
+      text: txt(s.querySelector(SEL.watch.transcriptText)) || txt(s),
+    }));
+  }
   function watchTools() {
-    // TODO(watch journey): get_video_info, get_transcript, summarize_video,
-    // plain_language_summary, jump_to, playback_control, set_captions
-    return [];
+    return [
+      {
+        name: "get_video_info",
+        description:
+          "Get information about the video currently playing: title, channel, view/date info, and playback position. Call this to orient the user on a watch page.",
+        inputSchema: { type: "object", properties: {} },
+        async execute() {
+          const v = getVideo();
+          return okJSON({
+            title: watchTitle(),
+            channel: qsText(document, SEL.watch.channel),
+            info: qsText(document, SEL.watch.info),
+            position: v ? mmss(v.currentTime) : null,
+            duration: v ? mmss(v.duration) : null,
+            paused: v ? v.paused : null,
+            playbackRate: v ? v.playbackRate : null,
+          });
+        },
+      },
+      {
+        name: "get_transcript",
+        description:
+          "Get the transcript of the current video as timestamped lines, if available. If the transcript panel isn't open, this tries to open it and asks the user to try again.",
+        inputSchema: {
+          type: "object",
+          properties: { limit: { type: "integer", default: 200 } },
+        },
+        async execute({ limit = 200 } = {}) {
+          let lines = readTranscript(limit);
+          if (lines.length === 0) {
+            const opened = actuate(SEL.watch.transcriptOpenButton);
+            await sleep(1200);
+            lines = readTranscript(limit);
+            if (lines.length === 0) {
+              return ok(
+                opened
+                  ? "I'm opening the transcript — please ask again in a moment."
+                  : "No transcript is available or open for this video. It may need to be opened from the description."
+              );
+            }
+          }
+          return ok(lines.map((l) => (l.time ? `[${l.time}] ${l.text}` : l.text)).join("\n"));
+        },
+      },
+      {
+        name: "summarize_video",
+        description:
+          "Gather the material needed to summarize the current video (title, channel, transcript if available). Returns that source text; you, the agent, then produce a concise spoken summary for the user.",
+        inputSchema: { type: "object", properties: {} },
+        async execute() {
+          const transcript = readTranscript(400)
+            .map((l) => l.text)
+            .filter(Boolean)
+            .join(" ");
+          return ok(
+            "SOURCE FOR SUMMARY — summarize this for the user in a few spoken sentences.\n" +
+              `Title: ${watchTitle()}\n` +
+              `Channel: ${qsText(document, SEL.watch.channel)}\n` +
+              `Transcript: ${transcript || "(not open/available — summarize from the title and offer to open the transcript)"}`
+          );
+        },
+      },
+      {
+        name: "plain_language_summary",
+        description:
+          "Like summarize_video, but you should produce an extra-simple, plain-language explanation (short sentences, no jargon) for someone who wants the gist quickly. Returns the source material to explain.",
+        inputSchema: { type: "object", properties: {} },
+        async execute() {
+          const transcript = readTranscript(400)
+            .map((l) => l.text)
+            .filter(Boolean)
+            .join(" ");
+          return ok(
+            "SOURCE FOR PLAIN-LANGUAGE SUMMARY — explain this simply, short sentences, no jargon.\n" +
+              `Title: ${watchTitle()}\n` +
+              `Transcript: ${transcript || "(no transcript — explain from the title and offer to open the transcript)"}`
+          );
+        },
+      },
+      {
+        name: "jump_to",
+        description:
+          "Jump the video to a specific time. Accept seconds (a number) or a timestamp like '1:30' or '1:02:03'.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            time: { type: ["string", "number"], description: "Seconds, or mm:ss / h:mm:ss." },
+          },
+          required: ["time"],
+        },
+        async execute({ time }) {
+          const v = getVideo();
+          if (!v) return ok("No video found on this page.");
+          const sec = parseTimecode(time);
+          if (isNaN(sec)) return ok(`I couldn't understand the time "${time}".`);
+          v.currentTime = Math.max(0, isNaN(v.duration) ? sec : Math.min(sec, v.duration));
+          return ok(`Jumped to ${mmss(v.currentTime)}.`);
+        },
+      },
+      {
+        name: "playback_control",
+        description:
+          "Control playback of the current video. `action` is one of: play, pause, toggle, forward, back, speed. For forward/back, `value` is seconds (default 10). For speed, `value` is the rate (e.g. 1.5).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            action: { type: "string", enum: ["play", "pause", "toggle", "forward", "back", "speed"] },
+            value: { type: "number" },
+          },
+          required: ["action"],
+        },
+        async execute({ action, value }) {
+          const v = getVideo();
+          if (!v) return ok("No video found on this page.");
+          switch (action) {
+            case "play":
+              await v.play().catch(() => {});
+              return ok("Playing.");
+            case "pause":
+              v.pause();
+              return ok("Paused.");
+            case "toggle":
+              if (v.paused) {
+                await v.play().catch(() => {});
+                return ok("Playing.");
+              }
+              v.pause();
+              return ok("Paused.");
+            case "forward":
+              v.currentTime += value || 10;
+              return ok(`Skipped forward to ${mmss(v.currentTime)}.`);
+            case "back":
+              v.currentTime -= value || 10;
+              return ok(`Skipped back to ${mmss(v.currentTime)}.`);
+            case "speed":
+              v.playbackRate = value || 1;
+              return ok(`Playback speed is now ${v.playbackRate}x.`);
+            default:
+              return ok(`Unknown action "${action}".`);
+          }
+        },
+      },
+      {
+        name: "set_captions",
+        description:
+          "Turn captions/subtitles on or off by toggling YouTube's native captions button.",
+        inputSchema: {
+          type: "object",
+          properties: { on: { type: "boolean", default: true } },
+        },
+        async execute({ on = true } = {}) {
+          const btn = document.querySelector(SEL.watch.ccButton);
+          if (!btn) return ok("The captions button isn't available on this player.");
+          const pressed = btn.getAttribute("aria-pressed") === "true";
+          if (on !== pressed) btn.click();
+          return ok(`Captions ${on ? "on" : "off"}.`);
+        },
+      },
+    ];
   }
 
+  // ---- WATCH-NEXT (sidebar on /watch) --------------------------------------
+  function watchNextScope() {
+    return document.querySelector(SEL.watchNext.scope) || document;
+  }
   function watchNextTools() {
-    // TODO(watch-next journey): list_up_next, play_next, set_autoplay
-    return [];
+    return [
+      {
+        name: "list_up_next",
+        description:
+          "List the up-next / recommended videos in the sidebar of the current watch page. Returns indexed items.",
+        inputSchema: {
+          type: "object",
+          properties: { limit: { type: "integer", default: 10 } },
+        },
+        async execute({ limit = 10 } = {}) {
+          const r = readVideoCards(watchNextScope(), SEL.watchNext.container, limit);
+          return r.length ? okJSON(r) : ok("No up-next videos found yet.");
+        },
+      },
+      {
+        name: "play_next",
+        description:
+          "Play the first up-next video. Navigates to it. Confirm with the user first if appropriate.",
+        inputSchema: { type: "object", properties: {} },
+        async execute() {
+          const r = readVideoCards(watchNextScope(), SEL.watchNext.container, 1);
+          if (!r.length || !r[0].url) return ok("I couldn't find an up-next video.");
+          window.location.href = r[0].url;
+          return ok(`Playing next: "${r[0].title}".`);
+        },
+      },
+      {
+        name: "set_autoplay",
+        description: "Turn autoplay on or off using the player's native autoplay toggle.",
+        inputSchema: {
+          type: "object",
+          properties: { on: { type: "boolean", default: true } },
+        },
+        async execute({ on = true } = {}) {
+          const btn = document.querySelector(SEL.watch.autoplayToggle);
+          if (!btn) return ok("The autoplay toggle isn't available.");
+          const checked = btn.getAttribute("aria-checked") === "true";
+          if (on !== checked) btn.click();
+          return ok(`Autoplay ${on ? "on" : "off"}.`);
+        },
+      },
+    ];
   }
 
+  // ---- COMMENTS (on /watch) -------------------------------------------------
+  async function ensureCommentsLoaded() {
+    if (!document.querySelector(SEL.comments.thread)) {
+      window.scrollTo(0, Math.floor(document.documentElement.scrollHeight * 0.4));
+      await sleep(1400);
+    }
+  }
   function commentsTools() {
-    // TODO(comments journey): get_comments, summarize_comments, get_pinned_comment
-    return [];
+    return [
+      {
+        name: "get_comments",
+        description:
+          "Read top-level comments on the current video. Scrolls to load them if needed. Returns indexed {author, text}.",
+        inputSchema: {
+          type: "object",
+          properties: { limit: { type: "integer", default: 10 } },
+        },
+        async execute({ limit = 10 } = {}) {
+          await ensureCommentsLoaded();
+          const threads = Array.from(document.querySelectorAll(SEL.comments.thread)).slice(0, limit);
+          if (!threads.length) return ok("No comments loaded — they may be turned off, or still loading.");
+          return okJSON(
+            threads.map((t, i) => ({
+              index: i,
+              author: qsText(t, SEL.comments.author),
+              text: qsText(t, SEL.comments.content),
+            }))
+          );
+        },
+      },
+      {
+        name: "summarize_comments",
+        description:
+          "Gather the top comments so you, the agent, can summarize the overall themes and sentiment for the user. Returns the comment texts.",
+        inputSchema: {
+          type: "object",
+          properties: { limit: { type: "integer", default: 20 } },
+        },
+        async execute({ limit = 20 } = {}) {
+          await ensureCommentsLoaded();
+          const threads = Array.from(document.querySelectorAll(SEL.comments.thread)).slice(0, limit);
+          if (!threads.length) return ok("There are no comments to summarize.");
+          const text = threads
+            .map((t) => qsText(t, SEL.comments.content))
+            .filter(Boolean)
+            .map((c) => `- ${c}`)
+            .join("\n");
+          return ok(
+            "SOURCE FOR COMMENT SUMMARY — summarize the themes and sentiment for the user:\n" + text
+          );
+        },
+      },
+      {
+        name: "get_pinned_comment",
+        description: "Get the pinned comment on the current video, if there is one.",
+        inputSchema: { type: "object", properties: {} },
+        async execute() {
+          await ensureCommentsLoaded();
+          let pinned = null;
+          try {
+            pinned = document.querySelector(SEL.comments.pinned);
+          } catch (_) {
+            /* :has() unsupported — ignore */
+          }
+          if (!pinned) return ok("There's no pinned comment on this video.");
+          return ok(
+            `Pinned comment by ${qsText(pinned, SEL.comments.author)}: ${qsText(pinned, SEL.comments.content)}`
+          );
+        },
+      },
+    ];
   }
 
+  // ---- PICTURE-IN-PICTURE (on /watch) --------------------------------------
   function pipTools() {
-    // TODO(pip journey): enter_pip, exit_pip
-    // NOTE: video.requestPictureInPicture() requires transient user activation
-    // (a real user gesture). A tool call may not count — measure
-    // navigator.userActivation.isActive, and fall back to actuating SEL.watch.pipButton.
-    return [];
+    return [
+      {
+        name: "enter_pip",
+        description:
+          "Put the current video into Picture-in-Picture — a small floating window that stays on top — so it stays visible/audible while navigating elsewhere.",
+        inputSchema: { type: "object", properties: {} },
+        async execute() {
+          const v = getVideo();
+          if (!v) return ok("No video found on this page.");
+          if (document.pictureInPictureElement) return ok("Already in Picture-in-Picture.");
+          // Open question (c): requestPictureInPicture needs transient user activation.
+          // Measure it, then fall back to actuating the native button if the API refuses.
+          const active = !!(navigator.userActivation && navigator.userActivation.isActive);
+          try {
+            await v.requestPictureInPicture();
+            return ok(`Entered Picture-in-Picture. (userActivation.isActive was ${active})`);
+          } catch (e) {
+            const clicked = actuate(SEL.watch.pipButton);
+            return ok(
+              `Direct Picture-in-Picture failed (userActivation.isActive=${active}: ${e.message}). ` +
+                (clicked
+                  ? "I clicked the native PiP button instead — let me know if it worked."
+                  : "No native PiP button was found.")
+            );
+          }
+        },
+      },
+      {
+        name: "exit_pip",
+        description: "Exit Picture-in-Picture and return the video to the page.",
+        inputSchema: { type: "object", properties: {} },
+        async execute() {
+          if (!document.pictureInPictureElement) return ok("The video isn't in Picture-in-Picture.");
+          try {
+            await document.exitPictureInPicture();
+            return ok("Exited Picture-in-Picture.");
+          } catch (e) {
+            return ok("I couldn't exit Picture-in-Picture: " + e.message);
+          }
+        },
+      },
+    ];
   }
 
   // ===========================================================================

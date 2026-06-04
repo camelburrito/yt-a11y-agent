@@ -58,11 +58,12 @@ control (offer, don't autoplay).**
 | Provider backbone (route-scoped registration via AbortController) | ✅ done, pushed |
 | Home journey tools (`list_home_feed`, `describe_home`, `open_video`, `load_more_home`) | ✅ verified live |
 | Cross-cutting `where_am_i` | ✅ done |
-| Consumer agent (dev harness) | ✅ built this session — `src/agent/dev-agent.user.js` |
-| Voice layer (Web Speech STT/TTS) | ✅ built this session (in the harness) |
-| Proactive `activate()` greeting | ✅ built this session |
-| Search / Watch / Watch-Next / Comments journeys | ⬜ **NEXT (item 3)** — stubs only |
-| PiP journey | ⬜ **NEXT (item 4)** |
+| Consumer agent (dev harness, on-device Gemini Nano) | ✅ `src/agent/dev-agent.user.js` |
+| Voice layer (Web Speech STT/TTS) | ✅ in the harness |
+| Proactive `activate()` greeting | ✅ |
+| Search / Watch / Watch-Next / Comments / PiP journeys | ✅ **implemented** — pending live selector verification |
+| Architecture doc with diagrams | ✅ `docs/architecture/yt-a11y-agent.md` |
+| **Live verification of non-home journeys** | ⬜ **NEXT** — run the per-journey recipe below |
 | Production extension (MV3, world:"MAIN") | ⬜ later |
 
 ## Verified facts (don't re-litigate)
@@ -106,38 +107,50 @@ control (offer, don't autoplay).**
 
 | Surface | Detect | Tools | Status |
 |---------|--------|-------|--------|
-| home | `/` or `/feed*` | `list_home_feed`, `describe_home`, `open_video`, `load_more_home` | ✅ |
-| home (planned) | | `list_categories`, `open_category` (the filter chip bar) | ⬜ |
-| search | `/results` | `run_search`, `list_results`, `refine_search`, `open_result` | ⬜ |
-| watch | `/watch` | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` | ⬜ |
-| watch-next | `/watch` | `list_up_next`, `play_next`, `set_autoplay` | ⬜ |
-| comments | `/watch` | `get_comments`, `summarize_comments`, `get_pinned_comment` | ⬜ |
-| pip | `/watch` | `enter_pip`, `exit_pip` | ⬜ |
+| home | `/` or `/feed*` | `list_home_feed`, `describe_home`, `open_video`, `load_more_home` | ✅ verified live |
+| search | `/results` | `run_search`, `list_results`, `refine_search`, `open_result` | ✅ implemented · verify |
+| watch | `/watch` | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` | ✅ implemented · verify |
+| watch-next | `/watch` | `list_up_next`, `play_next`, `set_autoplay` | ✅ implemented · verify |
+| comments | `/watch` | `get_comments`, `summarize_comments`, `get_pinned_comment` | ✅ implemented · verify |
+| pip | `/watch` | `enter_pip`, `exit_pip` | ✅ implemented · verify (open q. c) |
 | (every route) | — | `where_am_i` | ✅ |
+| home (planned) | | `list_categories`, `open_category` (filter chip bar) | ⬜ |
+
+Shared extraction: home/search/up-next all use `readVideoCards(scope, containerSel, limit)`
+over `SEL.card`. Watch tools read the `<video>` element (stable) and actuate native
+controls (`set_captions`, `set_autoplay`, PiP fallback) rather than scraping where possible.
 
 ## NEXT STEPS
 
-### Item 3 — build the remaining journeys (start with Search)
-Per-journey recipe (this is exactly how Home was verified):
-1. Navigate to the surface live. Run a selector probe in the console (structure/attribute-
-   based, case-insensitive `[class*="..." i]`) to find the real lockup classes — **do not
-   trust the placeholder selectors in `SEL`**, they're old-style guesses.
-2. Add the surface's selectors to the `SEL` block (camelCase lockup classes expected).
-3. Implement the tools in the corresponding `*Tools()` function (currently returns `[]`).
-   Keep them small/composable; write descriptions as model-facing instructions; return
-   `{ content: [{ type:"text", text }] }`; read-and-act only.
-4. Verify with the capture-shim (see CLAUDE.md run/test) calling `.execute()` directly,
-   then via `ytAgent.ask(...)`.
-5. Commit per journey; verify selectors live each time.
+All journeys are now **implemented** (tool logic + selectors in `SEL`). What remains is
+**live verification** of the non-home journeys, then the extension.
 
-Order suggestion: **Search → Watch (info/transcript/summary) → Watch-Next → Comments →
-PiP**. Search is the natural pair to Home (both are list-and-open).
+### Live-verify each journey (the recipe that worked for Home)
+Per surface, in the console with both scripts loaded:
+1. Navigate to the surface live. Probe selectors (structure/attribute-based,
+   case-insensitive `[class*="..." i]`) to confirm the real classes — the search/up-next
+   selectors in `SEL.card`/`SEL.watchNext` are best-effort and the lockup migration likely
+   moved things.
+2. Call the tools directly via the capture-shim (CLAUDE.md) or `ytAgent.ask(...)`; confirm
+   populated results.
+3. Fix any drift in `SEL` only (logic shouldn't need changes). Re-run.
+4. Commit per journey. **Update the status tables here, in `README.md`, and the "Verified
+   vs pending" section of `docs/architecture/yt-a11y-agent.md` as each is confirmed.**
 
-### Item 4 — PiP journey
-- `enter_pip`/`exit_pip`. **Open question (c):** `video.requestPictureInPicture()` needs
-  transient user activation. Inside `enter_pip`, measure
-  `navigator.userActivation.isActive`; if false, fall back to actuating
-  `SEL.watch.pipButton`. Measure empirically and record the answer here.
+Suggested order: **Search → Watch → Watch-Next → Comments → PiP**.
+
+Watch-specifics to check live: transcript needs the panel open (`get_transcript` tries to
+click `SEL.watch.transcriptOpenButton` — verify that selector); `set_captions`/`set_autoplay`
+read `aria-pressed`/`aria-checked` on native buttons — confirm those attributes exist.
+
+### PiP — open question (c), resolve empirically
+`enter_pip` already measures `navigator.userActivation.isActive` and falls back to clicking
+`SEL.watch.pipButton`. Run it from a tool call and **record here** whether the direct API
+succeeds (activation present) or the button fallback is what actually works.
+
+### Then: production MV3 extension
+Provider → `world:"MAIN"` content script; consumer → background worker (persists across
+the `open_video` full-nav reset) + popup/side-panel UI. Resolves open question (d).
 
 ## Open questions still live
 - **(c) PiP transient user activation** — measure in `enter_pip` (item 4).

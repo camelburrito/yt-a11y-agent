@@ -19,35 +19,47 @@ drives it for you.
 
 ## Status
 
-| Journey      | State |
-|--------------|-------|
-| **Home**     | ✅ Done — `list_home_feed`, `describe_home`, `open_video`, `load_more_home` |
-| Search       | 🔜 Planned — `run_search`, `list_results`, `refine_search`, `open_result` |
-| Watch        | 🔜 Planned — info, transcript, summary, plain-language summary, jump-to, playback, captions |
-| Watch Next   | 🔜 Planned — `list_up_next`, `play_next`, `set_autoplay` |
-| Comments     | 🔜 Planned — `get_comments`, `summarize_comments`, `get_pinned_comment` |
-| Picture-in-Picture | 🔜 Planned — `enter_pip`, `exit_pip` |
+All journeys are **implemented**. The **Home** journey is verified live against YouTube;
+the others are implemented and **pending live selector verification** (YouTube renames its
+DOM classes often — see [`docs/HANDOFF.md`](docs/HANDOFF.md) for the verify recipe).
 
-`where_am_i` works everywhere and tells the agent which surface you're on.
+| Journey      | Tools | State |
+|--------------|-------|-------|
+| **Home**     | `list_home_feed`, `describe_home`, `open_video`, `load_more_home` | ✅ verified live |
+| Search       | `run_search`, `list_results`, `refine_search`, `open_result` | ✅ implemented · verify pending |
+| Watch        | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` | ✅ implemented · verify pending |
+| Watch Next   | `list_up_next`, `play_next`, `set_autoplay` | ✅ implemented · verify pending |
+| Comments     | `get_comments`, `summarize_comments`, `get_pinned_comment` | ✅ implemented · verify pending |
+| Picture-in-Picture | `enter_pip`, `exit_pip` | ✅ implemented · verify pending |
+
+`where_am_i` works everywhere and tells the agent which surface you're on. The AI agent
+itself runs on **Chrome's on-device Gemini Nano** (no API key) — see
+[`src/agent/`](src/agent/).
 
 ## Requirements
 
-- **Google Chrome** with WebMCP testing enabled: `chrome://flags/#enable-webmcp-testing`
-  (restart Chrome after enabling).
+- **Google Chrome** with these flags enabled (restart after):
+  - `chrome://flags/#enable-webmcp-testing` — the WebMCP tools
+  - `chrome://flags/#prompt-api-for-gemini-nano` — the on-device agent model
+  - `chrome://flags/#optimization-guide-on-device-model` → "Enabled BypassPerfRequirement"
 - **[Tampermonkey](https://www.tampermonkey.net/)** (or any userscript manager that
-  supports `@grant none`).
-- A WebMCP-capable agent / inspector to call the tools — e.g. the
+  supports `@grant none`) — or just paste the scripts as DevTools snippets.
+- To call tools manually instead of via the agent, a WebMCP inspector such as the
   **Model Context Tool Inspector** extension.
 
 ## Try it
 
-1. Enable `chrome://flags/#enable-webmcp-testing` and restart Chrome.
-2. Install the userscript: open
+1. Enable the flags above and restart Chrome.
+2. Install the **provider**
    [`src/youtube-a11y-agent.user.js`](src/youtube-a11y-agent.user.js) in Tampermonkey
    (the `@grant none` header keeps it in the page's main world, which WebMCP requires).
 3. Open <https://www.youtube.com> and check the console for a `[yt-a11y]` line listing the
    registered tools.
-4. With the Model Context Tool Inspector, try `describe_home`, then `list_home_feed`, then
+4. **Via the agent** (no API key — on-device Gemini Nano): install the consumer harness
+   [`src/agent/dev-agent.user.js`](src/agent/dev-agent.user.js), then in the console run
+   `await ytAgent.activate()` for a spoken greeting, or
+   `await ytAgent.ask("what's on my home feed?")`. See [`src/agent/`](src/agent/).
+5. **Via an inspector** (manual): try `describe_home`, then `list_home_feed`, then
    `open_video` with an index. Navigate to a video and back — watch the registered tool
    set change with the route.
 
@@ -64,7 +76,9 @@ drives it for you.
 - **Media out-of-band:** speech and vision are handled in the script layer; tools
   themselves pass text only (WebMCP has no standard multimodal tool I/O yet).
 
-See [`CLAUDE.md`](CLAUDE.md) for architecture details and open questions.
+See [`docs/architecture/yt-a11y-agent.md`](docs/architecture/yt-a11y-agent.md) for the
+full architecture (with diagrams), and [`CLAUDE.md`](CLAUDE.md) for conventions and open
+questions.
 
 ## License
 
