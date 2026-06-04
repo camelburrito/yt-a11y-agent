@@ -35,6 +35,13 @@ user's existing assistive tech reports stays authoritative.
   pass **text only**. Web Speech (TTS/STT) and any vision/OCR are handled inside the
   script/agent layer, not shoved through the tool boundary. Tools return spoken-friendly
   text; the speaking happens elsewhere.
+- **Three layers.** (1) *Discovery/opt-in* — browser/AT surfaces the agent to a screen-
+  reader user, who opts in (platform-owned; harness simulates via `ytAgent.activate()`).
+  (2) *Consumer agent* — the MCP client (LLM + voice) that lists/calls our tools; dev
+  harness at `src/agent/dev-agent.user.js`, production = MV3 extension (LLM call off-page
+  to dodge YouTube CSP). (3) *Provider* — this userscript. The agent UX is **orient →
+  offer a short spoken menu → act on confirmation → don't autoplay**. Full flow + gotchas
+  (CSP, in-page nav reset) in `docs/HANDOFF.md`.
 
 ## Surfaces → tools
 
