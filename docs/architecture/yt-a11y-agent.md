@@ -222,6 +222,10 @@ sequenceDiagram
   - `navigator.modelContext` namespace; main-world registration passes youtube.com's
     `tools` permissions policy (interactive, by the user).
   - **Home** journey end to end (interactive).
+  - **Agent end to end (interactive):** on-device Gemini Nano with the **manual JSON tool
+    loop** spoke the `activate()` greeting and executed a real tool call that navigated the
+    page (observed video transition). Confirms TTS (voices/cancel/resume fix) and that the
+    manual loop fires tools where Nano's native tool-calling did not.
   - **Search / Watch / Watch-Next / Comments selectors** — via the headless harness
     `scripts/verify-selectors.mjs` (`npm run verify:selectors`), which runs the provider's
     real `readVideoCards`/`SEL.card` + watch/`<video>` + comments logic against live

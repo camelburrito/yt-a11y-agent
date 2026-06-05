@@ -58,8 +58,8 @@ control (offer, don't autoplay).**
 | Provider backbone (route-scoped registration via AbortController) | ✅ done, pushed |
 | Home journey tools (`list_home_feed`, `describe_home`, `open_video`, `load_more_home`) | ✅ verified live |
 | Cross-cutting `where_am_i` | ✅ done |
-| Consumer agent (dev harness, on-device Gemini Nano) | ✅ `src/agent/dev-agent.user.js` v0.3.0 — **manual JSON tool loop** (Nano native tool-calling is unreliable) |
-| Voice layer (Web Speech STT/TTS) | ✅ in the harness — TTS silence bugs fixed (voices/cancel/resume) |
+| Consumer agent (dev harness, on-device Gemini Nano) | ✅ `src/agent/dev-agent.user.js` v0.3.0 — **manual JSON tool loop**; verified end-to-end (tool call → page navigation observed) |
+| Voice layer (Web Speech STT/TTS) | ✅ in the harness — TTS silence bugs fixed (voices/cancel/resume), confirmed speaking |
 | Proactive `activate()` greeting | ✅ verified speaking interactively |
 | Search / Watch / Watch-Next / Comments / PiP journeys | ✅ **implemented + selectors verified live** (headless harness) |
 | Architecture doc with diagrams | ✅ `docs/architecture/yt-a11y-agent.md` |
