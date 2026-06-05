@@ -183,6 +183,11 @@ flowchart TB
   captures its own TTS). Optional push-to-talk hotkey runs one turn (the keypress doubles as
   the user gesture some Chrome builds require to open the mic). This is how the user replies
   to the agent's questions hands-free — without touching the console.
+- **Listen mode** — `captureUtterance()` dispatches on `state.listenMode`. Default
+  **`webspeech`** (Web Speech `SpeechRecognition` — fast, streaming). Opt-in **`nano`**
+  (`nanoAsr`: VAD mic capture → on-device Gemini Nano audio transcription) is **experimental**
+  — verified accurate but on-device audio inference is slow and briefly janks the page, so
+  it's unfit for real-time turn-taking; it auto-falls back to Web Speech on error.
 
 ### End-to-end: opt-in greeting + a tool turn
 
@@ -248,6 +253,10 @@ sequenceDiagram
 - **Known caveat:** during a preroll **ad**, `<video>.duration`/`currentTime` are the ad's;
   `get_video_info` detects the player's `ad-showing` class and reports `adPlaying` instead
   of ad timing.
+- **Multimodal Prompt API (2026-06):** this Chrome build exposes on-device **audio + image**
+  input (`expectedInputs`); Nano transcribed a `webm/opus` mic clip accurately. But audio
+  inference is slow / janks the page → Web Speech stays the default listen mode, Nano ASR is
+  opt-in/experimental. Image input is available but unused (future vision path).
 - **Open question (d):** multimodal contract when the consumer becomes the extension.
 
 ## Production trajectory

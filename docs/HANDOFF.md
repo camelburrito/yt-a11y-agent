@@ -103,6 +103,16 @@ control (offer, don't autoplay).**
   or if the queue gets stuck paused. `speak()` handles all three (wait for voices, set one,
   no pre-cancel, `resume()`). Console calls also aren't a user gesture — clicking the page
   once before a voice session makes it bulletproof.
+- **Listening: Web Speech is the default; Nano audio ASR is experimental.** Verified live
+  (2026-06): this Chrome build exposes on-device **audio AND image** input to the Prompt API
+  (`expectedInputs:[{type:"audio"}]` / `[{type:"image"}]`) behind
+  `#prompt-api-for-gemini-nano-multimodal-input`, and Nano transcribes a `webm/opus` mic clip
+  accurately with **no format conversion**. BUT on-device audio inference is **slow and
+  briefly janks the page** per utterance — too heavy for a real-time turn-by-turn loop. So
+  `listenMode` defaults to **Web Speech** (fast, streaming); Nano ASR is opt-in via
+  `ytAgent.setListenMode("nano")` (VAD-based capture in `nanoAsr`, auto-falls back to Web
+  Speech on error). Image input being available opens a **vision** path (describe a thumbnail
+  / frame the DOM can't expose) — noted for later, not built.
 - **In-page agent doesn't survive full navigations.** `open_video` sets
   `location.href` → cross-document load → the harness (living in the page) resets. SPA
   nav within YouTube survives; cross-document nav doesn't. A real extension consumer lives
@@ -160,9 +170,11 @@ the `open_video` full-nav reset) + popup/side-panel UI. Resolves open question (
 
 ## Open questions still live
 - **(c) PiP transient user activation** — measure in `enter_pip` (item 4).
-- **(d) Multimodal media handling** — the voice layer currently lives in the harness and
-  tools pass text only. Settle the contract (who speaks, who listens) when the consumer
-  becomes the extension. Web Speech is the current stack.
+- **(d) Multimodal media handling** — partly answered: on-device audio input works but is
+  too slow for real-time listening (Web Speech stays default; Nano ASR opt-in). Image input
+  also works → potential vision path. Still to settle: the speak/listen contract when the
+  consumer becomes the extension, and whether/when to use Nano vision for content the DOM
+  can't expose.
 - **Discovery/opt-in (layer 1)** — how the browser/AT actually surfaces and hands off to
   our agent. Largely platform-owned; track what makes us discoverable (registered tools,
   any agent manifest/labeling). Harness simulates with `activate()`.

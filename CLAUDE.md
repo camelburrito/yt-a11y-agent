@@ -44,7 +44,9 @@ user's existing assistive tech reports stays authoritative.
   Nano's native tool-calling narrates instead of executing, so don't rely on it; TTS needs
   the voices/cancel/resume care in `speak()`. The user replies hands-free via the
   `ytAgent.start()` conversation loop (greet→listen→respond→listen) or push-to-talk, not
-  console calls. (3) *Provider* — this userscript. UX is **orient →
+  console calls. Listening defaults to Web Speech STT; on-device Nano audio ASR works but is
+  too slow/janky for real-time, so it's opt-in only (`setListenMode("nano")`). (3) *Provider*
+  — this userscript. UX is **orient →
   offer a short spoken menu → act on confirmation → don't autoplay**. Full flow + gotchas
   (CSP, in-page nav reset) in `docs/HANDOFF.md`.
 

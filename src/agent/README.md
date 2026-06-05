@@ -89,6 +89,7 @@ ytAgent.useEngine(async (utterance) => {
 | `ytAgent.start()` | **Hands-free conversation loop**: greet → listen → respond → listen … |
 | `ytAgent.stop()` / `isRunning()` | End the loop / check if it's running |
 | `ytAgent.enablePushToTalk(opts?)` / `disablePushToTalk()` | Hotkey for one turn (default `Ctrl+Shift+Space`) |
+| `ytAgent.setListenMode("webspeech"\|"nano")` | STT backend. `webspeech` (default, fast). `nano` = **experimental** on-device audio transcription — accurate but slow and briefly freezes the page per turn; needs `#prompt-api-for-gemini-nano-multimodal-input`. |
 | `ytAgent.availability()` | Gemini Nano readiness |
 | `ytAgent.ask(text)` | One request (typed); runs the manual tool loop; returns reply text |
 | `ytAgent.activate()` | Proactive greeting (simulated opt-in handoff) |

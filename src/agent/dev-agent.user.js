@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.4.0
+// @version      0.5.0
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -195,6 +195,128 @@
   })();
 
   // ===========================================================================
+  // NANO ASR — optional speech-to-text via on-device Gemini Nano audio input
+  // (requires chrome://flags/#prompt-api-for-gemini-nano-multimodal-input). Records the mic
+  // with simple energy-based voice-activity detection (stops after trailing silence), then
+  // hands the clip to Nano to transcribe. Alternative to Web Speech STT; selected via
+  // ytAgent.setListenMode("nano").
+  // ===========================================================================
+  const nanoAsr = {
+    _rec: null,
+    _stream: null,
+
+    // Record one utterance: wait for speech, stop after `silenceMs` of trailing quiet, or
+    // `maxMs` hard cap. Returns a Blob, or null if nobody spoke. Energy-based VAD.
+    async recordUtterance({ maxMs = 12000, silenceMs = 1200, startTimeoutMs = 6000 } = {}) {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      this._stream = stream;
+      const rec = new MediaRecorder(stream);
+      this._rec = rec;
+      const chunks = [];
+      rec.ondataavailable = (e) => {
+        if (e.data && e.data.size) chunks.push(e.data);
+      };
+      const stopped = new Promise((res) => (rec.onstop = res));
+      rec.start();
+
+      const AC = window.AudioContext || window.webkitAudioContext;
+      const ac = new AC();
+      const analyser = ac.createAnalyser();
+      analyser.fftSize = 512;
+      ac.createMediaStreamSource(stream).connect(analyser);
+      const buf = new Uint8Array(analyser.fftSize);
+      const THRESH = 8; // RMS over the ~128-centered waveform that counts as "speech"
+      const t0 = Date.now();
+      let speechStarted = false;
+      let lastLoud = t0;
+
+      await new Promise((resolve) => {
+        const id = setInterval(() => {
+          if (rec.state !== "recording") {
+            clearInterval(id);
+            return resolve();
+          }
+          analyser.getByteTimeDomainData(buf);
+          let sum = 0;
+          for (let i = 0; i < buf.length; i++) {
+            const d = buf[i] - 128;
+            sum += d * d;
+          }
+          const rms = Math.sqrt(sum / buf.length);
+          const now = Date.now();
+          if (rms > THRESH) {
+            speechStarted = true;
+            lastLoud = now;
+          }
+          const elapsed = now - t0;
+          if (
+            elapsed > maxMs ||
+            (!speechStarted && elapsed > startTimeoutMs) ||
+            (speechStarted && now - lastLoud > silenceMs)
+          ) {
+            clearInterval(id);
+            resolve();
+          }
+        }, 100);
+      });
+
+      try {
+        if (rec.state === "recording") rec.stop();
+      } catch (_) {}
+      await stopped;
+      try {
+        ac.close();
+      } catch (_) {}
+      stream.getTracks().forEach((t) => t.stop());
+      this._stream = null;
+      this._rec = null;
+      if (!speechStarted || chunks.length === 0) return null;
+      return new Blob(chunks, { type: chunks[0].type || "audio/webm" });
+    },
+
+    async transcribe(blob) {
+      const LM = getLanguageModel();
+      if (!LM) throw new Error("Prompt API unavailable for transcription.");
+      const s = await LM.create({ expectedInputs: [{ type: "audio" }] });
+      try {
+        const out = await s.prompt([
+          {
+            role: "user",
+            content: [
+              { type: "text", value: "Transcribe this audio verbatim. Output only the words spoken, nothing else." },
+              { type: "audio", value: blob },
+            ],
+          },
+        ]);
+        return (out || "").trim();
+      } finally {
+        try {
+          s.destroy && s.destroy();
+        } catch (_) {}
+      }
+    },
+
+    async listenOnce() {
+      const blob = await this.recordUtterance();
+      if (!blob) throw new Error("no speech detected");
+      const text = await this.transcribe(blob);
+      if (!text) throw new Error("no speech detected");
+      return text;
+    },
+
+    abort() {
+      try {
+        if (this._rec && this._rec.state === "recording") this._rec.stop();
+      } catch (_) {}
+      try {
+        if (this._stream) this._stream.getTracks().forEach((t) => t.stop());
+      } catch (_) {}
+      this._rec = null;
+      this._stream = null;
+    },
+  };
+
+  // ===========================================================================
   // ENGINE — Chrome built-in Gemini Nano (Prompt API) with native tool calling.
   // The session is bound to the tools captured at creation time; tools are route-scoped,
   // so we rebuild the session when the captured tool set changes. Pluggable via
@@ -205,6 +327,9 @@
     session: null,
     sessionSig: null,
     running: false, // continuous conversation loop active?
+    // "webspeech" (default, fast, streaming) or "nano" (on-device audio transcription —
+    // EXPERIMENTAL: slower and can briefly jank the page during inference).
+    listenMode: "webspeech",
   };
 
   async function availability() {
@@ -350,9 +475,24 @@
     return reply;
   }
 
-  async function converse() {
+  // Capture one spoken utterance using the selected listen mode. Nano ASR is experimental
+  // (slow / can jank the page); on any non-silence error it falls back to Web Speech.
+  async function captureUtterance() {
+    if (state.listenMode === "nano") {
+      try {
+        return await nanoAsr.listenOnce();
+      } catch (e) {
+        if (e.message === "no speech detected") throw e;
+        log("nano ASR failed, falling back to Web Speech:", e.message);
+        return await voice.listenOnce();
+      }
+    }
     if (!voice.supported.stt) throw new Error("STT unavailable; use ytAgent.ask(text).");
-    const heard = await voice.listenOnce();
+    return await voice.listenOnce();
+  }
+
+  async function converse() {
+    const heard = await captureUtterance();
     log(`heard: ${heard}`);
     const reply = await ask(heard);
     await voice.speak(reply);
@@ -367,7 +507,8 @@
   // nothing, click the page once (or use push-to-talk, where the keypress is the gesture).
   const STOP_WORDS = /^\s*(stop|cancel|never mind|nevermind|goodbye|bye|that's all|thats all|quit|exit|done)\b/i;
   async function start() {
-    if (!voice.supported.stt) throw new Error("STT unavailable; use ytAgent.ask(text).");
+    if (state.listenMode === "webspeech" && !voice.supported.stt)
+      throw new Error("STT unavailable; use ytAgent.ask(text).");
     if (state.running) return "Already in a conversation.";
     state.running = true;
     await activate(); // speak the greeting + its question
@@ -375,7 +516,7 @@
     while (state.running) {
       let heard;
       try {
-        heard = await voice.listenOnce();
+        heard = await captureUtterance();
       } catch (e) {
         if (!state.running) break; // stop() aborted the listen
         if (++silent >= 2) {
@@ -403,6 +544,7 @@
     if (!state.running) return "Not currently in a conversation.";
     state.running = false;
     voice.abortListen();
+    nanoAsr.abort();
     voice.cancelSpeech();
     log("conversation stopped.");
     return "stopped";
@@ -455,13 +597,22 @@
     enablePushToTalk, // (opts?) bind a hotkey (default Ctrl+Shift+Space) for one turn
     disablePushToTalk,
     isRunning: () => state.running,
+    // "webspeech" (default) or "nano" (EXPERIMENTAL on-device audio transcription — slower,
+    // can jank the page; needs #prompt-api-for-gemini-nano-multimodal-input).
+    setListenMode(mode) {
+      state.listenMode = mode === "nano" ? "nano" : "webspeech";
+      if (state.listenMode === "nano")
+        log("listen mode: nano (experimental — slower, may briefly freeze the page per turn)");
+      else log("listen mode: webspeech");
+      return state.listenMode;
+    },
     useEngine(fn) {
       state.engine = typeof fn === "function" ? fn : geminiEngine;
       destroySession();
       log("engine:", state.engine === geminiEngine ? "Gemini Nano (default)" : "custom");
     },
     speak: voice.speak,
-    listen: voice.listenOnce,
+    listen: captureUtterance, // respects listenMode
     listTools: () => consumer.list().map((t) => ({ name: t.name, description: t.description })),
     reset() {
       destroySession();
