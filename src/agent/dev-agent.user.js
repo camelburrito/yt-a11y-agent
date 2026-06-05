@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.3.0
+// @version      0.4.0
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -152,10 +152,12 @@
       });
     }
 
+    let activeRec = null;
     function listenOnce() {
       return new Promise((resolve, reject) => {
         if (!SR) return reject(new Error("SpeechRecognition not supported in this browser."));
         const rec = new SR();
+        activeRec = rec;
         rec.lang = "en-US";
         rec.interimResults = false;
         rec.maxAlternatives = 1;
@@ -166,13 +168,30 @@
         };
         rec.onerror = (e) => reject(new Error("speech recognition error: " + e.error));
         rec.onend = () => {
+          activeRec = null;
           if (!done) reject(new Error("no speech detected"));
         };
         rec.start();
       });
     }
+    // Abort an in-progress listen (used by stop()).
+    function abortListen() {
+      if (activeRec) {
+        try {
+          activeRec.abort();
+        } catch (_) {}
+        activeRec = null;
+      }
+    }
+    function cancelSpeech() {
+      if (synth) {
+        try {
+          synth.cancel();
+        } catch (_) {}
+      }
+    }
 
-    return { speak, listenOnce, supported: { tts: !!synth, stt: !!SR } };
+    return { speak, listenOnce, abortListen, cancelSpeech, supported: { tts: !!synth, stt: !!SR } };
   })();
 
   // ===========================================================================
@@ -185,6 +204,7 @@
     engine: null, // set to geminiEngine below
     session: null,
     sessionSig: null,
+    running: false, // continuous conversation loop active?
   };
 
   async function availability() {
@@ -339,6 +359,89 @@
     return { heard, reply };
   }
 
+  // Continuous hands-free conversation: greet, then listen → respond → listen … until the
+  // user says a stop word, stays silent twice, or ytAgent.stop() is called. This is how a
+  // screen-reader user actually replies — they just talk; no console calls between turns.
+  // Turn-taking is sequential (we listen only AFTER finishing speaking) so the agent never
+  // hears its own TTS. Note: starting the mic may need a user gesture — if start() captures
+  // nothing, click the page once (or use push-to-talk, where the keypress is the gesture).
+  const STOP_WORDS = /^\s*(stop|cancel|never mind|nevermind|goodbye|bye|that's all|thats all|quit|exit|done)\b/i;
+  async function start() {
+    if (!voice.supported.stt) throw new Error("STT unavailable; use ytAgent.ask(text).");
+    if (state.running) return "Already in a conversation.";
+    state.running = true;
+    await activate(); // speak the greeting + its question
+    let silent = 0;
+    while (state.running) {
+      let heard;
+      try {
+        heard = await voice.listenOnce();
+      } catch (e) {
+        if (!state.running) break; // stop() aborted the listen
+        if (++silent >= 2) {
+          await voice.speak("I'll be here when you need me. Say start to talk again.");
+          break;
+        }
+        continue; // transient no-speech/error — keep listening
+      }
+      silent = 0;
+      if (!state.running) break;
+      log(`heard: ${heard}`);
+      if (STOP_WORDS.test(heard)) {
+        await voice.speak("Okay, I'll stop. Say start when you want me again.");
+        break;
+      }
+      const reply = await ask(heard);
+      if (!state.running) break;
+      await voice.speak(reply);
+    }
+    state.running = false;
+    return "conversation ended";
+  }
+
+  function stop() {
+    if (!state.running) return "Not currently in a conversation.";
+    state.running = false;
+    voice.abortListen();
+    voice.cancelSpeech();
+    log("conversation stopped.");
+    return "stopped";
+  }
+
+  // Optional push-to-talk: bind a hotkey that runs one converse() turn. Off by default
+  // (global key handlers can interfere with AT); requires a modifier combo and consumes the
+  // event so it won't trigger YouTube's own shortcuts. The keypress also counts as the user
+  // gesture some Chrome builds want before opening the mic.
+  let pttHandler = null;
+  function enablePushToTalk(opts = {}) {
+    disablePushToTalk();
+    const combo = { ctrlKey: true, shiftKey: true, altKey: false, code: "Space", ...opts };
+    pttHandler = (e) => {
+      if (
+        !!combo.ctrlKey === e.ctrlKey &&
+        !!combo.shiftKey === e.shiftKey &&
+        !!combo.altKey === e.altKey &&
+        e.code === combo.code
+      ) {
+        e.preventDefault();
+        e.stopPropagation();
+        converse().catch((err) => log("push-to-talk:", err.message));
+      }
+    };
+    window.addEventListener("keydown", pttHandler, true);
+    const label =
+      `${combo.ctrlKey ? "Ctrl+" : ""}${combo.shiftKey ? "Shift+" : ""}` +
+      `${combo.altKey ? "Alt+" : ""}${combo.code}`;
+    log(`push-to-talk enabled: press ${label} to speak one turn.`);
+    return label;
+  }
+  function disablePushToTalk() {
+    if (pttHandler) {
+      window.removeEventListener("keydown", pttHandler, true);
+      pttHandler = null;
+    }
+  }
+
   // ===========================================================================
   // PUBLIC API — headless on purpose (no DOM injection; AT-safe).
   // ===========================================================================
@@ -347,6 +450,11 @@
     ask, // ask(text) -> reply text
     activate, // proactive greeting (simulated opt-in handoff)
     converse, // listen -> ask -> speak (one turn)
+    start, // hands-free loop: greet, then listen<->respond until "stop" / silence / stop()
+    stop, // end the conversation loop
+    enablePushToTalk, // (opts?) bind a hotkey (default Ctrl+Shift+Space) for one turn
+    disablePushToTalk,
+    isRunning: () => state.running,
     useEngine(fn) {
       state.engine = typeof fn === "function" ? fn : geminiEngine;
       destroySession();
@@ -372,7 +480,8 @@
       availability().then((a) =>
         log(
           `ready. Gemini Nano: ${a}. voice: tts=${voice.supported.tts} stt=${voice.supported.stt}. ` +
-            `Try: await ytAgent.activate()  (or ytAgent.ask("what's on my home feed?"))`
+            `Try: ytAgent.start() for hands-free voice, ytAgent.ask("...") to type, ` +
+            `or ytAgent.enablePushToTalk() for a hotkey.`
         )
       );
       return;

@@ -156,12 +156,14 @@ flowchart TB
   subgraph consumer[src/agent/dev-agent.user.js]
     bridge[Consumer bridge<br/>wraps registerTool,<br/>captures tools,<br/>drops on AbortSignal]
     engine[Engine<br/>Gemini Nano session<br/>native tool calling]
-    voicem[Voice<br/>speak / listenOnce]
-    api[window.ytAgent<br/>activate / ask / converse]
+    voicem[Voice<br/>speak / listenOnce<br/>abortListen / cancelSpeech]
+    loop[Conversation loop<br/>start / stop<br/>push-to-talk hotkey]
+    api[window.ytAgent<br/>start / stop / ask / activate]
   end
   bridge --> engine
-  voicem --> api
-  engine --> api
+  voicem --> loop
+  engine --> loop
+  loop --> api
 ```
 
 - **Bridge** — the provider's `ModelContext` exposes only `registerTool` (no list/call),
@@ -175,6 +177,12 @@ flowchart TB
 - **Voice** — Web Speech `speechSynthesis` / `SpeechRecognition`, out-of-band from tools.
   `speak()` waits for `voiceschanged`, sets a voice, avoids the racing `cancel()`, and
   `resume()`s the paused queue (Chrome TTS-silence workarounds).
+- **Conversation loop** — `start()` speaks the greeting, then loops listen → respond →
+  listen so the user just talks back; ends on a stop word, two silent turns, or `stop()`.
+  Turn-taking is **sequential** (listen only after speaking finishes, so the agent never
+  captures its own TTS). Optional push-to-talk hotkey runs one turn (the keypress doubles as
+  the user gesture some Chrome builds require to open the mic). This is how the user replies
+  to the agent's questions hands-free — without touching the console.
 
 ### End-to-end: opt-in greeting + a tool turn
 

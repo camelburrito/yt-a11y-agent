@@ -109,15 +109,18 @@ If Gemini shows `downloadable`/`downloading`, the model is fetching — give it 
 In the Console:
 
 ```js
-await ytAgent.availability();              // "available" when the model is ready
-await ytAgent.activate();                  // spoken greeting: orients you + offers choices
-await ytAgent.ask("what's on my home feed?");
-await ytAgent.converse();                  // talk to it: listens, answers, speaks back
+await ytAgent.availability();   // "available" when the model is ready
+ytAgent.start();                // hands-free: it greets you, then you just TALK back
 ```
 
-Try navigating: `await ytAgent.ask("search for lo-fi music")`, then
+`start()` is the real mode: the agent speaks a greeting, then listens for your answer,
+responds, and listens again — so you simply talk. Say **"stop"** (or run `ytAgent.stop()`)
+to end. If the mic doesn't pick you up, click the page once first, or use a hotkey:
+`ytAgent.enablePushToTalk()` (press **Ctrl+Shift+Space** to speak one turn).
+
+Prefer typing? `await ytAgent.ask("search for lo-fi music")`, then
 `await ytAgent.ask("open the second result")` — watch the Console show the tool set change
-as the page changes.
+as the page navigates.
 
 ### Troubleshooting
 

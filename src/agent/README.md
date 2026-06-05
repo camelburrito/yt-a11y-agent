@@ -51,10 +51,24 @@ Gemini Nano downloads on first use; watch the console for progress. Check readin
    ```js
    await ytAgent.availability();          // "available" / "downloadable" / ...
    ytAgent.listTools();                   // confirms the bridge sees the provider's tools
-   await ytAgent.activate();              // proactive greeting (orient + menu)
-   await ytAgent.ask("what's on my home feed?");
-   await ytAgent.converse();              // listen -> ask -> speak (one voice turn)
+
+   ytAgent.start();                       // hands-free: greets, then you just TALK back
+   // ...converse naturally; say "stop" or call ytAgent.stop() to end.
+
+   ytAgent.enablePushToTalk();            // or: press Ctrl+Shift+Space for one turn each
+   await ytAgent.ask("what's on my home feed?");  // or type, no mic needed
    ```
+
+### How the user replies
+
+`ytAgent.start()` is the real conversational mode: it speaks the greeting, then **listens
+for the user's spoken answer, responds, and listens again** — a continuous loop, so the
+user just talks. It ends when the user says a stop word ("stop", "done", "goodbye"), stays
+silent for two turns, or `ytAgent.stop()` is called. Turn-taking is sequential (it listens
+only after it finishes speaking, so it never hears its own voice).
+
+If continuous listening picks up nothing, the mic may need a user gesture first — click the
+page once, or use **push-to-talk** (`enablePushToTalk()`; the keypress *is* the gesture).
 
 ## Testing without the model
 
@@ -72,8 +86,11 @@ ytAgent.useEngine(async (utterance) => {
 
 | Call | Purpose |
 |------|---------|
+| `ytAgent.start()` | **Hands-free conversation loop**: greet → listen → respond → listen … |
+| `ytAgent.stop()` / `isRunning()` | End the loop / check if it's running |
+| `ytAgent.enablePushToTalk(opts?)` / `disablePushToTalk()` | Hotkey for one turn (default `Ctrl+Shift+Space`) |
 | `ytAgent.availability()` | Gemini Nano readiness |
-| `ytAgent.ask(text)` | One request; Prompt API runs the tool loop; returns reply text |
+| `ytAgent.ask(text)` | One request (typed); runs the manual tool loop; returns reply text |
 | `ytAgent.activate()` | Proactive greeting (simulated opt-in handoff) |
 | `ytAgent.converse()` | STT → ask → TTS (one turn) |
 | `ytAgent.useEngine(fn)` | Swap the engine (mock / future bridge) |

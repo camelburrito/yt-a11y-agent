@@ -61,6 +61,7 @@ control (offer, don't autoplay).**
 | Consumer agent (dev harness, on-device Gemini Nano) | ✅ `src/agent/dev-agent.user.js` v0.3.0 — **manual JSON tool loop**; verified end-to-end (tool call → page navigation observed) |
 | Voice layer (Web Speech STT/TTS) | ✅ in the harness — TTS silence bugs fixed (voices/cancel/resume), confirmed speaking |
 | Proactive `activate()` greeting | ✅ verified speaking interactively |
+| Hands-free conversation loop | ✅ `ytAgent.start()`/`stop()` + push-to-talk (v0.4.0) — greet→listen→respond→listen; stop word / silence / `stop()` ends it |
 | Search / Watch / Watch-Next / Comments / PiP journeys | ✅ **implemented + selectors verified live** (headless harness) |
 | Architecture doc with diagrams | ✅ `docs/architecture/yt-a11y-agent.md` |
 | Headless selector verification | ✅ `scripts/verify-selectors.mjs` (`npm run verify:selectors`) |
