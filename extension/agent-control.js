@@ -39,6 +39,14 @@
           a.setListenMode(d.args);
           postStatus("idle", `Listen mode: ${d.args}`);
           break;
+        case "setTalkKey":
+          if (a.setTalkKey) a.setTalkKey(d.args);
+          postStatus("idle", `Talk key: ${d.args}`);
+          break;
+        case "setEarconVolume":
+          if (a.setEarconVolume) a.setEarconVolume(d.args);
+          if (a.speak) a.speak("Volume."); // sample so they hear the new level (and an earcon plays)
+          break;
         case "ping":
           postStatus("ready", `Ready (Gemini: ${await a.availability()}).`);
           break;

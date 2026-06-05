@@ -36,6 +36,27 @@ document.getElementById("activate").addEventListener("click", () => send("activa
 document.getElementById("nano").addEventListener("change", (e) =>
   send("setListenMode", e.target.checked ? "nano" : "webspeech")
 );
+document.getElementById("vol").addEventListener("input", (e) =>
+  send("setEarconVolume", parseFloat(e.target.value))
+);
+
+// Rebind the talk key: click, then press the key you want.
+const rebind = document.getElementById("rebind");
+const talkkey = document.getElementById("talkkey");
+let capturing = false;
+rebind.addEventListener("click", () => {
+  capturing = true;
+  setStatus("Press the key you want to use to talk…");
+});
+window.addEventListener("keydown", (e) => {
+  if (!capturing) return;
+  e.preventDefault();
+  capturing = false;
+  const label = e.key === "`" ? "`" : e.key.length === 1 ? e.key : e.code;
+  talkkey.textContent = label;
+  send("setTalkKey", e.code);
+  setStatus(`Talk key set to ${label}.`);
+});
 
 // Ask the page for readiness on open.
 send("ping");

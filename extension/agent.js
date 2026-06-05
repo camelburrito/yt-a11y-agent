@@ -266,7 +266,9 @@
   // ===========================================================================
   const audio = (() => {
     let ctx = null;
+    let vol = 1; // master multiplier (0 = mute), set via ytAgent.setEarconVolume
     function tone(freq, dur, type, gain) {
+      if (vol <= 0) return;
       try {
         ctx = ctx || new (window.AudioContext || window.webkitAudioContext)();
         if (ctx.state === "suspended") ctx.resume();
@@ -274,7 +276,7 @@
         const g = ctx.createGain();
         o.type = type || "sine";
         o.frequency.value = freq;
-        g.gain.value = gain || 0.05;
+        g.gain.value = (gain || 0.05) * vol;
         o.connect(g);
         g.connect(ctx.destination);
         const t = ctx.currentTime;
@@ -287,6 +289,10 @@
       captured: () => tone(900, 0.08, "sine", 0.05), // got your voice
       ready: () => tone(520, 0.1, "sine", 0.04), // done / your turn
       error: () => tone(200, 0.2, "triangle", 0.05), // didn't catch it
+      setVolume: (v) => {
+        vol = Math.max(0, Math.min(2, Number(v)));
+        return vol;
+      },
     };
   })();
 
@@ -972,6 +978,9 @@
     stop, // end the conversation loop
     enableTalk, // (key?) hold-to-talk + barge-in (default hold Backquote `); the primary input
     disableTalk,
+    setTalkKey: enableTalk, // alias: re-bind the talk key (KeyboardEvent.code, e.g. "Backquote")
+    setEarconVolume: audio.setVolume, // 0 mute … 1 default … 2 louder
+    talkKey: () => talk.key,
     enablePushToTalk, // (opts?) alternative: tap a combo (default Ctrl+Shift+Space) for one turn
     disablePushToTalk,
     consumePending, // read+clear the cross-navigation continuity message

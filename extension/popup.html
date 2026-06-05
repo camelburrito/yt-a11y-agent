@@ -81,6 +81,13 @@
       Use on-device Nano transcription (experimental, slower)
     </label>
 
+    <label for="vol">Feedback tone volume</label>
+    <input type="range" id="vol" min="0" max="2" step="0.1" value="1" style="width:100%" aria-label="Feedback tone volume" />
+
+    <div class="row">
+      <button id="rebind" aria-label="Change the talk key">Talk key: <span id="talkkey">`</span> — change</button>
+    </div>
+
     <div id="status" role="status" aria-live="polite">Connecting…</div>
 
     <script src="popup.js"></script>
