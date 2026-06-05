@@ -75,10 +75,12 @@ The project runs two scripts on YouTube: the **provider** (registers the tools) 
 **agent** (the AI that uses them). Three ways to load them, easiest first:
 
 **Option 0 — Chrome extension (recommended).** Auto-injects on every YouTube page (no
-re-pasting, survives navigation) and adds a Start/Stop popup. Open `chrome://extensions` →
-enable **Developer mode** → **Load unpacked** → select the **`extension/`** folder. Full
-steps in [`extension/README.md`](extension/README.md). The two manual options below are for
-quick experiments without installing anything.
+re-pasting, survives navigation) and is **hands-free**: it speaks when you first interact
+with the page, then `Ctrl+Shift+Space` to talk / `Alt+Shift+A` for an overview (a popup is
+the visual fallback). Open `chrome://extensions` → enable **Developer mode** → **Load
+unpacked** → select the **`extension/`** folder. Full steps in
+[`extension/README.md`](extension/README.md). The two manual options below are for quick
+experiments without installing anything.
 
 **Option A — DevTools snippets (quickest, nothing to install).**
 1. Open <https://www.youtube.com>, then open DevTools: **⌥⌘J** (Mac) / **Ctrl+Shift+J**

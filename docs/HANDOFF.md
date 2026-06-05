@@ -68,7 +68,7 @@ control (offer, don't autoplay).**
 | Architecture doc with diagrams | ✅ `docs/architecture/yt-a11y-agent.md` |
 | Headless selector verification | ✅ `scripts/verify-selectors.mjs` (`npm run verify:selectors`) |
 | PiP gesture path (open q. c) + transcript-open path | 🟡 partial — need a flagged interactive run |
-| Production extension (MV3) | ✅ **scaffolded** — `extension/` (MAIN-world content scripts reuse `src/` via `npm run build:extension`; ISOLATED `bridge.js`; Start/Stop popup). Auto-injects + survives navigation. Next: conversation state in a service worker; icons; Web Store packaging |
+| Production extension (MV3) | ✅ **scaffolded** — `extension/` (MAIN-world content scripts reuse `src/` via `npm run build:extension`; ISOLATED `bridge.js`; service worker for the global hotkey; popup as visual fallback). **Talk-first**: speaks on the user's first interaction + `Ctrl+Shift+Space` talk-back + `Alt+Shift+A` overview — no sighted click. Next: conversation **state** in the service worker (survive full-nav); icons; Web Store packaging |
 
 ## Verified facts (don't re-litigate)
 

@@ -52,4 +52,51 @@
   });
 
   postStatus("loaded", "Agent content script loaded.");
+
+  // ---------------------------------------------------------------------------
+  // Talk-first entry (accessibility). A popup click is sighted-first; instead, the agent
+  // announces itself by VOICE on the user's first interaction with the page — which is a
+  // valid user gesture for audio, and a screen-reader user generates one immediately (Tab /
+  // arrows). It enables a keyboard shortcut for talk-back (each press is a fresh mic
+  // gesture) so the whole thing works hands-free without ever seeing the popup.
+  // Browsers forbid speaking on bare page-load, so "first interaction" is the earliest we
+  // legally can. Greets once per tab session (sessionStorage survives same-tab navigation).
+  // ---------------------------------------------------------------------------
+  const GREETED = "ytA11yGreeted";
+  function alreadyGreeted() {
+    try {
+      return sessionStorage.getItem(GREETED) === "1";
+    } catch (_) {
+      return false;
+    }
+  }
+  function markGreeted() {
+    try {
+      sessionStorage.setItem(GREETED, "1");
+    } catch (_) {}
+  }
+
+  if (!alreadyGreeted()) {
+    const onFirstGesture = async () => {
+      window.removeEventListener("keydown", onFirstGesture, true);
+      window.removeEventListener("pointerdown", onFirstGesture, true);
+      markGreeted();
+      const a = window.ytAgent;
+      if (!a) return;
+      // Keyboard talk-back: each Ctrl+Shift+Space press is the gesture the mic needs.
+      try {
+        a.enablePushToTalk();
+      } catch (_) {}
+      // A short, instant spoken announcement (no model round-trip, so it can't be silent or
+      // janky). The full model-driven orientation runs on the Alt+Shift+A / popup greeting.
+      try {
+        await a.speak(
+          "YouTube accessibility agent ready. Hold Control Shift Space and speak to ask me anything, or press Alt Shift A for an overview of this page."
+        );
+      } catch (_) {}
+      postStatus("ready", "Ready. Hold Ctrl+Shift+Space to talk; Alt+Shift+A for an overview.");
+    };
+    window.addEventListener("keydown", onFirstGesture, true);
+    window.addEventListener("pointerdown", onFirstGesture, true);
+  }
 })();

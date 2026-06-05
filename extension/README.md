@@ -14,9 +14,10 @@ from `src/` by `npm run build:extension` (don't edit them directly).
 | `manifest.json` | — | MV3 manifest; declares the content scripts + popup |
 | `agent.js` | MAIN | the consumer agent (synced from `src/agent/dev-agent.user.js`) |
 | `provider.js` | MAIN | the WebMCP tool provider (synced from `src/youtube-a11y-agent.user.js`) |
-| `agent-control.js` | MAIN | maps extension commands → `window.ytAgent` |
+| `agent-control.js` | MAIN | maps extension commands → `window.ytAgent`; **talk-first** announce on first interaction |
 | `bridge.js` | ISOLATED | relays messages between the popup and the MAIN-world agent (MAIN can't use `chrome.*`) |
-| `popup.html` / `popup.js` | — | the toolbar control panel (out of the page's a11y tree) |
+| `service-worker.js` | — | dispatches the global `Alt+Shift+A` shortcut to the active tab |
+| `popup.html` / `popup.js` | — | toolbar control panel — a **visual fallback**, not the primary entry |
 
 Why two content-script "worlds": `navigator.modelContext` and the Prompt API only exist in
 the page's **MAIN** world, but `chrome.*` messaging only works in the **ISOLATED** world —
@@ -39,21 +40,29 @@ Same Chrome flags as the rest of the project (enable, then relaunch):
 3. Click **Load unpacked** and select this `extension/` folder.
 4. Pin the extension (puzzle-piece icon → pin) so the popup is one click away.
 
-## Use
+## Use — it talks first (no clicking required)
 
-1. Open <https://www.youtube.com>. The agent auto-loads (check the console for
-   `[yt-a11y]` / `[yt-a11y-agent]` lines). Unlike the snippets, it re-injects itself on
-   every navigation — no re-pasting.
-2. Click the extension's toolbar icon to open the popup:
-   - **▶ Start talking** — hands-free conversation: it greets you, then listens → responds →
-     listens. Say "stop" (or click **■ Stop**) to end. *Click the YouTube page once first so
-     the mic has a user gesture.*
-   - **🔊 Greeting** — just the proactive orientation ("You're on the home page… explore your
-     feed or search?").
-   - **Nano transcription** checkbox — experimental on-device STT (slower; Web Speech is the
-     default).
-3. You can still drive it from the page console via `window.ytAgent` (e.g.
-   `ytAgent.describeThumbnail(1)` for the vision feature).
+This is an accessibility supplement, so the primary flow is **hands-free, no sighted
+interaction**:
+
+1. Open <https://www.youtube.com>. The agent auto-loads on every page (re-injects on
+   navigation — no re-pasting).
+2. **On your first interaction with the page** (a keypress — e.g. Tab/arrows from a screen
+   reader — or a click), the agent **speaks**: *"YouTube accessibility agent ready. Hold
+   Control-Shift-Space and speak to ask me anything, or press Alt-Shift-A for an overview."*
+   (Browsers forbid audio on bare page-load, so the first interaction is the earliest it can
+   legally speak.) It greets once per tab session.
+3. **Hold `Ctrl+Shift+Space` and speak** to ask something — each press is the user gesture
+   the microphone needs. Or press **`Alt+Shift+A`** for the full spoken overview of the page
+   ("You're on the home page… explore your feed or search?").
+
+The **popup is a visual fallback** for sighted users / debugging — ▶ Start (continuous
+loop), ■ Stop, 🔊 Greeting, and a Nano-transcription toggle. You can also drive everything
+from the page console via `window.ytAgent` (e.g. `ytAgent.describeThumbnail(1)` for vision).
+
+> Why a keypress and not autoplay on load: the browser's autoplay/gesture policy blocks
+> speech and mic until the user interacts. Talking on first interaction is the accessible,
+> policy-compliant version of "talk first."
 
 ## Notes & limitations
 

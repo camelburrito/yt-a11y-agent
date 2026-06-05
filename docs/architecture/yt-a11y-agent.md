@@ -274,19 +274,22 @@ Userscripts → **MV3 extension** — **scaffolded** in `extension/`:
 
 ```mermaid
 flowchart TB
+  pop[popup.html / popup.js<br/>visual fallback]
   subgraph ext[extension/ · MV3]
-    pop[popup.html / popup.js<br/>Start · Stop · Greeting]
-    sw[(service worker<br/>— future: persistent state)]
+    sw[service worker<br/>Alt+Shift+A → active tab<br/>future: persistent state]
   end
   subgraph page[youtube.com page]
     iso[bridge.js · ISOLATED<br/>chrome.* ↔ window.postMessage]
     subgraph main[MAIN world]
+      ctl[agent-control.js<br/>talk-first on 1st gesture<br/>Ctrl+Shift+Space talk-back]
       ag[agent.js]
       pv[provider.js]
-      ctl[agent-control.js]
     end
   end
+  user2([User keypress]) -->|first interaction| ctl
+  user2 -->|Alt+Shift+A| sw
   pop -->|chrome.tabs.sendMessage| iso
+  sw -->|chrome.tabs.sendMessage| iso
   iso -->|postMessage| ctl
   ctl --> ag
   ag --> pv
@@ -298,10 +301,16 @@ flowchart TB
 - `navigator.modelContext` + the Prompt API live in MAIN; `chrome.*` only works in ISOLATED
   — so **`bridge.js`** (ISOLATED) relays popup commands to the MAIN-world agent via
   `window.postMessage`, and `agent-control.js` maps them onto `window.ytAgent`.
-- `popup.html` is the control UI — deliberately in the extension's own surface, **out of the
-  page's a11y tree** (AT-safe).
-- **Not yet:** a service worker holding conversation state across full navigations (today
-  only auto-reinjection persists, not history), icons, and Web Store packaging.
+- **Talk-first entry (accessibility).** A popup click is sighted-first, so `agent-control.js`
+  instead **speaks on the user's first interaction** with the page (a valid audio gesture; a
+  screen-reader user generates one immediately) and enables `Ctrl+Shift+Space` talk-back
+  (each press is the fresh gesture the mic needs). `Alt+Shift+A` (a `commands` shortcut via
+  the service worker) triggers the full spoken overview. This is the closest legal
+  approximation of layer-1 "discovery/opt-in" — browsers forbid audio on bare page-load.
+- `popup.html` is a **visual fallback** UI — in the extension's own surface, out of the
+  page's a11y tree (AT-safe).
+- **Not yet:** the service worker holds the hotkey dispatch but not **conversation state**;
+  persisting history across full navigations is the next step. Also: icons, Web Store packaging.
 
 ## Keeping this doc current
 
