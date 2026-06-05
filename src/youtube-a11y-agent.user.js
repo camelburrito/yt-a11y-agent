@@ -425,7 +425,7 @@
     return {
       name: "get_account",
       description:
-        "Report whether the user is signed in to YouTube and, if available, their account name — so you can welcome them by name. Call this once at the start of a session before greeting.",
+        "Report whether the user is signed in to YouTube. Returns {signedIn, name}; `name` is usually null (YouTube only exposes it once the account menu is open, which we don't do). If signed in, welcome them warmly ('Welcome back!'); use the name only if it is present. Call once at the start before greeting.",
       inputSchema: { type: "object", properties: {} },
       async execute() {
         const signedIn = !!document.querySelector(SEL.account.avatar) && !document.querySelector(SEL.account.signIn);

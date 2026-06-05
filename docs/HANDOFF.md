@@ -148,13 +148,13 @@ control (offer, don't autoplay).**
 
 | Surface | Detect | Tools | Status |
 |---------|--------|-------|--------|
-| home | `/` or `/feed*` | `list_home_feed`, `describe_home`, `open_video`, `load_more_home` (✅ live); `list_categories`, `select_category` (🟡 best-effort) | ✅ / verify |
+| home | `/` or `/feed*` | `list_home_feed`, `describe_home`, `open_video`, `load_more_home`, `list_categories`, `select_category` | ✅ verified live (chips confirmed: 12 categories) |
 | search | `/results` | `run_search`, `list_results`, `refine_search`, `open_result` | ✅ verified live |
 | watch | `/watch` | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` | ✅ verified live (transcript-open best-effort) |
 | watch-next | `/watch` | `list_up_next`, `play_next`, `set_autoplay` | ✅ verified live |
 | comments | `/watch` | `get_comments`, `summarize_comments`, `get_pinned_comment` | ✅ verified live |
 | pip | `/watch` | `enter_pip`, `exit_pip` | 🟡 button+fallback present; gesture path (q. c) needs flagged run |
-| (every route) | — | `where_am_i` ✅; `get_account` 🟡 (signed-in name best-effort) | ✅ / verify |
+| (every route) | — | `where_am_i` ✅; `get_account` ✅ (`signedIn` reliable; `name` is null — only in the account menu, which we don't open) | ✅ |
 | (agent, list surfaces) | home + search | arrow-key browse mode (`startBrowse`): Down/Up move, Enter plays, Escape exits; + personalized welcome (`get_account`) | new — verify interactively |
 | home (planned) | | `list_categories`, `open_category` (filter chip bar) | ⬜ |
 

@@ -265,6 +265,10 @@ sequenceDiagram
     YouTube. All fields populate. The harness caught a watch-next channel-extraction bug
     (channel isn't a `/@` link in the sidebar lockup) — fixed with a first-metadata-line
     fallback in `readVideoCards`.
+  - **Home categories** (`list_categories`) — confirmed live (12 chips via
+    `ytd-feed-filter-chip-bar-renderer yt-chip-cloud-chip-renderer`). **Account name** is NOT
+    in the DOM (only after opening the account menu, which we don't); `get_account` returns
+    reliable `signedIn` and `name: null`, so greet warmly without a name.
 - **Partial / needs a flagged interactive run:**
   - **PiP (open question c)** — button + fallback are present; which path actually fires
     (direct API vs. native-button gesture) needs a real tool call under the flags.
