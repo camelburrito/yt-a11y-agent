@@ -26,6 +26,10 @@ MV3 extension (for persistence across full navigations and out-of-page UI). See
 - **Voice** — Web Speech `speechSynthesis` (TTS) + `SpeechRecognition` (STT). Out-of-band
   from the tools. `speak()` waits for voices to load, sets one explicitly, avoids the
   racing `synth.cancel()`, and calls `resume()` to dodge Chrome's paused-queue silence bug.
+- **Vision** — `describe_image` is a consumer-local tool (merged into the model's tool
+  catalog) that fetches a thumbnail URL the provider supplies (`thumb` on list items /
+  `get_video_info`) and asks Nano (image input) to describe it for a non-sighted user.
+  One-shot/on-demand, so the brief inference pause is acceptable.
 - **`activate()`** — simulates the browser/AT opt-in handoff: a proactive, tool-driven
   greeting that orients the user and offers a branching menu.
 
@@ -90,6 +94,8 @@ ytAgent.useEngine(async (utterance) => {
 | `ytAgent.stop()` / `isRunning()` | End the loop / check if it's running |
 | `ytAgent.enablePushToTalk(opts?)` / `disablePushToTalk()` | Hotkey for one turn (default `Ctrl+Shift+Space`) |
 | `ytAgent.setListenMode("webspeech"\|"nano")` | STT backend. `webspeech` (default, fast). `nano` = **experimental** on-device audio transcription — accurate but slow and briefly freezes the page per turn; needs `#prompt-api-for-gemini-nano-multimodal-input`. |
+| `ytAgent.describeImage(url, question?)` | Describe an image (e.g. a `thumb` URL from a list item) via on-device Nano vision. |
+| `ytAgent.describeThumbnail(index, question?)` | Describe the thumbnail of item `index` on the current surface (home/search/up-next). |
 | `ytAgent.availability()` | Gemini Nano readiness |
 | `ytAgent.ask(text)` | One request (typed); runs the manual tool loop; returns reply text |
 | `ytAgent.activate()` | Proactive greeting (simulated opt-in handoff) |

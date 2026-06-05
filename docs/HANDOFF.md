@@ -62,6 +62,8 @@ control (offer, don't autoplay).**
 | Voice layer (Web Speech STT/TTS) | ✅ in the harness — TTS silence bugs fixed (voices/cancel/resume), confirmed speaking |
 | Proactive `activate()` greeting | ✅ verified speaking interactively |
 | Hands-free conversation loop | ✅ `ytAgent.start()`/`stop()` + push-to-talk (v0.4.0) — greet→listen→respond→listen; stop word / silence / `stop()` ends it |
+| Optional Nano audio ASR listen mode | ✅ v0.5.0 — `setListenMode("nano")`, experimental (slow); Web Speech default |
+| Vision: describe thumbnails (Nano image input) | ✅ v0.6.0 — provider gives `thumb` URLs; consumer `describe_image` tool + `ytAgent.describeImage/describeThumbnail`. Thumb pipeline verified live; Nano describe step pending user test |
 | Search / Watch / Watch-Next / Comments / PiP journeys | ✅ **implemented + selectors verified live** (headless harness) |
 | Architecture doc with diagrams | ✅ `docs/architecture/yt-a11y-agent.md` |
 | Headless selector verification | ✅ `scripts/verify-selectors.mjs` (`npm run verify:selectors`) |
@@ -111,8 +113,15 @@ control (offer, don't autoplay).**
   briefly janks the page** per utterance — too heavy for a real-time turn-by-turn loop. So
   `listenMode` defaults to **Web Speech** (fast, streaming); Nano ASR is opt-in via
   `ytAgent.setListenMode("nano")` (VAD-based capture in `nanoAsr`, auto-falls back to Web
-  Speech on error). Image input being available opens a **vision** path (describe a thumbnail
-  / frame the DOM can't expose) — noted for later, not built.
+  Speech on error). Image input is now used for **vision** (below).
+- **Vision (built, v0.6.0).** On-device image input works well and isn't latency-sensitive
+  (one-shot/on-demand), so it's a good fit. The provider derives a `thumb` URL per video
+  (`https://i.ytimg.com/vi/<id>/hqdefault.jpg`, fetchable — verified live) on list items and
+  `get_video_info`; the consumer's `describe_image` tool (and `ytAgent.describeImage` /
+  `describeThumbnail`) fetches it and asks Nano to describe it for a non-sighted user. Tool
+  boundary stays text-only (provider passes a URL, consumer does the vision). Capture uses
+  thumbnails, not video-frame canvas grabs, which sidesteps cross-origin tainting. The Nano
+  *describe* step itself still wants a quick interactive confirm (needs flags + model).
 - **In-page agent doesn't survive full navigations.** `open_video` sets
   `location.href` → cross-document load → the harness (living in the page) resets. SPA
   nav within YouTube survives; cross-document nav doesn't. A real extension consumer lives

@@ -183,9 +183,17 @@
         Array.from(el.querySelectorAll(SEL.card.duration))
           .map(txt)
           .find((t) => /^\d+:\d{2}/.test(t)) || "";
-      out.push({ index: out.length, title, channel, meta, duration, url });
+      // Thumbnail URL derived from the video id (robust vs. lazy-loaded <img> src). A
+      // consumer can fetch this and describe it for a user who can't see the screen.
+      out.push({ index: out.length, title, channel, meta, duration, url, thumb: thumbUrl(url) });
     }
     return out;
+  }
+
+  // Canonical thumbnail URL for a /watch URL (or video id). hqdefault.jpg always exists.
+  function thumbUrl(urlOrId) {
+    const m = String(urlOrId || "").match(/(?:[?&]v=|^)([A-Za-z0-9_-]{11})/);
+    return m ? `https://i.ytimg.com/vi/${m[1]}/hqdefault.jpg` : "";
   }
 
   // ---------------------------------------------------------------------------
@@ -439,6 +447,7 @@
             title: watchTitle(),
             channel: qsText(document, SEL.watch.channel),
             info: qsText(document, SEL.watch.info),
+            thumb: thumbUrl(location.search), // describe-able via the consumer's vision tool
             // During an ad, the <video> reports the ad's timing, not the video's.
             adPlaying: adShowing,
             position: v && !adShowing ? mmss(v.currentTime) : null,

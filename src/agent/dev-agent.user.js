@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.5.0
+// @version      0.6.0
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -317,6 +317,79 @@
   };
 
   // ===========================================================================
+  // VISION — describe an image (e.g. a video thumbnail) via on-device Gemini Nano image
+  // input (requires #prompt-api-for-gemini-nano-multimodal-input). One-shot / on-demand, so
+  // the brief inference jank is acceptable (unlike real-time listening). The provider hands
+  // us thumbnail URLs (the `thumb` field on list items / get_video_info) as plain text; we
+  // fetch and describe them here — keeping the tool boundary text-only.
+  // ===========================================================================
+  async function toJpeg(blob) {
+    try {
+      const bmp = await createImageBitmap(blob);
+      const c = document.createElement("canvas");
+      c.width = bmp.width;
+      c.height = bmp.height;
+      c.getContext("2d").drawImage(bmp, 0, 0);
+      return await new Promise((res) => c.toBlob((b) => res(b || blob), "image/jpeg", 0.9));
+    } catch (_) {
+      return blob; // fall back to the original bytes (Nano can usually decode them)
+    }
+  }
+
+  async function describeImage(url, question) {
+    if (!url) throw new Error("describeImage needs a url");
+    const LM = getLanguageModel();
+    if (!LM) throw new Error("Prompt API unavailable for vision.");
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`couldn't fetch image (${r.status})`);
+    const blob = await toJpeg(await r.blob());
+    const s = await LM.create({ expectedInputs: [{ type: "image" }] });
+    try {
+      const out = await s.prompt([
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              value:
+                question ||
+                "Describe this image for someone who cannot see it. Be concise and concrete in 1-2 sentences: main subject, setting, any visible text, and mood.",
+            },
+            { type: "image", value: blob },
+          ],
+        },
+      ]);
+      return (out || "").trim();
+    } finally {
+      try {
+        s.destroy && s.destroy();
+      } catch (_) {}
+    }
+  }
+
+  // Consumer-local tools — run in the agent (not registered on the page). Merged into the
+  // model's tool catalog alongside the provider's WebMCP tools so the agent can call them.
+  const localTools = [
+    {
+      name: "describe_image",
+      description:
+        "Describe an image for a user who cannot see it — typically a video thumbnail. Pass the image `url`: list items (list_home_feed / list_results / list_up_next) include a `thumb` URL, and get_video_info includes `thumb` for the current video. Optionally pass a `question` to ask something specific about it. On-device vision; may pause the page briefly.",
+      inputSchema: {
+        type: "object",
+        properties: { url: { type: "string" }, question: { type: "string" } },
+        required: ["url"],
+      },
+      execute: async ({ url, question } = {}) => {
+        try {
+          return await describeImage(url, question);
+        } catch (e) {
+          return "Couldn't describe the image: " + ((e && e.message) || e);
+        }
+      },
+    },
+  ];
+
+  // ===========================================================================
   // ENGINE — Chrome built-in Gemini Nano (Prompt API) with native tool calling.
   // The session is bound to the tools captured at creation time; tools are route-scoped,
   // so we rebuild the session when the captured tool set changes. Pluggable via
@@ -377,6 +450,7 @@
 
     const catalog = consumer
       .list()
+      .concat(localTools) // provider WebMCP tools + consumer-local tools (e.g. describe_image)
       .map(
         (t) =>
           `- ${t.name}: ${t.description || ""} | args: ${JSON.stringify(
@@ -424,7 +498,7 @@
   // up to MANUAL_LOOP_HOPS round-trips, then expect a {"action":"final"}.
   async function geminiEngine(utterance) {
     const session = await ensureSession();
-    const tools = consumer.asPromptApiTools();
+    const tools = consumer.asPromptApiTools().concat(localTools);
     let turn = `User said: ${utterance}`;
     for (let i = 0; i < MANUAL_LOOP_HOPS; i++) {
       const raw = await session.prompt(turn);
@@ -613,7 +687,28 @@
     },
     speak: voice.speak,
     listen: captureUtterance, // respects listenMode
-    listTools: () => consumer.list().map((t) => ({ name: t.name, description: t.description })),
+    describeImage, // (url, question?) -> spoken-friendly description via Nano vision
+    // Describe the thumbnail of item `index` on the current surface (home/search/up-next).
+    async describeThumbnail(index = 0, question) {
+      const path = location.pathname;
+      const listTool = path.startsWith("/results")
+        ? "list_results"
+        : path === "/" || path.startsWith("/feed")
+        ? "list_home_feed"
+        : path.startsWith("/watch")
+        ? "list_up_next"
+        : null;
+      if (!listTool) return "I can only describe thumbnails on the home, search, or watch pages.";
+      const res = await consumer.call(listTool, { limit: index + 1 });
+      let items = [];
+      try {
+        items = JSON.parse(res.content[0].text);
+      } catch (_) {}
+      const item = Array.isArray(items) ? items.find((v) => v.index === index) : null;
+      if (!item || !item.thumb) return `No thumbnail available for item ${index}.`;
+      return `${item.title}: ${await describeImage(item.thumb, question)}`;
+    },
+    listTools: () => consumer.list().concat(localTools).map((t) => ({ name: t.name, description: t.description })),
     reset() {
       destroySession();
       log("session reset.");

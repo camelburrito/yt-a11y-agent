@@ -59,7 +59,9 @@ const READ_CARDS = `
     if(!channel && metaParts.length) channel = metaParts[0];
     const meta = metaParts.filter(t=>t!==channel).join(" · ");
     const duration = Array.from(el.querySelectorAll(SELcard.duration)).map(txt).find(t=>/^\\d+:\\d{2}/.test(t)) || "";
-    out.push({ index: out.length, title, channel, meta, duration, url });
+    const tm = (url||"").match(/(?:[?&]v=|^)([A-Za-z0-9_-]{11})/);
+    const thumb = tm ? "https://i.ytimg.com/vi/"+tm[1]+"/hqdefault.jpg" : "";
+    out.push({ index: out.length, title, channel, meta, duration, url, thumb });
   }
   return out;
 })`;
@@ -97,6 +99,20 @@ async function main() {
       SEL.search.container
     );
     report.search = { count: results.length, sample: results };
+
+    // Verify the derived thumbnail URL is actually fetchable (vision pipeline).
+    const thumb = results.find((r) => r.thumb)?.thumb;
+    if (thumb) {
+      report.thumbCheck = await page.evaluate(async (u) => {
+        try {
+          const r = await fetch(u);
+          const b = await r.blob();
+          return { url: u, ok: r.ok, status: r.status, bytes: b.size, type: b.type };
+        } catch (e) {
+          return { url: u, error: e.name + ": " + e.message };
+        }
+      }, thumb);
+    }
 
     // ---- WATCH (open the first real result) ----
     const firstUrl = results.find((r) => r.url && r.url.includes("/watch"))?.url;

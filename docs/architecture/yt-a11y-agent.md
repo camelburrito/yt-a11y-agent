@@ -188,6 +188,12 @@ flowchart TB
   (`nanoAsr`: VAD mic capture → on-device Gemini Nano audio transcription) is **experimental**
   — verified accurate but on-device audio inference is slow and briefly janks the page, so
   it's unfit for real-time turn-taking; it auto-falls back to Web Speech on error.
+- **Vision** — `describe_image` is a **consumer-local tool** (merged into the model's
+  catalog alongside the provider's WebMCP tools). The provider emits a `thumb` URL (text)
+  per video; the consumer fetches it and asks Nano (image input) to describe it for a
+  non-sighted user. Keeps the tool boundary text-only and uses thumbnails (not video-frame
+  canvas grabs) to sidestep cross-origin tainting. Also exposed as `ytAgent.describeImage` /
+  `describeThumbnail`. One-shot, so the inference jank is acceptable.
 
 ### End-to-end: opt-in greeting + a tool turn
 
@@ -254,9 +260,10 @@ sequenceDiagram
   `get_video_info` detects the player's `ad-showing` class and reports `adPlaying` instead
   of ad timing.
 - **Multimodal Prompt API (2026-06):** this Chrome build exposes on-device **audio + image**
-  input (`expectedInputs`); Nano transcribed a `webm/opus` mic clip accurately. But audio
+  input (`expectedInputs`); Nano transcribed a `webm/opus` mic clip accurately. Audio
   inference is slow / janks the page → Web Speech stays the default listen mode, Nano ASR is
-  opt-in/experimental. Image input is available but unused (future vision path).
+  opt-in. Image input is used for **vision** (`describe_image`); the `thumb` URL derivation
+  and fetchability are verified live, the Nano describe step pending an interactive confirm.
 - **Open question (d):** multimodal contract when the consumer becomes the extension.
 
 ## Production trajectory

@@ -66,6 +66,11 @@ user's existing assistive tech reports stays authoritative.
 `where_am_i` is **cross-cutting** — registered on every route. It returns the current
 surface + pathname so the agent can orient itself.
 
+Video lists and `get_video_info` include a `thumb` URL (`i.ytimg.com/vi/<id>/hqdefault.jpg`).
+The agent's **consumer-local** `describe_image` tool (not a provider tool) fetches it and
+uses on-device Nano image input to describe it for a non-sighted user — keeping the tool
+boundary text-only (provider passes a URL; the consumer does the vision).
+
 ## Conventions
 
 - **One SEL block.** Every YouTube selector lives in the `SEL` object at the top of the
