@@ -127,7 +127,8 @@ as the page changes.
 | `WebMCP API not found` | `#enable-webmcp-testing` isn't on, Chrome wasn't relaunched, or a script lost `@grant none`. |
 | `ytAgent.availability()` says `unavailable` | Gemini Nano flags aren't both on, or your device/Chrome can't run it. Try Chrome Canary. |
 | Tools return blank/empty lists | YouTube changed its page structure (it does, often). Run `npm run verify:selectors` to see what's drifting — see [Development](#development). |
-| Nothing is spoken | Your OS/Chrome may have no speech voice, or the tab isn't focused. `ytAgent.ask(...)` still returns text in the console. |
+| Nothing is spoken | Click anywhere on the YouTube page once, then run the command — console calls don't count as a user gesture, which can mute speech. (The agent already waits for voices and calls `resume()` to dodge Chrome's silence bugs.) `ytAgent.ask(...)` still returns text in the console regardless. |
+| Agent says "I'm calling a tool…" but nothing happens | You're on an older build of the script — update to the current `dev-agent.user.js` (v0.3.0+), which drives tools with a manual JSON loop instead of Nano's unreliable native tool-calling. |
 
 To call tools by hand instead of through the agent, use a WebMCP inspector such as the
 **Model Context Tool Inspector** extension.

@@ -40,7 +40,9 @@ user's existing assistive tech reports stays authoritative.
   (2) *Consumer agent* — the MCP client (on-device Gemini Nano via the Prompt API + Web
   Speech) that lists/calls our tools; dev harness at `src/agent/dev-agent.user.js`,
   production = MV3 extension (for persistence across navigations + out-of-page UI; the
-  model is on-device so CSP is a non-issue). (3) *Provider* — this userscript. UX is **orient →
+  model is on-device so CSP is a non-issue). Tools are driven by a **manual JSON loop** —
+  Nano's native tool-calling narrates instead of executing, so don't rely on it; TTS needs
+  the voices/cancel/resume care in `speak()`. (3) *Provider* — this userscript. UX is **orient →
   offer a short spoken menu → act on confirmation → don't autoplay**. Full flow + gotchas
   (CSP, in-page nav reset) in `docs/HANDOFF.md`.
 

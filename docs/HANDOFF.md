@@ -58,9 +58,9 @@ control (offer, don't autoplay).**
 | Provider backbone (route-scoped registration via AbortController) | ✅ done, pushed |
 | Home journey tools (`list_home_feed`, `describe_home`, `open_video`, `load_more_home`) | ✅ verified live |
 | Cross-cutting `where_am_i` | ✅ done |
-| Consumer agent (dev harness, on-device Gemini Nano) | ✅ `src/agent/dev-agent.user.js` |
-| Voice layer (Web Speech STT/TTS) | ✅ in the harness |
-| Proactive `activate()` greeting | ✅ |
+| Consumer agent (dev harness, on-device Gemini Nano) | ✅ `src/agent/dev-agent.user.js` v0.3.0 — **manual JSON tool loop** (Nano native tool-calling is unreliable) |
+| Voice layer (Web Speech STT/TTS) | ✅ in the harness — TTS silence bugs fixed (voices/cancel/resume) |
+| Proactive `activate()` greeting | ✅ verified speaking interactively |
 | Search / Watch / Watch-Next / Comments / PiP journeys | ✅ **implemented + selectors verified live** (headless harness) |
 | Architecture doc with diagrams | ✅ `docs/architecture/yt-a11y-agent.md` |
 | Headless selector verification | ✅ `scripts/verify-selectors.mjs` (`npm run verify:selectors`) |
@@ -91,10 +91,17 @@ control (offer, don't autoplay).**
   This removes the API key and the CSP problem entirely (the page never fetches a model
   endpoint). Requires Chrome flags `#prompt-api-for-gemini-nano` and
   `#optimization-guide-on-device-model`; the model downloads on first use. Check with
-  `await ytAgent.availability()`. Caveat: Nano is small — native multi-tool function
-  calling may be less reliable than a frontier model; if it misbehaves, the fallback is a
-  manual JSON tool-selection loop using the Prompt API's `responseConstraint` (structured
-  output) — documented option, not yet built. Engine is pluggable: `ytAgent.useEngine(fn)`.
+  `await ytAgent.availability()`. **Nano's native tool-calling is confirmed unreliable** —
+  it narrates "I'm calling a tool…" instead of emitting a real call, so nothing executes.
+  The agent therefore uses a **manual JSON tool loop** (`geminiEngine`): the system prompt
+  asks for one strict-JSON action per turn, which we parse, run, and feed back. This is
+  what actually works on-device (verified interactively in the linked session). Engine is
+  pluggable: `ytAgent.useEngine(fn)`.
+- **TTS can be silent without care.** Chrome drops `speechSynthesis` utterances if you call
+  `cancel()` right before `speak()`, if voices haven't loaded yet (async `voiceschanged`),
+  or if the queue gets stuck paused. `speak()` handles all three (wait for voices, set one,
+  no pre-cancel, `resume()`). Console calls also aren't a user gesture — clicking the page
+  once before a voice session makes it bulletproof.
 - **In-page agent doesn't survive full navigations.** `open_video` sets
   `location.href` → cross-document load → the harness (living in the page) resets. SPA
   nav within YouTube survives; cross-document nav doesn't. A real extension consumer lives

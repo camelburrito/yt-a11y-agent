@@ -16,13 +16,16 @@ MV3 extension (for persistence across full navigations and out-of-page UI). See
   the provider registers them (and drops them on `AbortSignal` when routes change). The
   provider exposes only `registerTool`, so wrapping is how a same-page consumer gets a
   live tool registry.
-- **Engine** — Chrome's `LanguageModel` (Gemini Nano) with **native tool calling**.
-  Captured WebMCP tools are wrapped into Prompt-API tools (`{ name, description,
-  inputSchema, execute }` — nearly the same shape); the API runs the tool-call loop
-  internally and returns final text. The session rebuilds when the route-scoped tool set
-  changes.
+- **Engine** — Chrome's `LanguageModel` (Gemini Nano) driven by a **manual JSON tool
+  loop**. Nano's *native* tool-calling (`create({ tools })` auto-loop) proved unreliable —
+  it narrates "I'm calling a tool…" instead of emitting a real call — so instead the system
+  prompt asks for one line of strict JSON per turn (`{"action":"call",...}` /
+  `{"action":"final",...}`), which `geminiEngine` parses, runs against the captured tool,
+  and feeds back (up to `MANUAL_LOOP_HOPS` round-trips). The session rebuilds when the
+  route-scoped tool set changes.
 - **Voice** — Web Speech `speechSynthesis` (TTS) + `SpeechRecognition` (STT). Out-of-band
-  from the tools, which stay text-only.
+  from the tools. `speak()` waits for voices to load, sets one explicitly, avoids the
+  racing `synth.cancel()`, and calls `resume()` to dodge Chrome's paused-queue silence bug.
 - **`activate()`** — simulates the browser/AT opt-in handoff: a proactive, tool-driven
   greeting that orients the user and offers a branching menu.
 

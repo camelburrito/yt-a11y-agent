@@ -167,10 +167,14 @@ flowchart TB
 - **Bridge** — the provider's `ModelContext` exposes only `registerTool` (no list/call),
   so the consumer wraps `registerTool` to build a live registry, honoring each tool's
   `AbortSignal` to drop it when its route ends.
-- **Engine** — wraps captured tools into Prompt-API tools (shapes nearly match) and runs
-  `LanguageModel` sessions; the Prompt API runs the tool-call loop internally. The session
-  is rebuilt when the route-scoped toolset changes.
+- **Engine** — runs `LanguageModel` (Gemini Nano) sessions via a **manual JSON tool loop**
+  (`geminiEngine`): Nano's native `create({ tools })` auto-loop is unreliable (narrates
+  instead of calling), so the system prompt requests one strict-JSON action per turn, which
+  we parse, execute against the captured tool, and feed back. Session rebuilds on toolset
+  change.
 - **Voice** — Web Speech `speechSynthesis` / `SpeechRecognition`, out-of-band from tools.
+  `speak()` waits for `voiceschanged`, sets a voice, avoids the racing `cancel()`, and
+  `resume()`s the paused queue (Chrome TTS-silence workarounds).
 
 ### End-to-end: opt-in greeting + a tool turn
 

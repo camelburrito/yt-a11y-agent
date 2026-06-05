@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.2.0
+// @version      0.3.0
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -18,7 +18,9 @@
 //
 // ENGINE: Chrome built-in Gemini Nano via the Prompt API (LanguageModel). On-device, so
 // there is NO API key and NO external network call — which also means YouTube's CSP is a
-// non-issue here. Requires Chrome flags:
+// non-issue here. Tools are driven by a MANUAL JSON loop (geminiEngine), not Nano's native
+// tool-calling, which proved unreliable (it narrates calls instead of emitting them).
+// Requires Chrome flags:
 //   chrome://flags/#prompt-api-for-gemini-nano
 //   chrome://flags/#optimization-guide-on-device-model   (set to "Enabled BypassPerfRequirement")
 // The model may download on first use (watch the console for progress).
@@ -28,6 +30,7 @@
 
   const LOG = "[yt-a11y-agent]";
   const log = (...a) => console.log(LOG, ...a);
+  const MANUAL_LOOP_HOPS = 4; // max tool-call round-trips per ask() in the manual JSON loop
 
   function getModelContext() {
     return (
@@ -128,12 +131,24 @@
     function speak(text) {
       return new Promise((resolve) => {
         if (!synth || !text) return resolve();
-        synth.cancel();
-        const u = new SpeechSynthesisUtterance(text);
-        u.rate = 1.05;
-        u.onend = () => resolve();
-        u.onerror = () => resolve();
-        synth.speak(u);
+        // Do NOT call synth.cancel() right before speak() — on Chrome it races and can
+        // swallow the utterance (silent TTS). Also wait for voices to load (they arrive
+        // async via voiceschanged; getVoices() is often empty on the first call), pick one
+        // explicitly, and resume() to unstick Chrome's long-standing paused-queue bug.
+        const fire = () => {
+          const u = new SpeechSynthesisUtterance(text);
+          u.rate = 1.05;
+          const v =
+            synth.getVoices().find((x) => x.lang && x.lang.startsWith("en")) ||
+            synth.getVoices()[0];
+          if (v) u.voice = v;
+          u.onend = () => resolve();
+          u.onerror = () => resolve();
+          synth.speak(u);
+          setTimeout(() => synth.resume(), 100);
+        };
+        if (synth.getVoices().length) fire();
+        else synth.addEventListener("voiceschanged", fire, { once: true });
       });
     }
 
@@ -194,6 +209,11 @@
     state.sessionSig = null;
   }
 
+  // Build the per-route session. We do NOT use Nano's native tool-calling
+  // (LanguageModel.create({ tools }) + auto-loop): in practice Nano narrates
+  // "I'm calling a tool..." in prose instead of emitting a real call, so nothing
+  // executes. Instead we drive tools manually (see geminiEngine): the system prompt
+  // instructs the model to emit ONE line of strict JSON per turn, which we parse and run.
   async function ensureSession() {
     const sig = consumer.signature();
     if (state.session && state.sessionSig === sig) return state.session;
@@ -210,9 +230,26 @@
       throw new Error(`Gemini Nano unavailable on this device (availability="${avail}").`);
     }
 
+    const catalog = consumer
+      .list()
+      .map(
+        (t) =>
+          `- ${t.name}: ${t.description || ""} | args: ${JSON.stringify(
+            t.inputSchema || { type: "object", properties: {} }
+          )}`
+      )
+      .join("\n");
+    const sys =
+      SYSTEM +
+      "\n\n" +
+      "You control the page through tools. On EVERY turn reply with ONE line of strict JSON, nothing else, no markdown fences.\n" +
+      'To use a tool: {"action":"call","tool":"<name>","args":{...}}\n' +
+      'When you can answer the user: {"action":"final","say":"<the reply to speak>"}\n' +
+      "Available tools:\n" +
+      catalog;
+
     state.session = await LM.create({
-      initialPrompts: [{ role: "system", content: SYSTEM }],
-      tools: consumer.asPromptApiTools(),
+      initialPrompts: [{ role: "system", content: sys }],
       monitor(m) {
         if (m && m.addEventListener) {
           m.addEventListener("downloadprogress", (e) =>
@@ -226,10 +263,50 @@
     return state.session;
   }
 
+  // Extract the first JSON object from a model reply (tolerates stray prose / code fences).
+  function parseAction(raw) {
+    if (!raw) return null;
+    const m = raw.replace(/```(?:json)?/gi, "").match(/\{[\s\S]*\}/);
+    if (!m) return null;
+    try {
+      return JSON.parse(m[0]);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // Manual tool-call loop: prompt -> parse JSON action -> run tool -> feed result back,
+  // up to MANUAL_LOOP_HOPS round-trips, then expect a {"action":"final"}.
   async function geminiEngine(utterance) {
     const session = await ensureSession();
-    // The Prompt API runs the tool-call loop internally and returns the final text.
-    return await session.prompt(utterance);
+    const tools = consumer.asPromptApiTools();
+    let turn = `User said: ${utterance}`;
+    for (let i = 0; i < MANUAL_LOOP_HOPS; i++) {
+      const raw = await session.prompt(turn);
+      const step = parseAction(raw);
+      if (!step) return raw.trim(); // model returned plain prose; just use it
+      if (step.action === "final") return step.say || "";
+      if (step.action === "call") {
+        const tool = tools.find((t) => t.name === step.tool);
+        if (!tool) {
+          turn = `No tool "${step.tool}". Available: ${tools
+            .map((t) => t.name)
+            .join(", ")}. Reply with valid JSON.`;
+          continue;
+        }
+        let result;
+        try {
+          result = await tool.execute(step.args || {});
+        } catch (e) {
+          result = "tool error: " + ((e && e.message) || e);
+        }
+        log(`tool ${step.tool} ->`, result);
+        turn = `Result of ${step.tool}:\n${result}\n\nNow call another tool or give the final answer as JSON.`;
+        continue;
+      }
+      return raw.trim();
+    }
+    return "Sorry, I couldn't complete that.";
   }
   state.engine = geminiEngine;
 
