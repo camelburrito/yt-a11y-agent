@@ -54,7 +54,7 @@ user's existing assistive tech reports stays authoritative.
 
 | Surface | Detect (pathname)            | Tools |
 |---------|------------------------------|-------|
-| home    | `/` or `/feed*`              | `list_home_feed`, `describe_home`, `open_video`, `load_more_home` ✅ verified live |
+| home    | `/` or `/feed*`              | `list_home_feed`, `describe_home`, `open_video`, `load_more_home` ✅ verified live; `list_categories`, `select_category` 🟡 best-effort (signed-in only, verify live) |
 | search  | `/results`                   | `run_search`, `list_results`, `refine_search`, `open_result` ✅ verified live |
 | watch   | `/watch`                     | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` ✅ verified live (transcript-open best-effort) |
 | watch-next | `/watch` (same surface)   | `list_up_next`, `play_next`, `set_autoplay` ✅ verified live |
@@ -63,8 +63,15 @@ user's existing assistive tech reports stays authoritative.
 | channel | `/@*`, `/channel/*`, `/c/*`  | (cross-cutting only for now) |
 | other   | anything else                | (cross-cutting only) |
 
-`where_am_i` is **cross-cutting** — registered on every route. It returns the current
-surface + pathname so the agent can orient itself.
+`where_am_i` and `get_account` are **cross-cutting** — registered on every route.
+`where_am_i` returns surface + pathname; `get_account` returns `{signedIn, name}` so the
+agent can welcome the user by name (name is best-effort — signed-in only, may be empty).
+
+**Arrow-key browsing** (agent-side, `ytAgent.startBrowse`): on the home feed and search
+results the extension arms arrow keys so the user steps through videos hearing each
+described (Down/Up move, Enter plays, Escape exits). It captures arrows only while armed and
+not in a text field. Off on `/watch` (arrows seek the player). Voice/loop and tools are
+unchanged; this is guided navigation layered on top.
 
 Video lists and `get_video_info` include a `thumb` URL (`i.ytimg.com/vi/<id>/hqdefault.jpg`).
 The agent's **consumer-local** `describe_image` tool (not a provider tool) fetches it and

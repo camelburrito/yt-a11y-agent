@@ -55,6 +55,11 @@ interaction**:
 3. **Hold `Ctrl+Shift+Space` and speak** to ask something — each press is the user gesture
    the microphone needs. Or press **`Alt+Shift+A`** for the full spoken overview of the page
    ("You're on the home page… explore your feed or search?").
+4. **Arrow keys browse the feed** (on the home page and search results): **Down/Up** move to
+   the next/previous video and describe it ("Item 3 of 20: <title>, by <channel>, 10:26"),
+   **Enter** plays it, **Escape** stops browsing. Arrows are ignored while you're typing in
+   the search box, and on `/watch` (where they seek the player). The agent welcomes you by
+   name when you're signed in, and on the home page reads out the available categories.
 
 The **popup is a visual fallback** for sighted users / debugging — ▶ Start (continuous
 loop), ■ Stop, 🔊 Greeting, and a Nano-transcription toggle. You can also drive everything

@@ -69,6 +69,17 @@
     home: {
       // The tile wrapper. Contents are a yt-lockup-view-model (see SEL.card).
       container: "ytd-rich-item-renderer",
+      // Home feed filter chips ("All, Music, Live, Gaming, …"). BEST-EFFORT — these only
+      // render when signed in; verify live (see docs/HANDOFF.md probe).
+      chip: "ytd-feed-filter-chip-bar-renderer yt-chip-cloud-chip-renderer, #chips yt-chip-cloud-chip-renderer, yt-chip-cloud-chip-renderer",
+    },
+
+    // Masthead account info. BEST-EFFORT — signed-in only; name often isn't in the DOM
+    // until the account menu opens, so `name` may be empty (greeting degrades gracefully).
+    account: {
+      avatar: "#avatar-btn, button#avatar-btn, ytd-topbar-menu-button-renderer #avatar img",
+      name: "#account-name, ytd-active-account-header-renderer #account-name, #avatar-btn img[alt]",
+      signIn: "a[href*='ServiceLogin'], a[href*='accounts.google'], ytd-button-renderer a[aria-label*='Sign in' i]",
     },
 
     search: {
@@ -81,6 +92,7 @@
       channel: "ytd-channel-name#channel-name a, #owner #channel-name a, #upload-info #channel-name a",
       info: "ytd-watch-metadata #info, #info-container, ytd-watch-info-text",
       video: "video.html5-main-video, video",
+      playButton: "button.ytp-play-button",
       // Player container; gets an "ad-showing"/"ad-interrupting" class during ads, when
       // <video>.duration reflects the AD, not the real video.
       player: "#movie_player, .html5-video-player",
@@ -143,6 +155,22 @@
   }
 
   const getVideo = () => document.querySelector(SEL.watch.video);
+
+  // Start playback robustly. video.play() can be rejected by the autoplay policy when there
+  // was no recent user gesture (common after a programmatic navigation); fall back to
+  // clicking YouTube's native play button, and report honestly rather than failing silently.
+  async function tryPlay(v) {
+    try {
+      await v.play();
+      return "Playing.";
+    } catch (e) {
+      const btn = document.querySelector(SEL.watch.playButton);
+      if (btn && v.paused) btn.click();
+      // Re-check after the click.
+      if (!v.paused) return "Playing.";
+      return "I couldn't start playback automatically — the browser may need a keypress first. Press the space bar (or Ctrl+Shift+Space and say play) to start it.";
+    }
+  }
 
   // Actuate a native control (read-and-act; we click YouTube's own button, never build
   // our own UI). Returns whether something was clicked.
@@ -325,6 +353,46 @@
           );
         },
       },
+
+      {
+        name: "list_categories",
+        description:
+          "List the home feed's filter categories (the chips like 'All, Music, Live, Gaming, …'). Use this in the greeting so the user can pick a category to filter the feed.",
+        inputSchema: { type: "object", properties: {} },
+        async execute() {
+          const chips = Array.from(document.querySelectorAll(SEL.home.chip))
+            .map(txt)
+            .filter(Boolean);
+          // De-dupe while preserving order.
+          const seen = new Set();
+          const cats = chips.filter((c) => (seen.has(c) ? false : seen.add(c)));
+          return cats.length
+            ? okJSON(cats)
+            : ok("No category chips are visible (you may need to be signed in, or the bar hasn't loaded).");
+        },
+      },
+
+      {
+        name: "select_category",
+        description:
+          "Filter the home feed by a category from list_categories, by its `name` (e.g. 'Music'). Clicks the matching chip; then call list_home_feed to read the filtered videos.",
+        inputSchema: {
+          type: "object",
+          properties: { name: { type: "string" } },
+          required: ["name"],
+        },
+        async execute({ name }) {
+          if (!name) return ok("Tell me which category to pick.");
+          const want = name.trim().toLowerCase();
+          const chip = Array.from(document.querySelectorAll(SEL.home.chip)).find(
+            (c) => txt(c).toLowerCase() === want
+          );
+          if (!chip) return ok(`I couldn't find a "${name}" category. Call list_categories to hear the options.`);
+          chip.click();
+          await sleep(800);
+          return ok(`Filtered by ${txt(chip)}. Call list_home_feed for the videos.`);
+        },
+      },
     ];
   }
 
@@ -340,6 +408,27 @@
       async execute() {
         const surface = detectSurface(location.pathname);
         return ok(`Surface: ${surface}. Path: ${location.pathname}${location.search}`);
+      },
+    };
+  }
+
+  function accountTool() {
+    return {
+      name: "get_account",
+      description:
+        "Report whether the user is signed in to YouTube and, if available, their account name — so you can welcome them by name. Call this once at the start of a session before greeting.",
+      inputSchema: { type: "object", properties: {} },
+      async execute() {
+        const signedIn = !!document.querySelector(SEL.account.avatar) && !document.querySelector(SEL.account.signIn);
+        let name = qsText(document, SEL.account.name);
+        if (!name) {
+          // The avatar image's alt text is sometimes "Avatar image" or the channel name.
+          const alt = (document.querySelector("#avatar-btn img, " + SEL.account.avatar) || {}).getAttribute
+            ? document.querySelector("#avatar-btn img")?.getAttribute("alt")
+            : "";
+          if (alt && !/avatar/i.test(alt)) name = alt;
+        }
+        return okJSON({ signedIn, name: name || null });
       },
     };
   }
@@ -555,16 +644,12 @@
           if (!v) return ok("No video found on this page.");
           switch (action) {
             case "play":
-              await v.play().catch(() => {});
-              return ok("Playing.");
+              return ok(await tryPlay(v));
             case "pause":
               v.pause();
               return ok("Paused.");
             case "toggle":
-              if (v.paused) {
-                await v.play().catch(() => {});
-                return ok("Playing.");
-              }
+              if (v.paused) return ok(await tryPlay(v));
               v.pause();
               return ok("Paused.");
             case "forward":
@@ -778,8 +863,8 @@
   let currentSurface = null;
 
   function toolsForSurface(surface) {
-    // where_am_i is registered everywhere.
-    const tools = [whereAmITool()];
+    // where_am_i and get_account are registered everywhere.
+    const tools = [whereAmITool(), accountTool()];
     switch (surface) {
       case "home":
         tools.push(...homeTools());

@@ -136,8 +136,8 @@ bookkeeping. Tools are re-created fresh each route via the `*Tools()` factories.
 
 | Surface | Tools |
 |---------|-------|
-| every route | `where_am_i` |
-| home (`/`, `/feed*`) | `list_home_feed`, `describe_home`, `open_video`, `load_more_home` |
+| every route | `where_am_i`, `get_account` |
+| home (`/`, `/feed*`) | `list_home_feed`, `describe_home`, `open_video`, `load_more_home`, `list_categories`, `select_category` |
 | search (`/results`) | `run_search`, `list_results`, `refine_search`, `open_result` |
 | watch (`/watch`) | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` |
 | watch-next (`/watch`) | `list_up_next`, `play_next`, `set_autoplay` |
@@ -183,6 +183,11 @@ flowchart TB
   captures its own TTS). Optional push-to-talk hotkey runs one turn (the keypress doubles as
   the user gesture some Chrome builds require to open the mic). This is how the user replies
   to the agent's questions hands-free — without touching the console.
+- **Arrow-key browse mode** — `startBrowse`/`stopBrowse` (armed by the extension on home +
+  search): captures arrows (only while armed, not in text fields) so the user steps through
+  the current surface's videos hearing each described — Down/Up move, Enter plays (`openIndex`),
+  Escape exits. `feed()` pulls the items from the surface's list tool. Off on `/watch` (arrows
+  seek the player). A guided-navigation layer; tools/voice unchanged.
 - **Listen mode** — `captureUtterance()` dispatches on `state.listenMode`. Default
   **`webspeech`** (Web Speech `SpeechRecognition` — fast, streaming). Opt-in **`nano`**
   (`nanoAsr`: VAD mic capture → on-device Gemini Nano audio transcription) is **experimental**

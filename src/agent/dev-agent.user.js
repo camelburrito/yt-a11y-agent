@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.6.0
+// @version      0.7.0
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -59,6 +59,8 @@
     "Rules:",
     "- Be concise and spoken-friendly. One short paragraph. No markdown, no URLs, no emoji.",
     "- Orient before offering choices. When greeting, or when the user seems lost, briefly say what page they're on and what is available, then offer clear next steps as a short spoken menu that ends in a question (e.g. \"Would you like to explore your feed or search for something?\").",
+    "- At the START of a session, call get_account; if they are signed in and a name is available, welcome them by name (\"Welcome back, <name>\").",
+    "- On the HOME page, your greeting should call list_categories AND list_home_feed: briefly name the categories they can pick from, quickly read the first few video titles, and tell them they can press the up/down arrow keys to browse videos one at a time, or name a category to filter.",
     "- Use the provided tools to READ the page and ACT for the user. Never guess what is on screen — call a tool. If unsure where you are, call where_am_i.",
     "- When you have listed videos, refer to them by number (\"the first one\", \"number three\") matching the index the list tool returned.",
     "- Confirm before navigating away from the current page if there is any ambiguity.",
@@ -543,7 +545,7 @@
   async function activate() {
     destroySession();
     const reply = await ask(
-      "[The user just switched to you from their screen reader and opted in. Greet them, tell them what page they're on and briefly what's available, and offer their main choices, ending with a question.]"
+      "[Session start. First call get_account, then greet the user (by name if signed in). Say what page they're on. If on the HOME page, also call list_categories and list_home_feed: name the available categories, read the first few video titles, and tell them they can use the up/down arrow keys to browse videos one at a time or name a category. End with a question.]"
     );
     await voice.speak(reply);
     return reply;
@@ -659,6 +661,130 @@
   }
 
   // ===========================================================================
+  // FEED NAVIGATION + ARROW-KEY BROWSE MODE.
+  // Lets a user step through the current surface's videos with arrow keys, hearing each one
+  // described — a guided alternative to traversing YouTube's DOM with a screen reader.
+  // ===========================================================================
+  function surfaceListTool() {
+    const p = location.pathname;
+    if (p.startsWith("/results")) return "list_results";
+    if (p === "/" || p.startsWith("/feed")) return "list_home_feed";
+    if (p.startsWith("/watch")) return "list_up_next";
+    return null;
+  }
+
+  async function feed(limit = 20) {
+    const tool = surfaceListTool();
+    if (!tool) return [];
+    try {
+      const res = await consumer.call(tool, { limit });
+      const items = JSON.parse(res.content[0].text);
+      return Array.isArray(items) ? items : [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  async function openIndex(i) {
+    if (location.pathname.startsWith("/watch")) {
+      const items = await feed(50);
+      const it = items.find((v) => v.index === i);
+      if (it && it.url) {
+        window.location.href = it.url;
+        return `Opening ${it.title}.`;
+      }
+      return "I couldn't open that item.";
+    }
+    const tool = location.pathname.startsWith("/results") ? "open_result" : "open_video";
+    try {
+      const res = await consumer.call(tool, { index: i });
+      return res.content[0].text;
+    } catch (_) {
+      return "I couldn't open that item.";
+    }
+  }
+
+  // Down/Right = next, Up/Left = previous, Enter = play, Escape = exit. Arrows are captured
+  // ONLY while armed and when focus isn't in a text field (so it never fights the search
+  // box). While armed it takes over arrow keys (intended guided nav); Escape/stopBrowse hand
+  // them back to the page / screen reader.
+  const browseState = { armed: false, index: -1, items: [] };
+
+  function describeBrowseItem() {
+    const it = browseState.items[browseState.index];
+    if (!it) return;
+    const bits = [`Item ${browseState.index + 1} of ${browseState.items.length}`, it.title];
+    if (it.channel) bits.push("by " + it.channel);
+    bits.push(it.duration || "live");
+    voice.speak(bits.join(", ") + ". Press Enter to play.");
+  }
+
+  async function browseMove(delta) {
+    if (!browseState.items.length) browseState.items = await feed(20);
+    if (!browseState.items.length) {
+      voice.speak("There are no videos to browse here.");
+      return;
+    }
+    const n = browseState.items.length;
+    browseState.index = Math.max(0, Math.min(browseState.index + delta, n - 1));
+    describeBrowseItem();
+  }
+
+  function onBrowseKey(e) {
+    if (!browseState.armed) return;
+    const t = e.target;
+    const tag = (t && t.tagName) || "";
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test(tag) || (t && t.isContentEditable)) return;
+    switch (e.key) {
+      case "ArrowDown":
+      case "ArrowRight":
+        e.preventDefault();
+        e.stopPropagation();
+        browseMove(1);
+        break;
+      case "ArrowUp":
+      case "ArrowLeft":
+        e.preventDefault();
+        e.stopPropagation();
+        browseMove(-1);
+        break;
+      case "Enter":
+        if (browseState.index >= 0) {
+          e.preventDefault();
+          e.stopPropagation();
+          openIndex(browseState.index);
+        }
+        break;
+      case "Escape":
+        stopBrowse();
+        voice.speak("Exited browsing.");
+        break;
+      default:
+        break;
+    }
+  }
+
+  async function startBrowse(announce = true) {
+    if (browseState.armed) return browseState.items.length;
+    browseState.armed = true;
+    browseState.index = -1;
+    browseState.items = await feed(20);
+    window.addEventListener("keydown", onBrowseKey, true);
+    log(`browse mode armed (${browseState.items.length} items)`);
+    if (announce && browseState.items.length) {
+      voice.speak(
+        `Browsing ${browseState.items.length} videos. Down arrow for next, up arrow for previous, Enter to play, Escape to stop.`
+      );
+    }
+    return browseState.items.length;
+  }
+
+  function stopBrowse() {
+    browseState.armed = false;
+    window.removeEventListener("keydown", onBrowseKey, true);
+  }
+
+  // ===========================================================================
   // PUBLIC API — headless on purpose (no DOM injection; AT-safe).
   // ===========================================================================
   const ytAgent = {
@@ -671,6 +797,12 @@
     enablePushToTalk, // (opts?) bind a hotkey (default Ctrl+Shift+Space) for one turn
     disablePushToTalk,
     isRunning: () => state.running,
+    // Arrow-key feed browsing (guided navigation with spoken descriptions).
+    startBrowse, // (announce=true) -> arms arrows: Down/Up move, Enter plays, Escape exits
+    stopBrowse,
+    isBrowsing: () => browseState.armed,
+    feed, // (limit) -> current surface's video list
+    openIndex, // (i) -> open item i on the current surface
     // "webspeech" (default) or "nano" (EXPERIMENTAL on-device audio transcription — slower,
     // can jank the page; needs #prompt-api-for-gemini-nano-multimodal-input).
     setListenMode(mode) {

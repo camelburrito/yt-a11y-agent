@@ -124,11 +124,17 @@ control (offer, don't autoplay).**
   end-to-end interactively — Nano returns rich, accurate, spoken-friendly descriptions.
   (Note: the on-device model can't be exercised by automation — Chrome gates it to a real
   user profile — so this step needs an interactive run, not the headless harness.)
-- **In-page agent doesn't survive full navigations.** `open_video` sets
-  `location.href` → cross-document load → the harness (living in the page) resets. SPA
-  nav within YouTube survives; cross-document nav doesn't. A real extension consumer lives
-  outside the page and persists. This — plus out-of-page UI — is now the main reason the
-  production consumer is an extension (CSP no longer is, since the model is on-device).
+- **In-page agent doesn't survive full navigations → breaks conversational continuity.**
+  `open_video`/`run_search` set `location.href` → cross-document load → the in-page agent
+  resets, losing conversation state. This is why **search feels broken**: "search for X"
+  navigates to `/results`, but the fresh agent on that page doesn't remember the request, so
+  nothing reads the results back. The provider search tools themselves are fine
+  (`run_search` builds the right URL; `list_results` verified live — 5 results). Partial
+  mitigations in place: arrow-browse is armed on `/results` (press a key → hear results); the
+  per-surface greeting can re-orient. **Proper fix:** persist conversation + a "pending
+  intent" across navigation — either `sessionStorage` (survives same-tab nav) or the service
+  worker. This is the top open item. The extension already auto-reinjects (agent always
+  present); only *state* is lost.
 - **No DOM injection by design.** The harness is headless (console + voice); it does NOT
   add visible/AT-visible UI to YouTube, to honor the AT-safe principle. Real client UI
   lives in the extension popup/side panel, outside the page's a11y tree.
@@ -137,13 +143,14 @@ control (offer, don't autoplay).**
 
 | Surface | Detect | Tools | Status |
 |---------|--------|-------|--------|
-| home | `/` or `/feed*` | `list_home_feed`, `describe_home`, `open_video`, `load_more_home` | ✅ verified live |
+| home | `/` or `/feed*` | `list_home_feed`, `describe_home`, `open_video`, `load_more_home` (✅ live); `list_categories`, `select_category` (🟡 best-effort) | ✅ / verify |
 | search | `/results` | `run_search`, `list_results`, `refine_search`, `open_result` | ✅ verified live |
 | watch | `/watch` | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` | ✅ verified live (transcript-open best-effort) |
 | watch-next | `/watch` | `list_up_next`, `play_next`, `set_autoplay` | ✅ verified live |
 | comments | `/watch` | `get_comments`, `summarize_comments`, `get_pinned_comment` | ✅ verified live |
 | pip | `/watch` | `enter_pip`, `exit_pip` | 🟡 button+fallback present; gesture path (q. c) needs flagged run |
-| (every route) | — | `where_am_i` | ✅ |
+| (every route) | — | `where_am_i` ✅; `get_account` 🟡 (signed-in name best-effort) | ✅ / verify |
+| (agent, list surfaces) | home + search | arrow-key browse mode (`startBrowse`): Down/Up move, Enter plays, Escape exits; + personalized welcome (`get_account`) | new — verify interactively |
 | home (planned) | | `list_categories`, `open_category` (filter chip bar) | ⬜ |
 
 Shared extraction: home/search/up-next all use `readVideoCards(scope, containerSel, limit)`

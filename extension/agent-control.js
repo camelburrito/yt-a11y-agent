@@ -76,7 +76,26 @@
     } catch (_) {}
   }
 
-  if (!alreadyGreeted()) {
+  // Arrow-key browsing is armed on the home feed and disarmed elsewhere, re-evaluated on
+  // SPA navigation. So a user can step through videos with the arrow keys (Escape exits).
+  // Browse arrows on list surfaces (home feed + search results). NOT on /watch, where arrow
+  // keys seek the player. Re-evaluated on SPA navigation.
+  function onListSurface() {
+    const p = location.pathname;
+    return p === "/" || p.startsWith("/feed") || p.startsWith("/results");
+  }
+  function armBrowse() {
+    const a = window.ytAgent;
+    if (!a || !a.startBrowse) return;
+    if (onListSurface()) a.startBrowse(false);
+    else if (a.isBrowsing && a.isBrowsing()) a.stopBrowse();
+  }
+  window.addEventListener("yt-navigate-finish", armBrowse, true);
+
+  if (alreadyGreeted()) {
+    // Returning within the same tab session — re-arm browsing, skip the announcement.
+    armBrowse();
+  } else {
     const onFirstGesture = async () => {
       window.removeEventListener("keydown", onFirstGesture, true);
       window.removeEventListener("pointerdown", onFirstGesture, true);
@@ -87,14 +106,28 @@
       try {
         a.enablePushToTalk();
       } catch (_) {}
+      const home = onListSurface();
+      const arrowHint = home ? " Use the up and down arrow keys to browse videos one at a time." : "";
       // A short, instant spoken announcement (no model round-trip, so it can't be silent or
       // janky). The full model-driven orientation runs on the Alt+Shift+A / popup greeting.
       try {
         await a.speak(
-          "YouTube accessibility agent ready. Hold Control Shift Space and speak to ask me anything, or press Alt Shift A for an overview of this page."
+          "YouTube accessibility agent ready. Hold Control Shift Space and speak to ask me anything, or press Alt Shift A for an overview of this page." +
+            arrowHint
         );
       } catch (_) {}
-      postStatus("ready", "Ready. Hold Ctrl+Shift+Space to talk; Alt+Shift+A for an overview.");
+      // Arm browsing AFTER the announcement so the first arrow doesn't double-speak.
+      if (home) {
+        try {
+          a.startBrowse(false);
+        } catch (_) {}
+      }
+      postStatus(
+        "ready",
+        home
+          ? "Ready. Arrows browse · Ctrl+Shift+Space talk · Alt+Shift+A overview."
+          : "Ready. Ctrl+Shift+Space talk · Alt+Shift+A overview."
+      );
     };
     window.addEventListener("keydown", onFirstGesture, true);
     window.addEventListener("pointerdown", onFirstGesture, true);
