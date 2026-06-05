@@ -52,9 +52,12 @@ interaction**:
    Control-Shift-Space and speak to ask me anything, or press Alt-Shift-A for an overview."*
    (Browsers forbid audio on bare page-load, so the first interaction is the earliest it can
    legally speak.) It greets once per tab session.
-3. **Hold `Ctrl+Shift+Space` and speak** to ask something — each press is the user gesture
-   the microphone needs. Or press **`Alt+Shift+A`** for the full spoken overview of the page
-   ("You're on the home page… explore your feed or search?").
+3. **Hold the backtick key `` ` `` and speak** to ask something — **release to send**, and
+   **press it again while the agent is replying to interrupt** and speak. You'll hear short
+   tones: a rising beep when it starts listening, a higher beep when your voice is captured,
+   and a soft beep when it's your turn again — so you're never waiting in silence. The agent
+   also says what it's doing ("Searching.", "Opening."). Press **`Alt+Shift+A`** anytime for
+   the full spoken overview of the page.
 4. **Arrow keys browse the feed** (on the home page and search results): **Down/Up** move to
    the next/previous video and describe it ("Item 3 of 20: <title>, by <channel>, 10:26"),
    **Enter** plays it, **Escape** stops browsing. Arrows are ignored while you're typing in

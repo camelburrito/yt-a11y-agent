@@ -183,6 +183,15 @@ flowchart TB
   captures its own TTS). Optional push-to-talk hotkey runs one turn (the keypress doubles as
   the user gesture some Chrome builds require to open the mic). This is how the user replies
   to the agent's questions hands-free — without touching the console.
+- **Hold-to-talk + barge-in** (`enableTalk`, primary input) — hold the talk key (default
+  `` ` ``) to speak, release to send, press again while replying to interrupt. **Earcons**
+  (`audio`, Web Audio tones) signal listening/captured/ready/error so the user is never left
+  in silence; the engine speaks **progress cues** (`TOOL_CUE`: "Searching.", "Opening.") for
+  slow tools. Hold-to-talk uses `voice.holdStart/holdStop` (continuous recognition stopped on
+  key release).
+- **Cross-navigation continuity** — navigating provider tools call `pend()` (sessionStorage);
+  the consumer `consumePending()`s it on the next page and speaks it. This is what makes
+  "search for X" / "open Y" continue speaking after the full-page load that resets the agent.
 - **Arrow-key browse mode** — `startBrowse`/`stopBrowse` (armed by the extension on home +
   search): captures arrows (only while armed, not in text fields) so the user steps through
   the current surface's videos hearing each described — Down/Up move, Enter plays (`openIndex`),

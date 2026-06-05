@@ -219,6 +219,15 @@
     return out;
   }
 
+  // Cross-navigation continuity: stash a short message that the consumer agent will speak
+  // on the next page (sessionStorage survives the full page load that navigation triggers).
+  // This is why "search for X" can announce its results after the page changes.
+  function pend(text) {
+    try {
+      sessionStorage.setItem("ytA11yPending", text);
+    } catch (_) {}
+  }
+
   // Canonical thumbnail URL for a /watch URL (or video id). hqdefault.jpg always exists.
   function thumbUrl(urlOrId) {
     const m = String(urlOrId || "").match(/(?:[?&]v=|^)([A-Za-z0-9_-]{11})/);
@@ -330,6 +339,7 @@
             return ok(`Found "${item.title}" but could not resolve its URL.`);
           }
           // Navigate via location — read-and-act, no DOM mutation.
+          pend(`Now playing: "${item.title}"${item.channel ? " by " + item.channel : ""}.`);
           window.location.href = item.url;
           return ok(`Opening "${item.title}"${item.channel ? " by " + item.channel : ""}.`);
         },
@@ -456,6 +466,7 @@
         },
         async execute({ query }) {
           if (!query || !query.trim()) return ok("Please tell me what to search for.");
+          pend(`Here are the search results for "${query.trim()}". Use the arrow keys to browse them.`);
           window.location.href = searchUrl(query);
           return ok(`Searching for "${query.trim()}".`);
         },
@@ -486,6 +497,7 @@
         },
         async execute({ query }) {
           if (!query || !query.trim()) return ok("Tell me the refined search.");
+          pend(`Here are the results for "${query.trim()}". Use the arrow keys to browse them.`);
           window.location.href = searchUrl(query);
           return ok(`Refining the search to "${query.trim()}".`);
         },
@@ -504,6 +516,7 @@
           const item = r.find((v) => v.index === index);
           if (!item) return ok(`No result at index ${index}. There are ${r.length} results loaded.`);
           if (!item.url) return ok(`Found "${item.title}" but couldn't resolve its URL.`);
+          pend(`Now playing: "${item.title}".`);
           window.location.href = item.url;
           return ok(`Opening "${item.title}".`);
         },
@@ -712,6 +725,7 @@
         async execute() {
           const r = readVideoCards(watchNextScope(), SEL.watchNext.container, 1);
           if (!r.length || !r[0].url) return ok("I couldn't find an up-next video.");
+          pend(`Now playing: "${r[0].title}".`);
           window.location.href = r[0].url;
           return ok(`Playing next: "${r[0].title}".`);
         },

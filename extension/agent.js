@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.7.0
+// @version      0.8.0
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -32,6 +32,25 @@
   const LOG = "[yt-a11y-agent]";
   const log = (...a) => console.log(LOG, ...a);
   const MANUAL_LOOP_HOPS = 4; // max tool-call round-trips per ask() in the manual JSON loop
+
+  // Crisp spoken cues so the user knows what we're doing during slow/navigating tools —
+  // no endless silent waiting. One or two words; only for tools worth narrating.
+  const TOOL_CUE = {
+    run_search: "Searching.",
+    refine_search: "Searching.",
+    list_results: "Reading results.",
+    open_result: "Opening.",
+    open_video: "Opening.",
+    play_next: "Opening.",
+    load_more_home: "Loading more.",
+    list_home_feed: "Reading your feed.",
+    get_transcript: "Getting the transcript.",
+    summarize_video: "Summing up.",
+    plain_language_summary: "Summing up.",
+    get_comments: "Reading comments.",
+    summarize_comments: "Reading comments.",
+    describe_image: "Looking at it.",
+  };
 
   function getModelContext() {
     return (
@@ -194,7 +213,81 @@
       }
     }
 
-    return { speak, listenOnce, abortListen, cancelSpeech, supported: { tts: !!synth, stt: !!SR } };
+    // Hold-to-talk: holdStart() begins continuous recognition and resolves with the full
+    // transcript when holdStop() is called (on key release). Continuous so a natural pause
+    // mid-sentence doesn't cut the user off.
+    let holdRec = null;
+    function holdStart() {
+      return new Promise((resolve, reject) => {
+        if (!SR) return reject(new Error("SpeechRecognition not supported."));
+        const rec = new SR();
+        holdRec = rec;
+        rec.lang = "en-US";
+        rec.continuous = true;
+        rec.interimResults = true;
+        let finalText = "";
+        rec.onresult = (e) => {
+          finalText = "";
+          for (let i = 0; i < e.results.length; i++) finalText += e.results[i][0].transcript;
+        };
+        rec.onerror = (e) => {
+          holdRec = null;
+          reject(new Error("speech recognition error: " + e.error));
+        };
+        rec.onend = () => {
+          holdRec = null;
+          resolve(finalText.trim());
+        };
+        rec.start();
+      });
+    }
+    function holdStop() {
+      if (holdRec) {
+        try {
+          holdRec.stop();
+        } catch (_) {}
+      }
+    }
+
+    return {
+      speak,
+      listenOnce,
+      holdStart,
+      holdStop,
+      abortListen,
+      cancelSpeech,
+      supported: { tts: !!synth, stt: !!SR },
+    };
+  })();
+
+  // ===========================================================================
+  // EARCONS — short generated tones so the user gets immediate, non-verbal feedback
+  // (listening / captured / ready / error) and is never left in silence after speaking.
+  // ===========================================================================
+  const audio = (() => {
+    let ctx = null;
+    function tone(freq, dur, type, gain) {
+      try {
+        ctx = ctx || new (window.AudioContext || window.webkitAudioContext)();
+        if (ctx.state === "suspended") ctx.resume();
+        const o = ctx.createOscillator();
+        const g = ctx.createGain();
+        o.type = type || "sine";
+        o.frequency.value = freq;
+        g.gain.value = gain || 0.05;
+        o.connect(g);
+        g.connect(ctx.destination);
+        const t = ctx.currentTime;
+        o.start(t);
+        o.stop(t + (dur || 0.1));
+      } catch (_) {}
+    }
+    return {
+      listening: () => tone(680, 0.12, "sine", 0.06), // now listening
+      captured: () => tone(900, 0.08, "sine", 0.05), // got your voice
+      ready: () => tone(520, 0.1, "sine", 0.04), // done / your turn
+      error: () => tone(200, 0.2, "triangle", 0.05), // didn't catch it
+    };
   })();
 
   // ===========================================================================
@@ -516,6 +609,8 @@
             .join(", ")}. Reply with valid JSON.`;
           continue;
         }
+        // Crisp progress cue (fire-and-forget) so the user hears we're working.
+        if (TOOL_CUE[step.tool]) voice.speak(TOOL_CUE[step.tool]);
         let result;
         try {
           result = await tool.execute(step.args || {});
@@ -786,6 +881,86 @@
   }
 
   // ===========================================================================
+  // HOLD-TO-TALK + BARGE-IN. Hold the talk key to speak, release to send; press again while
+  // the agent is replying to interrupt and speak. Earcons give instant feedback (listening /
+  // captured / ready / error) so there's never silent waiting after the user speaks.
+  // ===========================================================================
+  const talk = { key: "Backquote", state: "idle", hold: null };
+
+  function isTextTarget(t) {
+    const tag = (t && t.tagName) || "";
+    return /^(INPUT|TEXTAREA|SELECT)$/.test(tag) || (t && t.isContentEditable);
+  }
+
+  async function handleHeard(text) {
+    if (!text || !text.trim()) {
+      audio.error();
+      talk.state = "idle";
+      return;
+    }
+    audio.captured();
+    log(`heard: ${text}`);
+    talk.state = "thinking";
+    let reply;
+    try {
+      reply = await ask(text); // progress cues fire inside the loop
+    } catch (_) {
+      reply = "Sorry, something went wrong.";
+    }
+    talk.state = "speaking";
+    audio.ready();
+    await voice.speak(reply);
+    if (talk.state === "speaking") talk.state = "idle";
+  }
+
+  function onTalkDown(e) {
+    if (e.code !== talk.key || e.repeat || isTextTarget(e.target)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (talk.state === "speaking") {
+      voice.cancelSpeech(); // barge-in: interrupt the reply
+      talk.state = "idle";
+    }
+    if (talk.state !== "idle") return; // ignore presses while thinking/listening
+    talk.state = "listening";
+    audio.listening();
+    talk.hold = voice.holdStart();
+    talk.hold.then(handleHeard).catch(() => {
+      audio.error();
+      talk.state = "idle";
+    });
+  }
+
+  function onTalkUp(e) {
+    if (e.code !== talk.key) return;
+    if (talk.state === "listening") voice.holdStop();
+  }
+
+  function enableTalk(key) {
+    if (key) talk.key = key;
+    disableTalk();
+    window.addEventListener("keydown", onTalkDown, true);
+    window.addEventListener("keyup", onTalkUp, true);
+    log(`hold-to-talk on: hold "${talk.key}" to speak, release to send, press again to interrupt.`);
+  }
+  function disableTalk() {
+    window.removeEventListener("keydown", onTalkDown, true);
+    window.removeEventListener("keyup", onTalkUp, true);
+  }
+
+  // Cross-navigation continuity: the provider's navigating tools stash a short message in
+  // sessionStorage (which survives the page load); we speak it on the next page.
+  function consumePending() {
+    try {
+      const v = sessionStorage.getItem("ytA11yPending");
+      if (v) sessionStorage.removeItem("ytA11yPending");
+      return v || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // ===========================================================================
   // PUBLIC API — headless on purpose (no DOM injection; AT-safe).
   // ===========================================================================
   const ytAgent = {
@@ -795,8 +970,11 @@
     converse, // listen -> ask -> speak (one turn)
     start, // hands-free loop: greet, then listen<->respond until "stop" / silence / stop()
     stop, // end the conversation loop
-    enablePushToTalk, // (opts?) bind a hotkey (default Ctrl+Shift+Space) for one turn
+    enableTalk, // (key?) hold-to-talk + barge-in (default hold Backquote `); the primary input
+    disableTalk,
+    enablePushToTalk, // (opts?) alternative: tap a combo (default Ctrl+Shift+Space) for one turn
     disablePushToTalk,
+    consumePending, // read+clear the cross-navigation continuity message
     isRunning: () => state.running,
     // Arrow-key feed browsing (guided navigation with spoken descriptions).
     startBrowse, // (announce=true) -> arms arrows: Down/Up move, Enter plays, Escape exits

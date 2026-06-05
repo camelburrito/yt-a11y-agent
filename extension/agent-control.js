@@ -54,32 +54,27 @@
   postStatus("loaded", "Agent content script loaded.");
 
   // ---------------------------------------------------------------------------
-  // Talk-first entry (accessibility). A popup click is sighted-first; instead, the agent
-  // announces itself by VOICE on the user's first interaction with the page — which is a
-  // valid user gesture for audio, and a screen-reader user generates one immediately (Tab /
-  // arrows). It enables a keyboard shortcut for talk-back (each press is a fresh mic
-  // gesture) so the whole thing works hands-free without ever seeing the popup.
-  // Browsers forbid speaking on bare page-load, so "first interaction" is the earliest we
-  // legally can. Greets once per tab session (sessionStorage survives same-tab navigation).
+  // Talk-first entry. A popup click is sighted-first; instead the agent speaks on the user's
+  // FIRST interaction with the page (a valid audio gesture; a screen-reader user makes one
+  // immediately). On that gesture we: enable hold-to-talk (the primary input), arm arrow
+  // browsing on list surfaces, and speak EITHER a cross-navigation continuation (e.g. "Here
+  // are your search results…") OR — only once per tab session — a short welcome. The full
+  // model greeting is on the talk key ("give me an overview") or Alt+Shift+A.
   // ---------------------------------------------------------------------------
   const GREETED = "ytA11yGreeted";
-  function alreadyGreeted() {
+  const greeted = () => {
     try {
       return sessionStorage.getItem(GREETED) === "1";
     } catch (_) {
       return false;
     }
-  }
-  function markGreeted() {
+  };
+  const markGreeted = () => {
     try {
       sessionStorage.setItem(GREETED, "1");
     } catch (_) {}
-  }
+  };
 
-  // Arrow-key browsing is armed on the home feed and disarmed elsewhere, re-evaluated on
-  // SPA navigation. So a user can step through videos with the arrow keys (Escape exits).
-  // Browse arrows on list surfaces (home feed + search results). NOT on /watch, where arrow
-  // keys seek the player. Re-evaluated on SPA navigation.
   function onListSurface() {
     const p = location.pathname;
     return p === "/" || p.startsWith("/feed") || p.startsWith("/results");
@@ -92,44 +87,40 @@
   }
   window.addEventListener("yt-navigate-finish", armBrowse, true);
 
-  if (alreadyGreeted()) {
-    // Returning within the same tab session — re-arm browsing, skip the announcement.
-    armBrowse();
-  } else {
-    const onFirstGesture = async () => {
-      window.removeEventListener("keydown", onFirstGesture, true);
-      window.removeEventListener("pointerdown", onFirstGesture, true);
-      markGreeted();
-      const a = window.ytAgent;
-      if (!a) return;
-      // Keyboard talk-back: each Ctrl+Shift+Space press is the gesture the mic needs.
+  let firstHandled = false;
+  const onFirstGesture = async () => {
+    if (firstHandled) return;
+    firstHandled = true;
+    window.removeEventListener("keydown", onFirstGesture, true);
+    window.removeEventListener("pointerdown", onFirstGesture, true);
+    const a = window.ytAgent;
+    if (!a) return;
+    try {
+      a.enableTalk();
+    } catch (_) {}
+    if (onListSurface()) {
       try {
-        a.enablePushToTalk();
+        a.startBrowse(false);
       } catch (_) {}
-      const home = onListSurface();
-      const arrowHint = home ? " Use the up and down arrow keys to browse videos one at a time." : "";
-      // A short, instant spoken announcement (no model round-trip, so it can't be silent or
-      // janky). The full model-driven orientation runs on the Alt+Shift+A / popup greeting.
+    }
+
+    // Continuity first: if we just navigated (search / open), announce that.
+    const pending = a.consumePending ? a.consumePending() : null;
+    const arrowHint = onListSurface() ? " Use the arrow keys to browse." : "";
+    if (pending) {
+      try {
+        await a.speak(pending);
+      } catch (_) {}
+    } else if (!greeted()) {
+      markGreeted();
       try {
         await a.speak(
-          "YouTube accessibility agent ready. Hold Control Shift Space and speak to ask me anything, or press Alt Shift A for an overview of this page." +
-            arrowHint
+          "YouTube accessibility agent ready. Hold the backtick key and speak to ask me anything." + arrowHint
         );
       } catch (_) {}
-      // Arm browsing AFTER the announcement so the first arrow doesn't double-speak.
-      if (home) {
-        try {
-          a.startBrowse(false);
-        } catch (_) {}
-      }
-      postStatus(
-        "ready",
-        home
-          ? "Ready. Arrows browse · Ctrl+Shift+Space talk · Alt+Shift+A overview."
-          : "Ready. Ctrl+Shift+Space talk · Alt+Shift+A overview."
-      );
-    };
-    window.addEventListener("keydown", onFirstGesture, true);
-    window.addEventListener("pointerdown", onFirstGesture, true);
-  }
+    }
+    postStatus("ready", "Ready. Hold ` to talk · arrows browse · Alt+Shift+A overview.");
+  };
+  window.addEventListener("keydown", onFirstGesture, true);
+  window.addEventListener("pointerdown", onFirstGesture, true);
 })();

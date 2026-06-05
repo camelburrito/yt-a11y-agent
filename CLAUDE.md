@@ -42,11 +42,16 @@ user's existing assistive tech reports stays authoritative.
   production = MV3 extension (for persistence across navigations + out-of-page UI; the
   model is on-device so CSP is a non-issue). Tools are driven by a **manual JSON loop** —
   Nano's native tool-calling narrates instead of executing, so don't rely on it; TTS needs
-  the voices/cancel/resume care in `speak()`. The user replies hands-free via the
-  `ytAgent.start()` conversation loop (greet→listen→respond→listen) or push-to-talk, not
-  console calls. Listening defaults to Web Speech STT; on-device Nano audio ASR works but is
-  too slow/janky for real-time, so it's opt-in only (`setListenMode("nano")`). (3) *Provider*
-  — this userscript. UX is **orient →
+  the voices/cancel/resume care in `speak()`. **Interaction model (v0.8.0):** primary input is
+  **hold-to-talk** (`enableTalk`, default hold the backtick `` ` `` key) — hold to speak,
+  release to send, press again to **interrupt** (barge-in). **Earcons** (Web Audio tones) give
+  instant feedback (listening / captured / ready / error) so there's never silent waiting;
+  the loop speaks **crisp progress cues** ("Searching.", "Opening.") for slow tools.
+  **Continuity across navigation:** navigating provider tools stash a message in
+  `sessionStorage` (`pend()`); the consumer speaks it on the next page (`consumePending`) — so
+  search/open flows continue after the full-page load. Listening defaults to Web Speech STT;
+  Nano audio ASR is opt-in (`setListenMode("nano")`, slow). (3) *Provider* — this userscript.
+  UX is **orient →
   offer a short spoken menu → act on confirmation → don't autoplay**. Full flow + gotchas
   (CSP, in-page nav reset) in `docs/HANDOFF.md`.
 

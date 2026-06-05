@@ -133,8 +133,13 @@ control (offer, don't autoplay).**
   mitigations in place: arrow-browse is armed on `/results` (press a key → hear results); the
   per-surface greeting can re-orient. **Proper fix:** persist conversation + a "pending
   intent" across navigation — either `sessionStorage` (survives same-tab nav) or the service
-  worker. This is the top open item. The extension already auto-reinjects (agent always
-  present); only *state* is lost.
+  worker. The extension already auto-reinjects (agent always present); only *state* is lost.
+  **Mitigated (v0.8.0):** navigating tools stash a continuation message via `pend()`
+  (sessionStorage) and the consumer speaks it on the next page (`consumePending`) — so
+  "search for X" now announces "Here are the results for X…" after the load, and arrow-browse
+  is armed there. Full conversation *history* across navigation still isn't carried (would
+  need to serialize the transcript / move it to the service worker) — that's the remaining
+  piece, but the common search/open flows now feel continuous.
 - **No DOM injection by design.** The harness is headless (console + voice); it does NOT
   add visible/AT-visible UI to YouTube, to honor the AT-safe principle. Real client UI
   lives in the extension popup/side panel, outside the page's a11y tree.
