@@ -122,6 +122,11 @@ Prefer typing? `await ytAgent.ask("search for lo-fi music")`, then
 `await ytAgent.ask("open the second result")` — watch the Console show the tool set change
 as the page navigates.
 
+**Vision** (describe what a thumbnail looks like, for a non-sighted user): ask
+`await ytAgent.ask("describe the thumbnail of the second video")`, or directly
+`await ytAgent.describeThumbnail(1)`. It uses on-device Nano image understanding and returns
+a concrete spoken description (subjects, setting, on-screen text, mood).
+
 ### Troubleshooting
 
 | Symptom | Fix |

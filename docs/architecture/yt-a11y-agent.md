@@ -262,8 +262,10 @@ sequenceDiagram
 - **Multimodal Prompt API (2026-06):** this Chrome build exposes on-device **audio + image**
   input (`expectedInputs`); Nano transcribed a `webm/opus` mic clip accurately. Audio
   inference is slow / janks the page → Web Speech stays the default listen mode, Nano ASR is
-  opt-in. Image input is used for **vision** (`describe_image`); the `thumb` URL derivation
-  and fetchability are verified live, the Nano describe step pending an interactive confirm.
+  opt-in. Image input powers **vision** (`describe_image`) — verified end-to-end: `thumb`
+  derivation + fetch via the headless harness, and the Nano describe step interactively
+  (returns rich, accurate descriptions). Note: the on-device model can't be driven by
+  automation (Chrome gates it to a real user profile), so vision is confirmed interactively.
 - **Open question (d):** multimodal contract when the consumer becomes the extension.
 
 ## Production trajectory
