@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.8.1
+// @version      0.8.2
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -67,6 +67,17 @@
     if (typeof window !== "undefined" && window.ai && window.ai.languageModel) return window.ai.languageModel;
     return null;
   }
+
+  // Shared download-progress monitor for LanguageModel.create({ monitor }). Text, audio, and
+  // image are SEPARATE on-device components — each downloads the first time it's used.
+  function dlMonitor(m) {
+    if (m && m.addEventListener) {
+      m.addEventListener("downloadprogress", (e) =>
+        log(`on-device model download: ${Math.round((e.loaded || 0) * 100)}%`)
+      );
+    }
+  }
+  let announcedDownload = false;
 
   // ---------------------------------------------------------------------------
   // System prompt — defines behavior, including the proactive, orient-first greeting
@@ -420,10 +431,13 @@
       return new Blob(chunks, { type: chunks[0].type || "audio/webm" });
     },
 
+    _audioBase: null, // warm audio session, only created when nano listen mode is actually used
     async transcribe(blob) {
       const LM = getLanguageModel();
       if (!LM) throw new Error("Prompt API unavailable for transcription.");
-      const s = await LM.create({ expectedInputs: [{ type: "audio" }] });
+      if (!this._audioBase)
+        this._audioBase = await LM.create({ expectedInputs: [{ type: "audio" }], monitor: dlMonitor });
+      const s = this._audioBase.clone ? await this._audioBase.clone() : await LM.create({ expectedInputs: [{ type: "audio" }] });
       try {
         const out = await s.prompt([
           {
@@ -436,9 +450,11 @@
         ]);
         return (out || "").trim();
       } finally {
-        try {
-          s.destroy && s.destroy();
-        } catch (_) {}
+        if (s !== this._audioBase) {
+          try {
+            s.destroy && s.destroy();
+          } catch (_) {}
+        }
       }
     },
 
@@ -482,6 +498,10 @@
     }
   }
 
+  // Keep one warm image-capable session and clone() it per call. The image model component
+  // loads/downloads once and stays warm — we don't re-create (and risk re-fetching) it on
+  // every describe. The clone gives a fresh context so descriptions don't bleed together.
+  let imageBase = null;
   async function describeImage(url, question) {
     if (!url) throw new Error("describeImage needs a url");
     const LM = getLanguageModel();
@@ -489,7 +509,8 @@
     const r = await fetch(url);
     if (!r.ok) throw new Error(`couldn't fetch image (${r.status})`);
     const blob = await toJpeg(await r.blob());
-    const s = await LM.create({ expectedInputs: [{ type: "image" }] });
+    if (!imageBase) imageBase = await LM.create({ expectedInputs: [{ type: "image" }], monitor: dlMonitor });
+    const s = imageBase.clone ? await imageBase.clone() : await LM.create({ expectedInputs: [{ type: "image" }] });
     try {
       const out = await s.prompt([
         {
@@ -507,9 +528,12 @@
       ]);
       return (out || "").trim();
     } finally {
-      try {
-        s.destroy && s.destroy();
-      } catch (_) {}
+      // Dispose only the clone / per-call session; keep imageBase warm.
+      if (s !== imageBase) {
+        try {
+          s.destroy && s.destroy();
+        } catch (_) {}
+      }
     }
   }
 
@@ -593,6 +617,10 @@
     if (avail === "unavailable" || avail === "no" || avail === "no-api") {
       throw new Error(`Gemini Nano unavailable on this device (availability="${avail}").`);
     }
+    if ((avail === "downloadable" || avail === "downloading") && !announcedDownload) {
+      announcedDownload = true;
+      voice.speak("Setting up the on-device model, one moment."); // communicate the one-time fetch
+    }
 
     const catalog = consumer
       .list()
@@ -616,13 +644,7 @@
 
     state.session = await LM.create({
       initialPrompts: [{ role: "system", content: sys }],
-      monitor(m) {
-        if (m && m.addEventListener) {
-          m.addEventListener("downloadprogress", (e) =>
-            log(`Gemini Nano download: ${Math.round((e.loaded || 0) * 100)}%`)
-          );
-        }
-      },
+      monitor: dlMonitor,
     });
     state.sessionSig = sig;
     log(`Gemini session ready (availability="${avail}"); tools: ${sig || "(none)"}`);

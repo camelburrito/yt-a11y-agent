@@ -104,6 +104,12 @@ boundary text-only (provider passes a URL; the consumer does the vision).
   voices) over the robotic default first-English voice; `ytAgent.setVoice("name")` overrides.
   **Hold-to-talk is race-safe** — a fast tap that releases before recognition starts still
   stops the mic (else continuous recognition runs forever).
+- **Model components**: text / audio / image are **separate** on-device downloads — each
+  fetches the first time its modality is used. So the audio adapter is only pulled if `nano`
+  listen mode is on (default Web Speech avoids it), and the image adapter only on vision.
+  Multimodal sessions are **cached + `clone()`d per call** (`imageBase`, `nanoAsr._audioBase`)
+  so we don't re-create — and risk re-fetching — them every time. `availability()` of
+  `downloadable`/`downloading` triggers a one-time "Setting up the model…" announcement.
 - **`[yt-a11y]` log prefix** for all console output.
 - **Docs stay current with code.** Update `README.md`, `docs/HANDOFF.md`, and
   `docs/architecture/yt-a11y-agent.md` (diagrams included) in the *same change* that
