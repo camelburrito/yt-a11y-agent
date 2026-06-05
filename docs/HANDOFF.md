@@ -68,7 +68,7 @@ control (offer, don't autoplay).**
 | Architecture doc with diagrams | ✅ `docs/architecture/yt-a11y-agent.md` |
 | Headless selector verification | ✅ `scripts/verify-selectors.mjs` (`npm run verify:selectors`) |
 | PiP gesture path (open q. c) + transcript-open path | 🟡 partial — need a flagged interactive run |
-| Production extension (MV3, world:"MAIN") | ⬜ later |
+| Production extension (MV3) | ✅ **scaffolded** — `extension/` (MAIN-world content scripts reuse `src/` via `npm run build:extension`; ISOLATED `bridge.js`; Start/Stop popup). Auto-injects + survives navigation. Next: conversation state in a service worker; icons; Web Store packaging |
 
 ## Verified facts (don't re-litigate)
 
@@ -175,9 +175,14 @@ drifted — it's the automated version of the manual probe loop. Findings so far
   (expand description → "Show transcript") is best-effort. Verify `SEL.watch.transcriptOpenButton`
   interactively (headless starts with it closed and 0 segments).
 
-### Then: production MV3 extension
-Provider → `world:"MAIN"` content script; consumer → background worker (persists across
-the `open_video` full-nav reset) + popup/side-panel UI. Resolves open question (d).
+### Production MV3 extension — scaffolded (`extension/`)
+Provider + agent run as `world:"MAIN"` content scripts (auto-injected on every YouTube page,
+reused from `src/` via `npm run build:extension`); an ISOLATED `bridge.js` relays popup
+commands (MAIN can't use `chrome.*`); `popup.html` is the Start/Stop UI (out of the page's
+a11y tree). See `extension/README.md`.
+Remaining for production: (a) move conversation state into a **service worker** so it
+survives the `open_video` full-nav reset (currently only auto-reinjection persists, not
+history); (b) icons; (c) Web Store packaging (privacy policy, permission justifications).
 
 ## Open questions still live
 - **(c) PiP transient user activation** — measure in `enter_pip` (item 4).

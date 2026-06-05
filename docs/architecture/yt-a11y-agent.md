@@ -270,9 +270,38 @@ sequenceDiagram
 
 ## Production trajectory
 
-Userscripts → **MV3 extension**: provider becomes a `world:"MAIN"` content script; consumer
-becomes a background service worker (model/agent off-page, persists across navigations) +
-a popup/side-panel UI (out of the page's a11y tree). The tool code ports largely unchanged.
+Userscripts → **MV3 extension** — **scaffolded** in `extension/`:
+
+```mermaid
+flowchart TB
+  subgraph ext[extension/ · MV3]
+    pop[popup.html / popup.js<br/>Start · Stop · Greeting]
+    sw[(service worker<br/>— future: persistent state)]
+  end
+  subgraph page[youtube.com page]
+    iso[bridge.js · ISOLATED<br/>chrome.* ↔ window.postMessage]
+    subgraph main[MAIN world]
+      ag[agent.js]
+      pv[provider.js]
+      ctl[agent-control.js]
+    end
+  end
+  pop -->|chrome.tabs.sendMessage| iso
+  iso -->|postMessage| ctl
+  ctl --> ag
+  ag --> pv
+```
+
+- Provider + agent run as **`world:"MAIN"` content scripts**, auto-injected on every YouTube
+  page (so the agent survives navigation — no manual re-paste). They are the *same* `src/`
+  files, synced by `npm run build:extension` (single source of truth).
+- `navigator.modelContext` + the Prompt API live in MAIN; `chrome.*` only works in ISOLATED
+  — so **`bridge.js`** (ISOLATED) relays popup commands to the MAIN-world agent via
+  `window.postMessage`, and `agent-control.js` maps them onto `window.ytAgent`.
+- `popup.html` is the control UI — deliberately in the extension's own surface, **out of the
+  page's a11y tree** (AT-safe).
+- **Not yet:** a service worker holding conversation state across full navigations (today
+  only auto-reinjection persists, not history), icons, and Web Store packaging.
 
 ## Keeping this doc current
 
@@ -283,6 +312,10 @@ Update this file in the **same change** that touches:
 
 When changing `SEL` or `readVideoCards`, re-run `npm run verify:selectors` and update the
 "Verified vs. pending" section with what the harness found.
+
+When changing `src/youtube-a11y-agent.user.js` or `src/agent/dev-agent.user.js`, re-run
+`npm run build:extension` to resync `extension/provider.js` + `extension/agent.js` (they're
+generated — never edit them directly).
 
 The diagrams reference real symbols (`readVideoCards`, `detectSurface`, `ytAgent`,
 `navigator.modelContext`); if you rename them, update the diagrams too.

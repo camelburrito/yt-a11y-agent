@@ -86,6 +86,10 @@ boundary text-only (provider passes a URL; the consumer does the vision).
 - **Docs stay current with code.** Update `README.md`, `docs/HANDOFF.md`, and
   `docs/architecture/yt-a11y-agent.md` (diagrams included) in the *same change* that
   alters tools, `SEL`, the engine, or the architecture. Treat stale docs as a bug.
+- **One source of truth for provider/agent.** `extension/provider.js` + `extension/agent.js`
+  are **generated** from `src/` by `npm run build:extension` — never edit them directly;
+  edit `src/…` then re-run the build (and reload the unpacked extension). The `extension/`
+  dir is the MV3 packaging; the `src/…user.js` files are the userscript form. Same code.
 
 ## Open questions — resolve empirically, not by reading specs
 

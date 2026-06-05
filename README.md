@@ -69,10 +69,16 @@ when prompted (do all three first, then relaunch once).
 > If a flag isn't found, your Chrome is likely too old — update it, or install
 > [Chrome Canary](https://www.google.com/chrome/canary/).
 
-### Step 2 — Load the two scripts
+### Step 2 — Load the agent
 
-The project is two scripts that run on YouTube: the **provider** (registers the tools) and
-the **agent** (the AI that uses them). Pick the easier path:
+The project runs two scripts on YouTube: the **provider** (registers the tools) and the
+**agent** (the AI that uses them). Three ways to load them, easiest first:
+
+**Option 0 — Chrome extension (recommended).** Auto-injects on every YouTube page (no
+re-pasting, survives navigation) and adds a Start/Stop popup. Open `chrome://extensions` →
+enable **Developer mode** → **Load unpacked** → select the **`extension/`** folder. Full
+steps in [`extension/README.md`](extension/README.md). The two manual options below are for
+quick experiments without installing anything.
 
 **Option A — DevTools snippets (quickest, nothing to install).**
 1. Open <https://www.youtube.com>, then open DevTools: **⌥⌘J** (Mac) / **Ctrl+Shift+J**

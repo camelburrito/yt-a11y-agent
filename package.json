@@ -6,7 +6,8 @@
   "type": "module",
   "license": "MIT",
   "scripts": {
-    "verify:selectors": "node scripts/verify-selectors.mjs"
+    "verify:selectors": "node scripts/verify-selectors.mjs",
+    "build:extension": "node scripts/build-extension.mjs"
   },
   "repository": {
     "type": "git",

@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>YouTube A11y Agent</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, sans-serif;
+      }
+      body {
+        width: 260px;
+        margin: 0;
+        padding: 14px;
+      }
+      h1 {
+        font-size: 14px;
+        margin: 0 0 2px;
+      }
+      p.sub {
+        font-size: 11px;
+        opacity: 0.7;
+        margin: 0 0 12px;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+      button {
+        flex: 1;
+        padding: 8px 10px;
+        font-size: 13px;
+        border: 1px solid currentColor;
+        border-radius: 8px;
+        background: transparent;
+        cursor: pointer;
+      }
+      button.primary {
+        background: #c00;
+        color: #fff;
+        border-color: #c00;
+      }
+      label {
+        font-size: 12px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin: 6px 0;
+      }
+      #status {
+        font-size: 12px;
+        margin-top: 10px;
+        padding: 8px;
+        border-radius: 8px;
+        background: rgba(127, 127, 127, 0.15);
+        min-height: 1.2em;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>YouTube A11y Agent</h1>
+    <p class="sub">Hands-free YouTube via on-device AI. Open a YouTube tab first.</p>
+
+    <div class="row">
+      <button id="start" class="primary" aria-label="Start hands-free conversation">▶ Start talking</button>
+      <button id="stop" aria-label="Stop the conversation">■ Stop</button>
+    </div>
+    <div class="row">
+      <button id="activate" aria-label="Greet and orient me">🔊 Greeting</button>
+    </div>
+
+    <label>
+      <input type="checkbox" id="nano" />
+      Use on-device Nano transcription (experimental, slower)
+    </label>
+
+    <div id="status" role="status" aria-live="polite">Connecting…</div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

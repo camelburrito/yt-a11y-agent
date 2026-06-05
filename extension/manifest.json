@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube A11y Agent (WebMCP)",
+  "version": "0.1.0",
+  "description": "In-browser accessibility agent for YouTube: WebMCP tools + on-device Gemini Nano voice & vision. Read-and-act only; never mutates the page or its a11y tree.",
+  "host_permissions": ["https://www.youtube.com/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "YouTube A11y Agent"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.youtube.com/*"],
+      "run_at": "document_idle",
+      "world": "MAIN",
+      "js": ["agent.js", "provider.js", "agent-control.js"]
+    },
+    {
+      "matches": ["https://www.youtube.com/*"],
+      "run_at": "document_idle",
+      "world": "ISOLATED",
+      "js": ["bridge.js"]
+    }
+  ]
+}
