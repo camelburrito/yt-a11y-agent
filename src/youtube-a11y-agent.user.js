@@ -182,8 +182,24 @@
     return false;
   }
 
+  // The on-device model is small and doesn't always pass args under the documented key.
+  // Read an index / name leniently from whatever it sent.
+  function argIndex(args) {
+    if (!args || typeof args !== "object") return null;
+    const c = args.index ?? args.number ?? args.n ?? args.i ?? args.video ?? args.position ?? args.item;
+    if (c === undefined || c === null || c === "") return null;
+    const n = parseInt(c, 10);
+    return isNaN(n) ? null : n;
+  }
+  function argName(args) {
+    if (!args || typeof args !== "object") return "";
+    return String(args.name ?? args.category ?? args.value ?? args.query ?? args.q ?? "").trim();
+  }
+
   // Generic reader for a list of video cards (home, search, up-next). Uses SEL.card for
   // fields; dedupes by URL so nested lockup matches don't double-count.
+  // Items are numbered 1-based (`index` starts at 1) so spoken numbers match what users say
+  // ("open video 5" = the 5th).
   function readVideoCards(scope, containerSel, limit) {
     const root = scope || document;
     const items = Array.from(root.querySelectorAll(containerSel));
@@ -213,7 +229,7 @@
           .find((t) => /^\d+:\d{2}/.test(t)) || "";
       // Thumbnail URL derived from the video id (robust vs. lazy-loaded <img> src). A
       // consumer can fetch this and describe it for a user who can't see the screen.
-      out.push({ index: out.length, title, channel, meta, duration, url, thumb: thumbUrl(url) });
+      out.push({ index: out.length + 1, title, channel, meta, duration, url, thumb: thumbUrl(url) });
     }
     return out;
   }
@@ -320,18 +336,20 @@
           properties: {
             index: {
               type: "integer",
-              minimum: 0,
-              description: "The index of the video from list_home_feed.",
+              minimum: 1,
+              description: "The number of the video (1-based) from list_home_feed.",
             },
           },
           required: ["index"],
         },
-        async execute({ index }) {
+        async execute(args) {
+          const index = argIndex(args);
+          if (index == null) return ok("Which video number? For example, say 'open video 3'.");
           const feed = readHomeFeed(100);
           const item = feed.find((v) => v.index === index);
           if (!item) {
             return ok(
-              `No video at index ${index}. There are ${feed.length} videos loaded (indices 0–${feed.length - 1}).`
+              `There's no video number ${index}. There are ${feed.length} videos, numbered 1 to ${feed.length}.`
             );
           }
           if (!item.url) {
@@ -390,9 +408,10 @@
           properties: { name: { type: "string" } },
           required: ["name"],
         },
-        async execute({ name }) {
+        async execute(args) {
+          const name = argName(args);
           if (!name) return ok("Tell me which category to pick.");
-          const want = name.trim().toLowerCase();
+          const want = name.toLowerCase();
           const chip = Array.from(document.querySelectorAll(SEL.home.chip)).find(
             (c) => txt(c).toLowerCase() === want
           );
@@ -507,13 +526,15 @@
           "Open a search result by its `index` from list_results. Navigates to that video.",
         inputSchema: {
           type: "object",
-          properties: { index: { type: "integer", minimum: 0 } },
+          properties: { index: { type: "integer", minimum: 1 } },
           required: ["index"],
         },
-        async execute({ index }) {
+        async execute(args) {
+          const index = argIndex(args);
+          if (index == null) return ok("Which result number? For example, say 'open result 2'.");
           const r = readVideoCards(document, SEL.search.container, 50);
           const item = r.find((v) => v.index === index);
-          if (!item) return ok(`No result at index ${index}. There are ${r.length} results loaded.`);
+          if (!item) return ok(`There's no result number ${index}. There are ${r.length} results, numbered 1 to ${r.length}.`);
           if (!item.url) return ok(`Found "${item.title}" but couldn't resolve its URL.`);
           pend(`Now playing: "${item.title}".`);
           window.location.href = item.url;

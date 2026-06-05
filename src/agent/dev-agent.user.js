@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.8.0
+// @version      0.8.1
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -149,6 +149,34 @@
       (typeof window !== "undefined" && (window.SpeechRecognition || window.webkitSpeechRecognition)) ||
       null;
 
+    // Voice selection. The first English voice is often a low-quality/robotic system voice;
+    // prefer natural ones (Chrome's Google voices, or Mac's good voices), with a user override.
+    let preferredVoiceName = null;
+    function pickVoice() {
+      const vs = synth ? synth.getVoices() : [];
+      if (!vs.length) return null;
+      const en = vs.filter((v) => v.lang && v.lang.toLowerCase().startsWith("en"));
+      const pool = en.length ? en : vs;
+      if (preferredVoiceName) {
+        const m = pool.find((v) => v.name.toLowerCase().includes(preferredVoiceName.toLowerCase()));
+        if (m) return m;
+      }
+      return (
+        pool.find((v) => /google/i.test(v.name)) || // Chrome's natural network voices
+        pool.find((v) => /(samantha|alex|karen|daniel|natural|neural|siri|aria|jenny|libby)/i.test(v.name)) ||
+        pool.find((v) => v.localService === false) || // online voices tend to sound better
+        pool[0]
+      );
+    }
+    function setVoice(name) {
+      preferredVoiceName = name || null;
+      const v = pickVoice();
+      return v ? v.name : null;
+    }
+    function listVoices() {
+      return (synth ? synth.getVoices() : []).map((v) => `${v.name} (${v.lang})`);
+    }
+
     function speak(text) {
       return new Promise((resolve) => {
         if (!synth || !text) return resolve();
@@ -159,9 +187,7 @@
         const fire = () => {
           const u = new SpeechSynthesisUtterance(text);
           u.rate = 1.05;
-          const v =
-            synth.getVoices().find((x) => x.lang && x.lang.startsWith("en")) ||
-            synth.getVoices()[0];
+          const v = pickVoice();
           if (v) u.voice = v;
           u.onend = () => resolve();
           u.onerror = () => resolve();
@@ -225,6 +251,27 @@
         rec.continuous = true;
         rec.interimResults = true;
         let finalText = "";
+        let started = false;
+        let stopRequested = false;
+        // Race fix: a quick tap can fire key-up (holdStop) BEFORE recognition has started, so
+        // stop() would no-op and continuous recognition would run forever (mic never releases).
+        // Track start/stop intent and stop as soon as it has actually started.
+        rec._requestStop = () => {
+          stopRequested = true;
+          if (started) {
+            try {
+              rec.stop();
+            } catch (_) {}
+          }
+        };
+        rec.onstart = () => {
+          started = true;
+          if (stopRequested) {
+            try {
+              rec.stop();
+            } catch (_) {}
+          }
+        };
         rec.onresult = (e) => {
           finalText = "";
           for (let i = 0; i < e.results.length; i++) finalText += e.results[i][0].transcript;
@@ -241,11 +288,7 @@
       });
     }
     function holdStop() {
-      if (holdRec) {
-        try {
-          holdRec.stop();
-        } catch (_) {}
-      }
+      if (holdRec && holdRec._requestStop) holdRec._requestStop();
     }
 
     return {
@@ -255,6 +298,8 @@
       holdStop,
       abortListen,
       cancelSpeech,
+      setVoice,
+      listVoices,
       supported: { tts: !!synth, stt: !!SR },
     };
   })();
@@ -563,8 +608,9 @@
       SYSTEM +
       "\n\n" +
       "You control the page through tools. On EVERY turn reply with ONE line of strict JSON, nothing else, no markdown fences.\n" +
-      'To use a tool: {"action":"call","tool":"<name>","args":{...}}\n' +
+      'To use a tool, include ALL its required args. Example: {"action":"call","tool":"open_video","args":{"index":3}}\n' +
       'When you can answer the user: {"action":"final","say":"<the reply to speak>"}\n' +
+      'Videos are numbered starting at 1; pass the exact number the user says (e.g. "open video 5" -> {"action":"call","tool":"open_video","args":{"index":5}}).\n' +
       "Available tools:\n" +
       catalog;
 
@@ -849,13 +895,15 @@
         e.stopPropagation();
         browseMove(-1);
         break;
-      case "Enter":
-        if (browseState.index >= 0) {
+      case "Enter": {
+        const it = browseState.index >= 0 ? browseState.items[browseState.index] : null;
+        if (it) {
           e.preventDefault();
           e.stopPropagation();
-          openIndex(browseState.index);
+          openIndex(it.index); // 1-based index the provider expects
         }
         break;
+      }
       case "Escape":
         stopBrowse();
         voice.speak("Exited browsing.");
@@ -979,6 +1027,8 @@
     disableTalk,
     setTalkKey: enableTalk, // alias: re-bind the talk key (KeyboardEvent.code, e.g. "Backquote")
     setEarconVolume: audio.setVolume, // 0 mute … 1 default … 2 louder
+    setVoice: voice.setVoice, // (nameSubstring) pick a TTS voice; e.g. "Google US English"
+    listVoices: voice.listVoices,
     talkKey: () => talk.key,
     enablePushToTalk, // (opts?) alternative: tap a combo (default Ctrl+Shift+Space) for one turn
     disablePushToTalk,

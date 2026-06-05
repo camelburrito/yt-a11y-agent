@@ -96,6 +96,14 @@ boundary text-only (provider passes a URL; the consumer does the vision).
   what the args mean.
 - **Shared `readVideoCards`** over `SEL.card` backs every video list (home/search/up-next).
   Watch tools read the `<video>` element and actuate native controls rather than scraping.
+- **Video lists are 1-based** (`index` starts at 1) so spoken numbers match ("open video 5" =
+  the 5th). Tools read args **leniently** (`argIndex`/`argName`) because the small on-device
+  model often mislabels them (e.g. omits `index`); the system prompt also gives a concrete
+  `{"args":{"index":5}}` example.
+- **TTS voice**: `pickVoice()` prefers natural voices (Chrome's Google voices / good Mac
+  voices) over the robotic default first-English voice; `ytAgent.setVoice("name")` overrides.
+  **Hold-to-talk is race-safe** — a fast tap that releases before recognition starts still
+  stops the mic (else continuous recognition runs forever).
 - **`[yt-a11y]` log prefix** for all console output.
 - **Docs stay current with code.** Update `README.md`, `docs/HANDOFF.md`, and
   `docs/architecture/yt-a11y-agent.md` (diagrams included) in the *same change* that
