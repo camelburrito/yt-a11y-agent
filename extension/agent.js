@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.9.4
+// @version      0.9.5
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -829,7 +829,15 @@
     // Browse next / previous on list surfaces
     if (onList && /^(next|next one|down|forward)$/.test(t)) { if (!browseState.armed) await startBrowse(false); await browseMove(1); return ""; }
     if (onList && /^(previous|prev|back one|up|go up)$/.test(t)) { if (!browseState.armed) await startBrowse(false); await browseMove(-1); return ""; }
-    if (onList && /^(more|load more|show more)$/.test(t)) return await callText("load_more_home");
+    if (onList && /^(more|load more|show more)$/.test(t)) {
+      const msg = await callText("load_more_home");
+      // Keep arrow-browse in sync with the newly loaded cards.
+      if (browseState.armed) {
+        const fresh = await feed(BROWSE_LIMIT);
+        if (fresh.length) browseState.items = fresh;
+      }
+      return msg;
+    }
     if (/^(list|what'?s here|read( the)? titles|list (videos|results))$/.test(t)) return await listHere();
 
     // Filter by category (home)
@@ -1053,6 +1061,35 @@
   }
 
   let browseFetching = false;
+  // Read as many of the currently-loaded cards as the provider allows (not just 20), so
+  // browsing covers everything on the page. load_more_home / scrolling adds more, which
+  // growFeed() picks up when the user reaches the end.
+  const BROWSE_LIMIT = 100;
+
+  // At the end of the list, pull in more: ask the provider to load the next batch onto the
+  // page (home only — search has no load-more tool), then re-read. Returns true if the list
+  // actually grew. Guarded by browseFetching so rapid presses don't stack fetches.
+  async function growFeed() {
+    if (browseFetching) return false;
+    browseFetching = true;
+    try {
+      const before = browseState.items.length;
+      if (consumer.has("load_more_home")) {
+        try {
+          await callText("load_more_home");
+        } catch (_) {}
+      }
+      const fresh = await feed(BROWSE_LIMIT);
+      if (fresh.length > before) {
+        browseState.items = fresh;
+        return true;
+      }
+      return false;
+    } finally {
+      browseFetching = false;
+    }
+  }
+
   async function browseMove(delta) {
     voice.cancelSpeech(); // stop the previous item immediately — never read a backlog
     if (!onBrowsableSurface()) {
@@ -1064,7 +1101,7 @@
       if (browseFetching) return; // a fetch is already in flight; ignore the extra press
       browseFetching = true;
       try {
-        browseState.items = await feed(20);
+        browseState.items = await feed(BROWSE_LIMIT);
       } finally {
         browseFetching = false;
       }
@@ -1072,6 +1109,15 @@
     if (!browseState.items.length) {
       voice.speak("There are no videos to browse here.");
       return;
+    }
+    // Moving forward past the last item → try to load more before giving up.
+    if (delta > 0 && browseState.index >= browseState.items.length - 1) {
+      voice.speak("Loading more videos.");
+      const grew = await growFeed();
+      if (!grew) {
+        voice.speak("That's the end of the feed for now.");
+        return;
+      }
     }
     const n = browseState.items.length;
     browseState.index = Math.max(0, Math.min(browseState.index + delta, n - 1));

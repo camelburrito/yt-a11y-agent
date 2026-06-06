@@ -85,8 +85,11 @@ results the extension arms arrow keys so the user steps through videos hearing e
 described (Down/Up move, Enter plays, Escape exits). It captures arrows only while armed and
 not in a text field. Off on `/watch` and `/shorts` (arrows seek the player) — `browseMove`
 self-disarms if invoked off a list surface, and `stopBrowse` clears the cached list so a
-stale feed is never replayed after navigating. Voice/loop and tools are unchanged; this is
-guided navigation layered on top.
+stale feed is never replayed after navigating. **Browse reads up to `BROWSE_LIMIT` (100)
+cards, not 20, and auto-extends at the end** — pressing Down on the last item calls
+`growFeed()` (which invokes `load_more_home` then re-reads) so the user can page past the
+initial batch; saying "more" while browsing also refreshes the cached list. Voice/loop and
+tools are unchanged; this is guided navigation layered on top.
 
 **Consumer↔provider invocation.** The provider's `ModelContext` exposes only `registerTool`
 (no `callTool`), so the agent wraps `registerTool` to capture every tool into a live registry
