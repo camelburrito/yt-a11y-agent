@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.9.2
+// @version      0.9.3
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -211,30 +211,67 @@
       return volume;
     }
 
+    // Single speech channel. Every speak() INTERRUPTS the previous line instead of queueing
+    // behind it — otherwise rapid arrow presses read every old item in order, and a reply
+    // keeps talking after the user has barged in. Tricky part: calling synth.speak()
+    // immediately after synth.cancel() races on Chrome and silently drops the utterance, so
+    // we cancel, then start on the next tick. And when a new line supersedes one that hasn't
+    // started speaking yet, we must still resolve the old promise (else `await speak()` hangs).
+    let pendingResolve = null;
+    let speakTimer = null;
+    let resumeTimer = null;
+    function flushSpeak() {
+      if (speakTimer) {
+        clearTimeout(speakTimer);
+        speakTimer = null;
+      }
+      if (pendingResolve) {
+        const r = pendingResolve;
+        pendingResolve = null;
+        r();
+      }
+    }
     function speak(text) {
       return new Promise((resolve) => {
         if (!synth || !text) return resolve();
-        // Do NOT call synth.cancel() right before speak() — on Chrome it races and can
-        // swallow the utterance (silent TTS). Also wait for voices to load (they arrive
-        // async via voiceschanged; getVoices() is often empty on the first call), pick one
-        // explicitly, and resume() to unstick Chrome's long-standing paused-queue bug.
-        const fire = () => {
+        flushSpeak(); // resolve + cancel whatever was speaking/queued
+        try {
+          synth.cancel();
+        } catch (_) {}
+        pendingResolve = resolve;
+        const start = () => {
+          speakTimer = null;
           const u = new SpeechSynthesisUtterance(text);
           u.rate = rate;
           u.volume = volume;
           const v = pickVoice();
           if (v) u.voice = v;
-          u.onend = () => resolve();
-          u.onerror = () => resolve();
+          const finish = () => {
+            if (pendingResolve === resolve) pendingResolve = null;
+            resolve();
+          };
+          u.onend = finish;
+          u.onerror = finish;
           synth.speak(u);
-          setTimeout(() => synth.resume(), 100);
+          if (resumeTimer) clearTimeout(resumeTimer);
+          resumeTimer = setTimeout(() => {
+            try {
+              synth.resume(); // unstick Chrome's long-standing paused-queue bug
+            } catch (_) {}
+          }, 100);
         };
-        if (synth.getVoices().length) fire();
-        else synth.addEventListener("voiceschanged", fire, { once: true });
+        // Wait for voices on the very first call (getVoices() is async via voiceschanged),
+        // then start a tick later to dodge the cancel→speak race.
+        const launch = () => {
+          speakTimer = setTimeout(start, 70);
+        };
+        if (synth.getVoices().length) launch();
+        else synth.addEventListener("voiceschanged", launch, { once: true });
       });
     }
 
     let activeRec = null;
+    const LISTEN_WATCHDOG_MS = 10000; // a single listen can NEVER hold the mic longer than this
     function listenOnce() {
       return new Promise((resolve, reject) => {
         if (!SR) return reject(new Error("SpeechRecognition not supported in this browser."));
@@ -244,13 +281,32 @@
         rec.interimResults = false;
         rec.maxAlternatives = 1;
         let done = false;
+        // Hard safety: if the browser never fires onend/onresult (seen on some Chrome builds),
+        // force-abort so the microphone is released no matter what. This is the backstop
+        // against the "mic on hangs the machine / blocks video calls" failure.
+        let watchdog = setTimeout(() => {
+          try {
+            rec.abort();
+          } catch (_) {}
+        }, LISTEN_WATCHDOG_MS);
+        const clearWatchdog = () => {
+          if (watchdog) {
+            clearTimeout(watchdog);
+            watchdog = null;
+          }
+        };
         rec.onresult = (e) => {
           done = true;
+          clearWatchdog();
           resolve(e.results[0][0].transcript);
         };
-        rec.onerror = (e) => reject(new Error("speech recognition error: " + e.error));
+        rec.onerror = (e) => {
+          clearWatchdog();
+          reject(new Error("speech recognition error: " + e.error));
+        };
         rec.onend = () => {
           activeRec = null;
+          clearWatchdog();
           if (!done) reject(new Error("no speech detected"));
         };
         rec.start();
@@ -266,6 +322,7 @@
       }
     }
     function cancelSpeech() {
+      flushSpeak(); // resolve any awaited speak() so callers don't hang
       if (synth) {
         try {
           synth.cancel();
@@ -273,88 +330,21 @@
       }
     }
 
-    // Hold-to-talk: holdStart() begins continuous recognition and resolves with the full
-    // transcript when holdStop() is called (on key release). Continuous so a natural pause
-    // mid-sentence doesn't cut the user off.
-    let holdRec = null;
-    const MAX_HOLD_MS = 12000; // hard cap: a stuck hold can NEVER hold the mic longer than this
-    function holdStart() {
-      return new Promise((resolve, reject) => {
-        if (!SR) return reject(new Error("SpeechRecognition not supported."));
-        const rec = new SR();
-        holdRec = rec;
-        rec.lang = "en-US";
-        rec.continuous = true;
-        rec.interimResults = true;
-        let finalText = "";
-        let started = false;
-        let stopRequested = false;
-        // Safety: if key-up is somehow missed (app switch while holding, lost keyup, etc.),
-        // force-stop so the microphone is never held open indefinitely — which would block
-        // video-call apps and run continuous recognition forever.
-        const safety = setTimeout(() => {
-          try {
-            rec.stop();
-          } catch (_) {}
-        }, MAX_HOLD_MS);
-        // End + force-release. stop() finalizes the transcript, but on a CONTINUOUS recognizer
-        // Chrome often keeps the mic after stop() — so abort() shortly after to guarantee the
-        // mic is freed. (We've been accumulating interim text, so we keep the transcript.)
-        const endNow = () => {
-          try {
-            rec.stop();
-          } catch (_) {}
-          setTimeout(() => {
-            try {
-              rec.abort();
-            } catch (_) {}
-          }, 600);
-        };
-        // Race fix: a quick tap can fire key-up (holdStop) BEFORE recognition has started, so
-        // act as soon as it has actually started.
-        rec._requestStop = () => {
-          stopRequested = true;
-          if (started) endNow();
-        };
-        rec.onstart = () => {
-          started = true;
-          if (stopRequested) endNow();
-        };
-        rec.onresult = (e) => {
-          finalText = "";
-          for (let i = 0; i < e.results.length; i++) finalText += e.results[i][0].transcript;
-        };
-        rec.onerror = (e) => {
-          clearTimeout(safety);
-          holdRec = null;
-          reject(new Error("speech recognition error: " + e.error));
-        };
-        rec.onend = () => {
-          clearTimeout(safety);
-          holdRec = null;
-          resolve(finalText.trim());
-        };
-        rec.start();
-      });
-    }
-    function holdStop() {
-      if (holdRec && holdRec._requestStop) holdRec._requestStop();
-    }
+    // NOTE: there is deliberately NO continuous-recognition / hold-to-talk path here. A
+    // continuous SpeechRecognition (rec.continuous = true) is what previously held the mic
+    // open, blocked video-call apps, and hung the machine — Chrome often keeps the mic after
+    // stop() on a continuous recognizer. All listening goes through the non-continuous
+    // listenOnce() above (with its 10s watchdog). Do NOT reintroduce a continuous recognizer.
+
     // Hard release: immediately abort any active recognition and drop the mic. Used on tab
     // hide / window blur / unload so we never hold the microphone away from other apps.
     function releaseMic() {
-      try {
-        if (holdRec) holdRec.abort();
-      } catch (_) {}
-      holdRec = null;
       abortListen();
     }
 
     return {
       speak,
       listenOnce,
-      holdStart,
-      holdStop,
       releaseMic,
       abortListen,
       cancelSpeech,
@@ -1062,13 +1052,23 @@
     return p === "/" || p.startsWith("/feed") || p.startsWith("/results");
   }
 
+  let browseFetching = false;
   async function browseMove(delta) {
+    voice.cancelSpeech(); // stop the previous item immediately — never read a backlog
     if (!onBrowsableSurface()) {
       stopBrowse();
       voice.speak("Arrow browsing isn't available on this page. The arrow keys control the video here.");
       return;
     }
-    if (!browseState.items.length) browseState.items = await feed(20);
+    if (!browseState.items.length) {
+      if (browseFetching) return; // a fetch is already in flight; ignore the extra press
+      browseFetching = true;
+      try {
+        browseState.items = await feed(20);
+      } finally {
+        browseFetching = false;
+      }
+    }
     if (!browseState.items.length) {
       voice.speak("There are no videos to browse here.");
       return;
@@ -1143,21 +1143,26 @@
   }
 
   // ===========================================================================
-  // HOLD-TO-TALK + BARGE-IN. Hold the talk key to speak, release to send; press again while
-  // the agent is replying to interrupt and speak. Earcons give instant feedback (listening /
-  // captured / ready / error) so there's never silent waiting after the user speaks.
+  // TAP-TO-TALK + UNIVERSAL BARGE-IN. Press the talk key once and speak; non-continuous
+  // recognition auto-ends on a pause (and a 10s watchdog force-frees the mic regardless), so
+  // the microphone is never held open. EVERY press interrupts whatever we're doing — it stops
+  // speaking, aborts any in-flight listen, and bumps talk.gen so a pending LLM reply can't
+  // speak over the new turn. Speech is a single channel (voice.speak interrupts, never
+  // queues), so the agent goes quiet the instant you press the key. Earcons give instant
+  // feedback (listening / captured / ready / error) so there's never silent waiting.
   // ===========================================================================
-  const talk = { key: "Backquote", state: "idle", hold: null };
+  const talk = { key: "Backquote", state: "idle", hold: null, gen: 0 };
 
   function isTextTarget(t) {
     const tag = (t && t.tagName) || "";
     return /^(INPUT|TEXTAREA|SELECT)$/.test(tag) || (t && t.isContentEditable);
   }
 
-  async function handleHeard(text) {
+  async function handleHeard(text, gen) {
+    if (talk.gen !== gen) return; // superseded before we even processed it
     if (!text || !text.trim()) {
       audio.error();
-      talk.state = "idle";
+      if (talk.gen === gen) talk.state = "idle";
       return;
     }
     audio.captured();
@@ -1169,10 +1174,11 @@
     } catch (_) {
       reply = "Sorry, something went wrong.";
     }
+    if (talk.gen !== gen) return; // user started a new turn while the LLM was thinking — drop this
     talk.state = "speaking";
     audio.ready();
     await voice.speak(reply);
-    if (talk.state === "speaking") talk.state = "idle";
+    if (talk.state === "speaking" && talk.gen === gen) talk.state = "idle";
   }
 
   // TAP-to-talk (not hold). Press the key once and speak; recognition is NON-continuous, so
@@ -1183,11 +1189,20 @@
     if (e.code !== talk.key || e.repeat || isTextTarget(e.target)) return;
     e.preventDefault();
     e.stopPropagation();
-    if (talk.state === "speaking") {
-      voice.cancelSpeech(); // barge-in: interrupt the reply
+    // Universal barge-in: a press ALWAYS interrupts — stop talking, abort any in-flight
+    // recognition, and bump the generation so a pending LLM reply (or a listen that was about
+    // to resolve) can't speak over this new turn. This is what makes it feel intuitive: the
+    // moment you press the key, the agent goes quiet and listens.
+    talk.gen++;
+    const myGen = talk.gen;
+    voice.cancelSpeech();
+    voice.abortListen();
+    // If we were already listening, this press cancels it (toggle off) without opening a new mic.
+    if (talk.state === "listening") {
       talk.state = "idle";
+      audio.error();
+      return;
     }
-    if (talk.state !== "idle") return; // already listening/thinking
     talk.state = "listening";
     audio.listening();
     let heard;
@@ -1195,10 +1210,11 @@
       heard = await voice.listenOnce(); // auto-ends on pause; browser frees the mic
     } catch (_) {
       audio.error();
-      talk.state = "idle";
+      if (talk.gen === myGen) talk.state = "idle";
       return;
     }
-    await handleHeard(heard);
+    if (talk.gen !== myGen) return; // a newer press superseded this listen
+    await handleHeard(heard, myGen);
   }
 
   function enableTalk(key) {
@@ -1240,6 +1256,7 @@
     try {
       voice.cancelSpeech();
     } catch (_) {}
+    talk.gen++; // invalidate any in-flight turn so its reply can't speak after release
     talk.state = "idle";
     state.running = false;
   }

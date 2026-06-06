@@ -42,9 +42,15 @@ user's existing assistive tech reports stays authoritative.
   production = MV3 extension (for persistence across navigations + out-of-page UI; the
   model is on-device so CSP is a non-issue). Tools are driven by a **manual JSON loop** —
   Nano's native tool-calling narrates instead of executing, so don't rely on it; TTS needs
-  the voices/cancel/resume care in `speak()`. **Interaction model (v0.8.0):** primary input is
-  **hold-to-talk** (`enableTalk`, default hold the backtick `` ` `` key) — hold to speak,
-  release to send, press again to **interrupt** (barge-in). **Earcons** (Web Audio tones) give
+  the voices/cancel/resume care in `speak()`. **Interaction model (v0.9.3):** primary input is
+  **tap-to-talk** (`enableTalk`, default the backtick `` ` `` key) — press once and speak;
+  non-continuous recognition auto-ends on a pause (so the mic is never held open). **Every
+  press is universal barge-in**: it cancels speech, aborts any in-flight listen, and bumps
+  `talk.gen` so a pending LLM reply can't speak over the new turn. **`speak()` is a single
+  interrupt-driven channel** — it cancels the previous line instead of queueing (rapid arrow
+  presses / barge-in never stack up); the cancel→speak Chrome race is dodged with a one-tick
+  delay, and a superseded `speak()` promise is still resolved (`flushSpeak`) so `await
+  speak()` never hangs. **Earcons** (Web Audio tones) give
   instant feedback (listening / captured / ready / error) so there's never silent waiting;
   the loop speaks **crisp progress cues** ("Searching.", "Opening.") for slow tools.
   **Continuity across navigation:** navigating provider tools stash a message in
@@ -111,15 +117,16 @@ boundary text-only (provider passes a URL; the consumer does the vision).
   `{"args":{"index":5}}` example.
 - **TTS voice**: `pickVoice()` prefers natural voices (Chrome's Google voices / good Mac
   voices) over the robotic default first-English voice; `ytAgent.setVoice("name")` overrides.
-  **Hold-to-talk is race-safe** — a fast tap that releases before recognition starts still
-  stops the mic (else continuous recognition runs forever).
 - **⚠️ NEVER hold the mic when the user isn't actively talking.** The extension auto-injects on
   every YouTube tab and persists; a stuck-open mic blocks other apps (video calls) and a
-  runaway continuous recognizer can hang the machine. Safeguards (do not regress): hold-to-talk
-  has a **12 s hard cap** (`MAX_HOLD_MS`), and `releaseAll()` (mic abort + stop recording +
-  cancel speech + end loop) fires on **`visibilitychange` (hidden) / `blur` / `pagehide` /
-  `beforeunload`**, plus `ytAgent.release()`. Any new mic / `getUserMedia` path must be covered
-  by these and always stop its stream in a `finally`.
+  runaway recognizer can hang the machine. Safeguards (do not regress): tap-to-talk uses
+  **non-continuous** recognition (the browser ends it on a pause), `listenOnce` has a **10 s
+  watchdog** (`LISTEN_WATCHDOG_MS`) that force-`abort()`s if `onend`/`onresult` never fire,
+  and `releaseAll()` (mic abort + stop recording + cancel speech + bump `talk.gen` + end loop)
+  fires on **`visibilitychange` (hidden) / `blur` / `pagehide` / `beforeunload`**, plus
+  `ytAgent.release()`. Any new mic / `getUserMedia` path must be covered by these and always
+  stop its stream in a `finally`. **Never reintroduce a continuous recognizer** — that was the
+  root of the machine-hang / blocked-video-call incidents.
 - **Model components**: text / audio / image are **separate** on-device downloads — each
   fetches the first time its modality is used. So the audio adapter is only pulled if `nano`
   listen mode is on (default Web Speech avoids it), and the image adapter only on vision.
