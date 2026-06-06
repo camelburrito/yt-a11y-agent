@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.9.8
+// @version      0.9.9
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -29,7 +29,12 @@
   "use strict";
 
   const LOG = "[yt-a11y-agent]";
-  const log = (...a) => console.log(LOG, ...a);
+  // High-res clock for timing. Every log line is stamped with seconds-since-load so the
+  // console shows where the time goes (e.g. which session.prompt() hop stalls the machine).
+  const nowms = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
+  const T0 = nowms();
+  const stamp = () => `+${((nowms() - T0) / 1000).toFixed(2)}s`;
+  const log = (...a) => console.log(LOG, stamp(), ...a);
   const MANUAL_LOOP_HOPS = 4; // max tool-call round-trips per ask() in the manual JSON loop
 
   // Crisp spoken cues so the user knows what we're doing during slow/navigating tools —
@@ -692,12 +697,13 @@
       "Available tools:\n" +
       catalog;
 
+    const tCreate = nowms();
     state.session = await LM.create({
       initialPrompts: [{ role: "system", content: sys }],
       monitor: dlMonitor,
     });
     state.sessionSig = sig;
-    log(`Gemini session ready (availability="${avail}"); tools: ${sig || "(none)"}`);
+    log(`LM.create() took ${Math.round(nowms() - tCreate)}ms (availability="${avail}"); tools: ${sig || "(none)"}`);
     return state.session;
   }
 
@@ -716,11 +722,15 @@
   // Manual tool-call loop: prompt -> parse JSON action -> run tool -> feed result back,
   // up to MANUAL_LOOP_HOPS round-trips, then expect a {"action":"final"}.
   async function geminiEngine(utterance) {
+    const tSess = nowms();
     const session = await ensureSession();
+    log(`ensureSession() ${Math.round(nowms() - tSess)}ms`);
     const tools = consumer.asPromptApiTools().concat(localTools);
     let turn = `User said: ${utterance}`;
     for (let i = 0; i < MANUAL_LOOP_HOPS; i++) {
+      const tP = nowms();
       const raw = await session.prompt(turn);
+      log(`session.prompt() hop ${i} ${Math.round(nowms() - tP)}ms`);
       const step = parseAction(raw);
       if (!step) return raw.trim(); // model returned plain prose; just use it
       if (step.action === "final") return step.say || "";
@@ -735,12 +745,13 @@
         // Crisp progress cue (fire-and-forget) so the user hears we're working.
         if (TOOL_CUE[step.tool]) voice.speak(TOOL_CUE[step.tool]);
         let result;
+        const tExec = nowms();
         try {
           result = await tool.execute(step.args || {});
         } catch (e) {
           result = "tool error: " + ((e && e.message) || e);
         }
-        log(`tool ${step.tool} ->`, result);
+        log(`tool ${step.tool} ${Math.round(nowms() - tExec)}ms ->`, result);
         turn = `Result of ${step.tool}:\n${result}\n\nNow call another tool or give the final answer as JSON.`;
         continue;
       }
@@ -796,8 +807,10 @@
   }
   const callText = async (tool, args) => {
     if (!consumer.has(tool)) return `That isn't available on this page.`;
+    const tExec = nowms();
     try {
       const r = await consumer.call(tool, args || {});
+      log(`tool ${tool} ${Math.round(nowms() - tExec)}ms (command path)`);
       return r && r.content && r.content[0] ? r.content[0].text : "";
     } catch (_) {
       return `Sorry, I couldn't do that just now.`;
@@ -1263,15 +1276,19 @@
     log(`heard: ${text}`);
     talk.state = "thinking";
     let reply;
+    const tAsk = nowms();
     try {
       reply = await ask(text); // progress cues fire inside the loop
     } catch (_) {
       reply = "Sorry, something went wrong.";
     }
+    log(`ask() total ${Math.round(nowms() - tAsk)}ms`);
     if (talk.gen !== gen) return; // user started a new turn while the LLM was thinking — drop this
     talk.state = "speaking";
     audio.ready();
+    const tSpeak = nowms();
     await voice.speak(reply);
+    log(`speak() ${Math.round(nowms() - tSpeak)}ms`);
     if (talk.state === "speaking" && talk.gen === gen) talk.state = "idle";
   }
 
