@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.8.2
+// @version      0.8.3
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -254,6 +254,7 @@
     // transcript when holdStop() is called (on key release). Continuous so a natural pause
     // mid-sentence doesn't cut the user off.
     let holdRec = null;
+    const MAX_HOLD_MS = 12000; // hard cap: a stuck hold can NEVER hold the mic longer than this
     function holdStart() {
       return new Promise((resolve, reject) => {
         if (!SR) return reject(new Error("SpeechRecognition not supported."));
@@ -265,9 +266,17 @@
         let finalText = "";
         let started = false;
         let stopRequested = false;
+        // Safety: if key-up is somehow missed (app switch while holding, lost keyup, etc.),
+        // force-stop so the microphone is never held open indefinitely — which would block
+        // video-call apps and run continuous recognition forever.
+        const safety = setTimeout(() => {
+          try {
+            rec.stop();
+          } catch (_) {}
+        }, MAX_HOLD_MS);
         // Race fix: a quick tap can fire key-up (holdStop) BEFORE recognition has started, so
-        // stop() would no-op and continuous recognition would run forever (mic never releases).
-        // Track start/stop intent and stop as soon as it has actually started.
+        // stop() would no-op and continuous recognition would run forever. Track start/stop
+        // intent and stop as soon as it has actually started.
         rec._requestStop = () => {
           stopRequested = true;
           if (started) {
@@ -289,10 +298,12 @@
           for (let i = 0; i < e.results.length; i++) finalText += e.results[i][0].transcript;
         };
         rec.onerror = (e) => {
+          clearTimeout(safety);
           holdRec = null;
           reject(new Error("speech recognition error: " + e.error));
         };
         rec.onend = () => {
+          clearTimeout(safety);
           holdRec = null;
           resolve(finalText.trim());
         };
@@ -302,12 +313,22 @@
     function holdStop() {
       if (holdRec && holdRec._requestStop) holdRec._requestStop();
     }
+    // Hard release: immediately abort any active recognition and drop the mic. Used on tab
+    // hide / window blur / unload so we never hold the microphone away from other apps.
+    function releaseMic() {
+      try {
+        if (holdRec) holdRec.abort();
+      } catch (_) {}
+      holdRec = null;
+      abortListen();
+    }
 
     return {
       speak,
       listenOnce,
       holdStart,
       holdStop,
+      releaseMic,
       abortListen,
       cancelSpeech,
       setVoice,
@@ -1037,6 +1058,41 @@
   }
 
   // ===========================================================================
+  // SAFETY: never hold the microphone when the user isn't actively talking to us.
+  // Releases the mic, stops any recording, cancels speech, and ends the loop whenever the
+  // tab is hidden, the window loses focus (e.g. switching to a video call), or the page
+  // unloads. This is what stops the extension from blocking other apps' mic / running the
+  // recognizer in the background.
+  // ===========================================================================
+  function releaseAll() {
+    try {
+      voice.releaseMic();
+    } catch (_) {}
+    try {
+      nanoAsr.abort();
+    } catch (_) {}
+    try {
+      voice.cancelSpeech();
+    } catch (_) {}
+    talk.state = "idle";
+    state.running = false;
+  }
+  if (typeof document !== "undefined") {
+    document.addEventListener(
+      "visibilitychange",
+      () => {
+        if (document.hidden) releaseAll();
+      },
+      true
+    );
+  }
+  if (typeof window !== "undefined") {
+    window.addEventListener("blur", releaseAll, true);
+    window.addEventListener("pagehide", releaseAll, true);
+    window.addEventListener("beforeunload", releaseAll, true);
+  }
+
+  // ===========================================================================
   // PUBLIC API — headless on purpose (no DOM injection; AT-safe).
   // ===========================================================================
   const ytAgent = {
@@ -1056,6 +1112,7 @@
     enablePushToTalk, // (opts?) alternative: tap a combo (default Ctrl+Shift+Space) for one turn
     disablePushToTalk,
     consumePending, // read+clear the cross-navigation continuity message
+    release: releaseAll, // panic: drop the mic + stop everything right now
     isRunning: () => state.running,
     // Arrow-key feed browsing (guided navigation with spoken descriptions).
     startBrowse, // (announce=true) -> arms arrows: Down/Up move, Enter plays, Escape exits

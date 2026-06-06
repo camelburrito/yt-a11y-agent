@@ -104,6 +104,13 @@ boundary text-only (provider passes a URL; the consumer does the vision).
   voices) over the robotic default first-English voice; `ytAgent.setVoice("name")` overrides.
   **Hold-to-talk is race-safe** — a fast tap that releases before recognition starts still
   stops the mic (else continuous recognition runs forever).
+- **⚠️ NEVER hold the mic when the user isn't actively talking.** The extension auto-injects on
+  every YouTube tab and persists; a stuck-open mic blocks other apps (video calls) and a
+  runaway continuous recognizer can hang the machine. Safeguards (do not regress): hold-to-talk
+  has a **12 s hard cap** (`MAX_HOLD_MS`), and `releaseAll()` (mic abort + stop recording +
+  cancel speech + end loop) fires on **`visibilitychange` (hidden) / `blur` / `pagehide` /
+  `beforeunload`**, plus `ytAgent.release()`. Any new mic / `getUserMedia` path must be covered
+  by these and always stop its stream in a `finally`.
 - **Model components**: text / audio / image are **separate** on-device downloads — each
   fetches the first time its modality is used. So the audio adapter is only pulled if `nano`
   listen mode is on (default Web Speech avoids it), and the image adapter only on vision.
