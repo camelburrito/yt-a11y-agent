@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.9.9
+// @version      0.9.10
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -176,23 +176,29 @@
       (typeof window !== "undefined" && (window.SpeechRecognition || window.webkitSpeechRecognition)) ||
       null;
 
-    // Voice selection. The first English voice is often a low-quality/robotic system voice;
-    // prefer natural ones (Chrome's Google voices, or Mac's good voices), with a user override.
+    // Voice selection. CRITICAL: prefer LOCAL voices (localService === true). The "Google"
+    // / online voices (localService === false) fetch audio from a server PER utterance — when
+    // that network call stalls, speechSynthesis.speak() takes ~25s to say one word and freezes
+    // the turn (measured: speak() 25510ms for "Paused."). Local macOS voices (Samantha/Alex/…)
+    // are instant and never touch the network. We only fall back to an online voice if there is
+    // no local English voice at all. A user override (setVoice) still wins if it's local.
     let preferredVoiceName = null;
     function pickVoice() {
       const vs = synth ? synth.getVoices() : [];
       if (!vs.length) return null;
       const en = vs.filter((v) => v.lang && v.lang.toLowerCase().startsWith("en"));
       const pool = en.length ? en : vs;
+      const local = pool.filter((v) => v.localService);
+      const safe = local.length ? local : pool; // only go online if no local voice exists
       if (preferredVoiceName) {
-        const m = pool.find((v) => v.name.toLowerCase().includes(preferredVoiceName.toLowerCase()));
+        const m = safe.find((v) => v.name.toLowerCase().includes(preferredVoiceName.toLowerCase()));
         if (m) return m;
       }
       return (
-        pool.find((v) => /google/i.test(v.name)) || // Chrome's natural network voices
-        pool.find((v) => /(samantha|alex|karen|daniel|natural|neural|siri|aria|jenny|libby)/i.test(v.name)) ||
-        pool.find((v) => v.localService === false) || // online voices tend to sound better
-        pool[0]
+        // Good, natural-sounding LOCAL macOS/Windows voices (no network).
+        safe.find((v) => /(samantha|alex|karen|daniel|moira|tessa|fiona|victoria|aaron|allison|ava|susan|zoe)/i.test(v.name)) ||
+        safe.find((v) => v.default) ||
+        safe[0]
       );
     }
     function setVoice(name) {
@@ -251,7 +257,20 @@
           u.volume = volume;
           const v = pickVoice();
           if (v) u.voice = v;
+          // Watchdog: if the utterance neither ends nor errors in a reasonable window (a
+          // stalled/online voice can take ~25s for one word), cancel and move on so a turn is
+          // never blocked. Budget scales with text length but caps generously for long greetings.
+          let watchdog = setTimeout(() => {
+            try {
+              synth.cancel();
+            } catch (_) {}
+            finish();
+          }, Math.min(30000, Math.max(6000, text.length * 130)));
           const finish = () => {
+            if (watchdog) {
+              clearTimeout(watchdog);
+              watchdog = null;
+            }
             if (pendingResolve === resolve) pendingResolve = null;
             resolve();
           };

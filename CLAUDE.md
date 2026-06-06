@@ -118,8 +118,13 @@ boundary text-only (provider passes a URL; the consumer does the vision).
   the 5th). Tools read args **leniently** (`argIndex`/`argName`) because the small on-device
   model often mislabels them (e.g. omits `index`); the system prompt also gives a concrete
   `{"args":{"index":5}}` example.
-- **TTS voice**: `pickVoice()` prefers natural voices (Chrome's Google voices / good Mac
-  voices) over the robotic default first-English voice; `ytAgent.setVoice("name")` overrides.
+- **TTS voice**: `pickVoice()` prefers **LOCAL** voices (`localService === true`) — picking a
+  natural local one (Samantha/Alex/…) over the robotic default. **Do NOT prefer "Google"/online
+  voices**: they fetch audio from a server per utterance, and when that stalls `speak()` takes
+  ~25 s for one word and freezes the turn (measured — this was the "whole machine hangs" report,
+  v0.9.10). `speak()` also has a length-scaled **watchdog** that cancels + resolves if an
+  utterance never ends. Online voices are used only if no local English voice exists.
+  `ytAgent.setVoice("name")` overrides (still local-only).
 - **⚠️ NEVER hold the mic when the user isn't actively talking.** The extension auto-injects on
   every YouTube tab and persists; a stuck-open mic blocks other apps (video calls) and a
   runaway recognizer can hang the machine. Safeguards (do not regress): tap-to-talk uses
