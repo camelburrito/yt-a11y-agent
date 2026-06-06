@@ -141,6 +141,16 @@ boundary text-only (provider passes a URL; the consumer does the vision).
   apology loops). Only non-matching/conversational text falls through to `geminiEngine`.
   Numbers are 1-based; word-numbers + ordinals parsed (`parseNum`). Open/search/home speak a
   confirmation then navigate (with `sessionStorage` continuity).
+- **Route registration is surface-scoped, not path-scoped.** Re-register tools only when the
+  resolved **surface** changes (`onMaybeRouteChange` compares `lastSurface` only) — NOT on every
+  pathname change. Scrolling Shorts (`/shorts/A→B`) and switching videos (`/watch?v=A→B`) stay on
+  the same surface and the tools read the DOM live, so re-registering just churns. **Verified
+  Chrome behavior (`#enable-webmcp-testing`):** `ModelContext` does **not** unregister tools when
+  their `AbortSignal` fires — there is no `unregisterTool`, and abort is a no-op for the native
+  registry. So a re-register throws `InvalidStateError: Duplicate tool name`; the provider treats
+  that as "already registered" (the consumer's `registerTool` wrapper captures the tool into its
+  Map *before* the native call throws, so the agent still works). Never rely on abort to clear
+  the page's registry; rely on surface-scoped re-registration to avoid duplicates in the first place.
 - **`[yt-a11y]` log prefix** for all console output.
 - **Docs stay current with code.** Update `README.md`, `docs/HANDOFF.md`, and
   `docs/architecture/yt-a11y-agent.md` (diagrams included) in the *same change* that

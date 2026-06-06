@@ -949,7 +949,15 @@
         api.registerTool(tool, { signal });
         registered.push(tool.name);
       } catch (err) {
-        console.error(`${LOG} failed to register tool "${tool.name}":`, err);
+        // Chrome's experimental ModelContext (behind #enable-webmcp-testing) does NOT reliably
+        // unregister tools when their AbortSignal fires, so a re-register can throw
+        // "Duplicate tool name". The tool IS present in the page's registry (and the consumer
+        // captured it before this throw), so treat it as registered rather than spamming errors.
+        if (String((err && err.message) || err).includes("Duplicate tool name")) {
+          registered.push(tool.name);
+        } else {
+          console.error(`${LOG} failed to register tool "${tool.name}":`, err);
+        }
       }
     }
 
@@ -963,17 +971,18 @@
   //   1. yt-navigate-finish  — YouTube's own "done navigating" event (primary)
   //   2. popstate            — back/forward
   //   3. 1s URL poll         — fallback for anything the above miss
-  // We only re-register when the resolved surface actually changes.
+  // We only re-register when the resolved SURFACE changes — NOT on every path tweak. This is
+  // critical: scrolling between Shorts (/shorts/A -> /shorts/B) or switching videos
+  // (/watch?v=A -> /watch?v=B) keeps the same surface, and the tools read the DOM live, so
+  // re-registering would only churn (and, given Chrome's abort-doesn't-unregister behavior,
+  // produce "Duplicate tool name" storms) for no benefit.
   // ---------------------------------------------------------------------------
   let lastSurface = null;
-  let lastPath = null;
 
   function onMaybeRouteChange() {
-    const path = location.pathname;
-    const surface = detectSurface(path);
-    if (surface === lastSurface && path === lastPath) return;
+    const surface = detectSurface(location.pathname);
+    if (surface === lastSurface) return;
     lastSurface = surface;
-    lastPath = path;
     registerForRoute();
   }
 
