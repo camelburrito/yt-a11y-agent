@@ -123,8 +123,11 @@ boundary text-only (provider passes a URL; the consumer does the vision).
 - **⚠️ NEVER hold the mic when the user isn't actively talking.** The extension auto-injects on
   every YouTube tab and persists; a stuck-open mic blocks other apps (video calls) and a
   runaway recognizer can hang the machine. Safeguards (do not regress): tap-to-talk uses
-  **non-continuous** recognition (the browser ends it on a pause), `listenOnce` has a **10 s
-  watchdog** (`LISTEN_WATCHDOG_MS`) that force-`abort()`s if `onend`/`onresult` never fire,
+  **non-continuous** recognition, and **`listenOnce` calls `rec.abort()` the instant
+  `onresult` fires** — do NOT wait for Chrome's natural `onend`, which leaves the session (and
+  the mic indicator) open through the LLM + TTS reply, and the live mic can even hear our own
+  TTS over the speakers and refuse to end. `listenOnce` also has a **10 s watchdog**
+  (`LISTEN_WATCHDOG_MS`) that force-`abort()`s if `onend`/`onresult` never fire,
   and `releaseAll()` (mic abort + stop recording + cancel speech + bump `talk.gen` + end loop)
   fires on **`visibilitychange` (hidden) / `blur` / `pagehide` / `beforeunload`**, plus
   `ytAgent.release()`. Any new mic / `getUserMedia` path must be covered by these and always

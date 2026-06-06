@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.9.6
+// @version      0.9.7
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -297,7 +297,17 @@
         rec.onresult = (e) => {
           done = true;
           clearWatchdog();
-          resolve(e.results[0][0].transcript);
+          const transcript = e.results[0][0].transcript;
+          // Release the mic IMMEDIATELY. Do NOT wait for Chrome's natural onend — once we have
+          // the words, an open session keeps the mic indicator on through the LLM + TTS reply,
+          // and the still-live mic can even hear our own TTS through the speakers and refuse to
+          // end. abort() discards the rest and frees the device right now. done=true makes the
+          // ensuing onend/onerror no-ops.
+          activeRec = null;
+          try {
+            rec.abort();
+          } catch (_) {}
+          resolve(transcript);
         };
         rec.onerror = (e) => {
           clearWatchdog();
