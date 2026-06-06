@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.8.4
+// @version      0.9.0
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -189,6 +189,18 @@
       return (synth ? synth.getVoices() : []).map((v) => `${v.name} (${v.lang})`);
     }
 
+    // Spoken-rate + volume, adjustable by voice ("slower" / "faster" / "louder" / "quieter").
+    let rate = 1.05;
+    let volume = 1.0;
+    function setRate(delta) {
+      rate = Math.max(0.5, Math.min(2, rate + (delta || 0)));
+      return rate;
+    }
+    function setSpeechVolume(delta) {
+      volume = Math.max(0.1, Math.min(1, volume + (delta || 0)));
+      return volume;
+    }
+
     function speak(text) {
       return new Promise((resolve) => {
         if (!synth || !text) return resolve();
@@ -198,7 +210,8 @@
         // explicitly, and resume() to unstick Chrome's long-standing paused-queue bug.
         const fire = () => {
           const u = new SpeechSynthesisUtterance(text);
-          u.rate = 1.05;
+          u.rate = rate;
+          u.volume = volume;
           const v = pickVoice();
           if (v) u.voice = v;
           u.onend = () => resolve();
@@ -337,6 +350,8 @@
       cancelSpeech,
       setVoice,
       listVoices,
+      setRate,
+      setSpeechVolume,
       supported: { tts: !!synth, stt: !!SR },
     };
   })();
@@ -729,9 +744,119 @@
   // ===========================================================================
   // AGENT entry points.
   // ===========================================================================
+  // ===========================================================================
+  // DETERMINISTIC COMMAND LAYER. Common intents are matched here and run instantly — no
+  // model round-trip, no misrouting, no waiting. Only genuinely conversational requests fall
+  // through to Nano. Returns: a reply string (spoken), "" (handled silently), or null (not a
+  // command -> use the model). Also folds in voice ergonomics and graceful recovery.
+  // ===========================================================================
+  const NUMWORDS = {
+    one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+    eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17,
+    eighteen: 18, nineteen: 19, twenty: 20, first: 1, second: 2, third: 3, fourth: 4, fifth: 5,
+    sixth: 6, seventh: 7, eighth: 8, ninth: 9, tenth: 10, last: -1,
+  };
+  function parseNum(s) {
+    const m = s.match(/\b(\d+)\b/);
+    if (m) return parseInt(m[1], 10);
+    for (const w in NUMWORDS) if (new RegExp("\\b" + w + "\\b").test(s)) return NUMWORDS[w];
+    return null;
+  }
+  function helpText() {
+    if (location.pathname.startsWith("/watch"))
+      return "On this video you can say: play, pause, skip forward, skip back, captions on, captions off, next video, or go home. Say repeat to hear something again, or slower and faster to change my speed.";
+    return "You can say: list videos, open and a number, next, previous, search for something, load more, or go home. Say a category name like Music to filter. Say repeat, slower, or faster anytime.";
+  }
+  async function listHere() {
+    const items = await feed(20);
+    if (!items.length) return "There's nothing to list here.";
+    const top = items.slice(0, 5).map((v) => `${v.index}, ${v.title}`).join(". ");
+    return `${items.length} videos. ${top}. Say open and a number, or next.`;
+  }
+  async function openByNumber(n) {
+    const items = await feed(60);
+    let it = n === -1 ? items[items.length - 1] : items.find((v) => v.index === n);
+    if (!it) return `There's no number ${n}. There are ${items.length}. Say a number from 1 to ${items.length}.`;
+    if (!it.url) return `I found "${it.title}" but couldn't open it.`;
+    try {
+      sessionStorage.setItem("ytA11yPending", `Now playing ${it.title}.`);
+    } catch (_) {}
+    await voice.speak(`Opening ${it.title}.`); // finish the confirmation before navigating
+    window.location.href = it.url;
+    return "";
+  }
+  const callText = async (tool, args) => {
+    const r = await consumer.call(tool, args || {});
+    return r && r.content && r.content[0] ? r.content[0].text : "";
+  };
+
+  async function handleCommand(rawText) {
+    const t = (rawText || "").trim().toLowerCase().replace(/[.!?]+$/, "");
+    if (!t || t.startsWith("[")) return null; // ignore the bracketed greeting trigger
+    const path = location.pathname;
+    const onWatch = path.startsWith("/watch");
+    const onList = path === "/" || path.startsWith("/feed") || path.startsWith("/results");
+
+    // Ergonomics (any surface)
+    if (/^(repeat|say (that|it) again|again|what did you say)$/.test(t)) return state.lastReply || "I haven't said anything yet.";
+    if (/^faster$|(speak|talk|go)\b.*\bfaster\b/.test(t)) { voice.setRate(0.15); return "Speaking faster."; }
+    if (/^slower$|slow down|(speak|talk)\b.*\bslower\b/.test(t)) { voice.setRate(-0.15); return "Speaking slower."; }
+    if (/\b(louder|volume up|turn it up)\b/.test(t)) { voice.setSpeechVolume(0.15); return "Louder."; }
+    if (/\b(quieter|softer|volume down|turn it down)\b/.test(t)) { voice.setSpeechVolume(-0.15); return "Quieter."; }
+    if (/^(stop|quiet|shush|shut up|never ?mind|be quiet)$/.test(t)) { voice.cancelSpeech(); return ""; }
+    if (/^(help|what can i (say|do)|options|commands|how do i)\b/.test(t)) return helpText();
+
+    // Navigation
+    if (/^(go )?home$|take me home/.test(t)) { try { sessionStorage.setItem("ytA11yPending", "You're on the home page."); } catch (_) {} await voice.speak("Going home."); location.href = "https://www.youtube.com/"; return ""; }
+    if (/^(go back|previous page)$/.test(t)) { await voice.speak("Going back."); history.back(); return ""; }
+    {
+      const m = t.match(/^(?:search(?: for)?|find|look up|search up) (.+)$/);
+      if (m) { await voice.speak(`Searching for ${m[1]}.`); await callText("run_search", { query: m[1] }); return ""; }
+    }
+
+    // Open by number (home / search / up-next)
+    if (/\b(open|play|watch|select|choose)\b/.test(t) || /\bnumber\b/.test(t) || /\b(first|second|third|fourth|fifth|last)\b/.test(t)) {
+      const n = parseNum(t);
+      if (n != null) return await openByNumber(n);
+      if (/\b(open|play|watch)\b/.test(t) && onList) return "Which number? Say, for example, open 3.";
+    }
+
+    // Browse next / previous on list surfaces
+    if (onList && /^(next|next one|down|forward)$/.test(t)) { if (!browseState.armed) await startBrowse(false); await browseMove(1); return ""; }
+    if (onList && /^(previous|prev|back one|up|go up)$/.test(t)) { if (!browseState.armed) await startBrowse(false); await browseMove(-1); return ""; }
+    if (onList && /^(more|load more|show more)$/.test(t)) return await callText("load_more_home");
+    if (/^(list|what'?s here|read( the)? titles|list (videos|results))$/.test(t)) return await listHere();
+
+    // Filter by category (home)
+    {
+      const m = t.match(/^(?:filter by|show me|show|category) (.+)$/);
+      if (m && (path === "/" || path.startsWith("/feed"))) return await callText("select_category", { name: m[1] });
+    }
+
+    // Playback (watch)
+    if (onWatch) {
+      if (/^(pause|pause( the)? video)$/.test(t)) return await callText("playback_control", { action: "pause" });
+      if (/^(play|resume|continue|unpause|play( the)? video)$/.test(t)) return await callText("playback_control", { action: "play" });
+      if (/(skip|jump|go)\b.*(ahead|forward)|fast ?forward/.test(t)) return await callText("playback_control", { action: "forward", value: parseNum(t) || 10 });
+      if (/(skip back|rewind|go back)/.test(t)) return await callText("playback_control", { action: "back", value: parseNum(t) || 10 });
+      if (/captions?\b.*\bon\b|subtitles?\b.*\bon\b/.test(t)) return await callText("set_captions", { on: true });
+      if (/captions?\b.*\boff\b|subtitles?\b.*\boff\b/.test(t)) return await callText("set_captions", { on: false });
+      if (/^(next( video| up)?|play next)$/.test(t)) return await callText("play_next");
+    }
+
+    return null; // not a recognized command -> hand to the model
+  }
+
   async function ask(utterance) {
     if (!utterance || !utterance.trim()) return "";
+    const cmd = await handleCommand(utterance);
+    if (cmd !== null) {
+      if (cmd) state.lastReply = cmd;
+      log("reply (command):", cmd);
+      return cmd; // "" = handled silently (already spoke / no reply needed)
+    }
     const reply = await state.engine(utterance);
+    state.lastReply = reply;
     log("reply:", reply);
     return reply;
   }

@@ -117,6 +117,14 @@ boundary text-only (provider passes a URL; the consumer does the vision).
   Multimodal sessions are **cached + `clone()`d per call** (`imageBase`, `nanoAsr._audioBase`)
   so we don't re-create — and risk re-fetching — them every time. `availability()` of
   `downloadable`/`downloading` triggers a one-time "Setting up the model…" announcement.
+- **Deterministic command layer** (`handleCommand` in the agent, runs first in `ask()`):
+  common intents — `open/play N`, `next`/`previous`, `play`/`pause`, `skip forward/back`,
+  `search X`, `filter by X`, `captions on/off`, `list`, `more`, `go home/back`, plus
+  ergonomics (`repeat`, `slower`/`faster`, `louder`/`quieter`, `stop`, `help`) — are matched
+  by regex and run **instantly, no model round-trip** (fixes Nano misrouting + latency +
+  apology loops). Only non-matching/conversational text falls through to `geminiEngine`.
+  Numbers are 1-based; word-numbers + ordinals parsed (`parseNum`). Open/search/home speak a
+  confirmation then navigate (with `sessionStorage` continuity).
 - **`[yt-a11y]` log prefix** for all console output.
 - **Docs stay current with code.** Update `README.md`, `docs/HANDOFF.md`, and
   `docs/architecture/yt-a11y-agent.md` (diagrams included) in the *same change* that
