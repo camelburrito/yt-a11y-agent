@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.9.10
+// @version      0.9.11
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -196,8 +196,8 @@
       return (
         // Good, natural-sounding LOCAL macOS/Windows voices (no network).
         safe.find((v) => /(samantha|alex|karen|daniel|moira|tessa|fiona|victoria|aaron|allison|ava|susan|zoe)/i.test(v.name)) ||
-        safe.find((v) => v.default) ||
-        safe[0]
+        safe.find((v) => v.default) || // the system default local voice (reliable)
+        null // null = let the browser use its own default rather than force a maybe-broken one
       );
     }
     function setVoice(name) {
@@ -260,11 +260,12 @@
           // stalled/online voice can take ~25s for one word), cancel and move on so a turn is
           // never blocked. Budget scales with text length but caps generously for long greetings.
           let watchdog = setTimeout(() => {
-            try {
-              synth.cancel();
-            } catch (_) {}
+            // Do NOT synth.cancel() here — local macOS voices often speak fine but fire onend
+            // late or never, and cancelling would CUT the audio (the "not reading responses"
+            // bug). Just resolve so the turn isn't blocked; the audio keeps playing and the
+            // next speak()'s cancel clears anything still going.
             finish();
-          }, Math.min(30000, Math.max(6000, text.length * 130)));
+          }, Math.min(30000, Math.max(8000, text.length * 140)));
           const finish = () => {
             if (watchdog) {
               clearTimeout(watchdog);
@@ -892,6 +893,18 @@
       return msg;
     }
     if (/^(list|what'?s here|read( the)? titles|list (videos|results))$/.test(t)) return await listHere();
+
+    // List categories (home) — deterministic so it never hits the slow on-device model.
+    if ((path === "/" || path.startsWith("/feed")) && /\bcategor(y|ies)\b/.test(t) && /^(list|read|what|which|show|tell|name)\b/.test(t)) {
+      const raw = await callText("list_categories");
+      let names = [];
+      try {
+        names = JSON.parse(raw);
+      } catch (_) {}
+      if (Array.isArray(names) && names.length)
+        return "Categories you can pick: " + names.slice(0, 12).join(", ") + ". Say, for example, filter by Music.";
+      return "I couldn't read the categories here.";
+    }
 
     // Filter by category (home)
     {
