@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.8.3
+// @version      0.8.4
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -273,24 +273,28 @@
             rec.stop();
           } catch (_) {}
         }, MAX_HOLD_MS);
+        // End + force-release. stop() finalizes the transcript, but on a CONTINUOUS recognizer
+        // Chrome often keeps the mic after stop() — so abort() shortly after to guarantee the
+        // mic is freed. (We've been accumulating interim text, so we keep the transcript.)
+        const endNow = () => {
+          try {
+            rec.stop();
+          } catch (_) {}
+          setTimeout(() => {
+            try {
+              rec.abort();
+            } catch (_) {}
+          }, 600);
+        };
         // Race fix: a quick tap can fire key-up (holdStop) BEFORE recognition has started, so
-        // stop() would no-op and continuous recognition would run forever. Track start/stop
-        // intent and stop as soon as it has actually started.
+        // act as soon as it has actually started.
         rec._requestStop = () => {
           stopRequested = true;
-          if (started) {
-            try {
-              rec.stop();
-            } catch (_) {}
-          }
+          if (started) endNow();
         };
         rec.onstart = () => {
           started = true;
-          if (stopRequested) {
-            try {
-              rec.stop();
-            } catch (_) {}
-          }
+          if (stopRequested) endNow();
         };
         rec.onresult = (e) => {
           finalText = "";
@@ -1029,7 +1033,7 @@
 
   function onTalkUp(e) {
     if (e.code !== talk.key) return;
-    if (talk.state === "listening") voice.holdStop();
+    voice.holdStop(); // always release on key-up, regardless of state
   }
 
   function enableTalk(key) {
