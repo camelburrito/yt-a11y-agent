@@ -127,7 +127,12 @@ boundary text-only (provider passes a URL; the consumer does the vision).
   `onresult` fires** — do NOT wait for Chrome's natural `onend`, which leaves the session (and
   the mic indicator) open through the LLM + TTS reply, and the live mic can even hear our own
   TTS over the speakers and refuse to end. `listenOnce` also has a **10 s watchdog**
-  (`LISTEN_WATCHDOG_MS`) that force-`abort()`s if `onend`/`onresult` never fire,
+  (`LISTEN_WATCHDOG_MS`) that force-`abort()`s if `onend`/`onresult` never fire. **Page media
+  is paused for the mic window** (`duckMedia`/`restoreMedia` around `listenOnce`): opening Web
+  Speech while the `<video>` blasts audio is the macOS `coreaudiod`-contention trigger that
+  beachballed the whole machine (reported repeatedly; only this site, since Meet/FaceTime use
+  WebRTC not `webkitSpeechRecognition`). We pause only media we find playing and resume only
+  those — also on `releaseAll`, so a video is never stranded paused.
   and `releaseAll()` (mic abort + stop recording + cancel speech + bump `talk.gen` + end loop)
   fires on **`visibilitychange` (hidden) / `blur` / `pagehide` / `beforeunload`**, plus
   `ytAgent.release()`. Any new mic / `getUserMedia` path must be covered by these and always

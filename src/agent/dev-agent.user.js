@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.9.7
+// @version      0.9.8
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -1225,6 +1225,33 @@
     return /^(INPUT|TEXTAREA|SELECT)$/.test(tag) || (t && t.isContentEditable);
   }
 
+  // Pause the page's own media (the YouTube <video>, any <audio>) WHILE the mic is open.
+  // Opening the mic (Web Speech) at the same time loud audio is playing out the speakers is
+  // the classic macOS coreaudiod-contention trigger that can beachball the whole machine —
+  // and it also makes the mic hear the video/our TTS. We pause for the capture+reply window,
+  // then resume. Acting on the player's native pause is read-and-act safe (no DOM/a11y edits).
+  let duckedMedia = [];
+  function duckMedia() {
+    try {
+      document.querySelectorAll("video, audio").forEach((m) => {
+        if (!m.paused) {
+          m.pause();
+          duckedMedia.push(m);
+        }
+      });
+    } catch (_) {}
+  }
+  function restoreMedia() {
+    const list = duckedMedia;
+    duckedMedia = [];
+    list.forEach((m) => {
+      try {
+        const p = m.play();
+        if (p && p.catch) p.catch(() => {});
+      } catch (_) {}
+    });
+  }
+
   async function handleHeard(text, gen) {
     if (talk.gen !== gen) return; // superseded before we even processed it
     if (!text || !text.trim()) {
@@ -1268,20 +1295,27 @@
     if (talk.state === "listening") {
       talk.state = "idle";
       audio.error();
+      restoreMedia(); // we paused it when this listen started — bring it back
       return;
     }
     talk.state = "listening";
     audio.listening();
+    duckMedia(); // pause the video/audio before opening the mic — avoids coreaudiod contention
     let heard;
     try {
       heard = await voice.listenOnce(); // auto-ends on pause; browser frees the mic
     } catch (_) {
       audio.error();
       if (talk.gen === myGen) talk.state = "idle";
+      restoreMedia();
       return;
     }
-    if (talk.gen !== myGen) return; // a newer press superseded this listen
+    if (talk.gen !== myGen) {
+      restoreMedia();
+      return;
+    }
     await handleHeard(heard, myGen);
+    restoreMedia(); // resume playback after the reply (or after navigation, harmlessly)
   }
 
   function enableTalk(key) {
@@ -1322,6 +1356,9 @@
     } catch (_) {}
     try {
       voice.cancelSpeech();
+    } catch (_) {}
+    try {
+      restoreMedia(); // never strand a video we paused for the mic (only resumes ones we paused)
     } catch (_) {}
     talk.gen++; // invalidate any in-flight turn so its reply can't speak after release
     talk.state = "idle";
