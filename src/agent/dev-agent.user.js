@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.9.0
+// @version      0.9.1
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -1138,7 +1138,11 @@
     if (talk.state === "speaking") talk.state = "idle";
   }
 
-  function onTalkDown(e) {
+  // TAP-to-talk (not hold). Press the key once and speak; recognition is NON-continuous, so
+  // the browser ends it automatically when you pause and reliably releases the mic — there is
+  // no continuous session to get stuck holding the microphone. Press again while the agent is
+  // replying to interrupt (barge-in).
+  async function onTalkDown(e) {
     if (e.code !== talk.key || e.repeat || isTextTarget(e.target)) return;
     e.preventDefault();
     e.stopPropagation();
@@ -1146,31 +1150,28 @@
       voice.cancelSpeech(); // barge-in: interrupt the reply
       talk.state = "idle";
     }
-    if (talk.state !== "idle") return; // ignore presses while thinking/listening
+    if (talk.state !== "idle") return; // already listening/thinking
     talk.state = "listening";
     audio.listening();
-    talk.hold = voice.holdStart();
-    talk.hold.then(handleHeard).catch(() => {
+    let heard;
+    try {
+      heard = await voice.listenOnce(); // auto-ends on pause; browser frees the mic
+    } catch (_) {
       audio.error();
       talk.state = "idle";
-    });
-  }
-
-  function onTalkUp(e) {
-    if (e.code !== talk.key) return;
-    voice.holdStop(); // always release on key-up, regardless of state
+      return;
+    }
+    await handleHeard(heard);
   }
 
   function enableTalk(key) {
     if (key) talk.key = key;
     disableTalk();
     window.addEventListener("keydown", onTalkDown, true);
-    window.addEventListener("keyup", onTalkUp, true);
-    log(`hold-to-talk on: hold "${talk.key}" to speak, release to send, press again to interrupt.`);
+    log(`tap-to-talk on: press "${talk.key}" and speak; it sends when you pause. Press again to interrupt.`);
   }
   function disableTalk() {
     window.removeEventListener("keydown", onTalkDown, true);
-    window.removeEventListener("keyup", onTalkUp, true);
   }
 
   // Cross-navigation continuity: the provider's navigating tools stash a short message in

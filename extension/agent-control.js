@@ -123,7 +123,8 @@
       markGreeted();
       try {
         await a.speak(
-          "YouTube accessibility agent ready. Hold the backtick key and speak to ask me anything." + arrowHint
+          "YouTube accessibility agent ready. Press the backtick key and speak to ask me anything; I'll respond when you pause." +
+            arrowHint
         );
       } catch (_) {}
     }
