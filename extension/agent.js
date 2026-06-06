@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.9.11
+// @version      0.9.12
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -305,45 +305,36 @@
         rec.lang = "en-US";
         rec.interimResults = false;
         rec.maxAlternatives = 1;
-        let done = false;
-        // Hard safety: if the browser never fires onend/onresult (seen on some Chrome builds),
-        // force-abort so the microphone is released no matter what. This is the backstop
-        // against the "mic on hangs the machine / blocks video calls" failure.
-        let watchdog = setTimeout(() => {
+        let result = null;
+        let settled = false;
+        // Backstop: if onend/onresult never fire, force-abort so the mic is freed no matter what.
+        const watchdog = setTimeout(() => {
           try {
             rec.abort();
           } catch (_) {}
         }, LISTEN_WATCHDOG_MS);
-        const clearWatchdog = () => {
-          if (watchdog) {
-            clearTimeout(watchdog);
-            watchdog = null;
-          }
+        // Resolve/reject EXACTLY once, and only here — after onend, i.e. once the mic is released.
+        const settle = (err) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(watchdog);
+          activeRec = null;
+          if (err) reject(err);
+          else if (result && result.trim()) resolve(result);
+          else reject(new Error("no speech detected"));
         };
         rec.onresult = (e) => {
-          done = true;
-          clearWatchdog();
-          const transcript = e.results[0][0].transcript;
-          // Release the mic IMMEDIATELY. Do NOT wait for Chrome's natural onend — once we have
-          // the words, an open session keeps the mic indicator on through the LLM + TTS reply,
-          // and the still-live mic can even hear our own TTS through the speakers and refuse to
-          // end. abort() discards the rest and frees the device right now. done=true makes the
-          // ensuing onend/onerror no-ops.
-          activeRec = null;
+          result = e.results[0][0].transcript;
+          // We have the words — stop capturing. CRITICAL: do NOT resolve here. We resolve in
+          // onend, i.e. only once Chrome has actually RELEASED the microphone, so the caller's
+          // TTS reply never plays while the mic is still open. That mic-input + speaker-output
+          // overlap is the macOS coreaudiod collision that froze the whole machine.
           try {
-            rec.abort();
+            rec.stop();
           } catch (_) {}
-          resolve(transcript);
         };
-        rec.onerror = (e) => {
-          clearWatchdog();
-          reject(new Error("speech recognition error: " + e.error));
-        };
-        rec.onend = () => {
-          activeRec = null;
-          clearWatchdog();
-          if (!done) reject(new Error("no speech detected"));
-        };
+        rec.onerror = (e) => settle(new Error("speech recognition error: " + e.error));
+        rec.onend = () => settle(); // mic fully released at this point
         rec.start();
       });
     }
