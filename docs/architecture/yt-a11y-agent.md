@@ -176,20 +176,31 @@ flowchart TB
   we parse, execute against the captured tool, and feed back. Session rebuilds on toolset
   change.
 - **Voice** — Web Speech `speechSynthesis` / `SpeechRecognition`, out-of-band from tools.
-  `speak()` waits for `voiceschanged`, sets a voice, avoids the racing `cancel()`, and
-  `resume()`s the paused queue (Chrome TTS-silence workarounds).
+  `speak()` waits for `voiceschanged`, picks a **local** voice (`pickVoice()` prefers
+  `localService` voices; online "Google" voices fetch per-utterance audio that can stall ~25 s
+  and freeze the turn), avoids the racing `cancel()`, `resume()`s the paused queue (Chrome
+  TTS-silence workarounds), and runs a length-scaled **watchdog** that resolves the promise if
+  an utterance never ends so a turn never hangs. It's a single interrupt-driven channel —
+  `speak()` cancels the previous line instead of queueing.
 - **Conversation loop** — `start()` speaks the greeting, then loops listen → respond →
   listen so the user just talks back; ends on a stop word, two silent turns, or `stop()`.
   Turn-taking is **sequential** (listen only after speaking finishes, so the agent never
   captures its own TTS). Optional push-to-talk hotkey runs one turn (the keypress doubles as
   the user gesture some Chrome builds require to open the mic). This is how the user replies
   to the agent's questions hands-free — without touching the console.
-- **Hold-to-talk + barge-in** (`enableTalk`, primary input) — hold the talk key (default
-  `` ` ``) to speak, release to send, press again while replying to interrupt. **Earcons**
-  (`audio`, Web Audio tones) signal listening/captured/ready/error so the user is never left
-  in silence; the engine speaks **progress cues** (`TOOL_CUE`: "Searching.", "Opening.") for
-  slow tools. Hold-to-talk uses `voice.holdStart/holdStop` (continuous recognition stopped on
-  key release).
+- **Tap-to-talk + barge-in** (`enableTalk`, primary input) — tap the talk key (default `` ` ``)
+  once and speak; **non-continuous** recognition auto-ends on a pause, so the mic is never held
+  open. Every press is universal barge-in (cancels speech, aborts any in-flight listen, bumps
+  `talk.gen` so a stale LLM reply can't speak over the new turn). **Earcons** (`audio`, Web
+  Audio tones) signal listening/captured/ready/error so the user is never left in silence; the
+  engine speaks **progress cues** (`TOOL_CUE`: "Searching.", "Opening.") for slow tools.
+  `listenOnce` resolves on **`onend`** — i.e. only after Chrome has actually released the mic —
+  so TTS never starts while the mic is still open (mic-input + speaker-output simultaneously is
+  the macOS `coreaudiod` contention that froze the whole machine). It also **ducks page media**
+  (`duckMedia`/`restoreMedia`) for the mic window and force-`abort()`s on a 10 s watchdog. There
+  is **no continuous recognizer** — the removed `holdStart/holdStop` path was the root of the
+  machine-hang / blocked-mic incidents. `releaseAll()` drops the mic + cancels speech on
+  `visibilitychange`/`blur`/`pagehide`/`beforeunload`.
 - **Cross-navigation continuity** — navigating provider tools call `pend()` (sessionStorage);
   the consumer `consumePending()`s it on the next page and speaks it. This is what makes
   "search for X" / "open Y" continue speaking after the full-page load that resets the agent.

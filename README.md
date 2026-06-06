@@ -77,8 +77,10 @@ The project runs two scripts on YouTube: the **provider** (registers the tools) 
 **Option 0 — Chrome extension (recommended).** Auto-injects on every YouTube page (no
 re-pasting) and is **hands-free**: it speaks when you first interact, welcomes you by name
 when signed in, and lets you **browse the feed with the arrow keys** (Down/Up to move + hear
-each video, Enter to play). **Hold the `` ` `` (backtick) key to talk** — release to send,
-press again to interrupt; earcons + spoken cues tell you what's happening. `Alt+Shift+A`
+each video, Enter to play, Escape to exit — an arrow steps you back in). **Tap the `` ` ``
+(backtick) key once and speak** — it sends automatically when you pause (the mic is never
+held open), and tapping again interrupts; earcons + spoken cues tell you what's happening.
+`Alt+Shift+A`
 gives a full overview (a popup is the visual fallback). Open `chrome://extensions` → enable **Developer mode** → **Load
 unpacked** → select the **`extension/`** folder. Full steps in
 [`extension/README.md`](extension/README.md). The two manual options below are for quick
