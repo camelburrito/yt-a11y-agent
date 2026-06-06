@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.9.5
+// @version      0.9.6
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -815,7 +815,19 @@
     if (/^(go back|previous page)$/.test(t)) { await voice.speak("Going back."); history.back(); return ""; }
     {
       const m = t.match(/^(?:search(?: for)?|find|look up|search up) (.+)$/);
-      if (m) { await voice.speak(`Searching for ${m[1]}.`); await callText("run_search", { query: m[1] }); return ""; }
+      if (m) {
+        // Navigate to results DIRECTLY — works from ANY surface. (run_search is only
+        // registered on /results, so calling it from home/watch was a no-op: the original
+        // bug where "search for X" did nothing.) Stash a continuation for the results page.
+        const q = m[1].trim();
+        const url = "https://www.youtube.com/results?search_query=" + encodeURIComponent(q);
+        try {
+          sessionStorage.setItem("ytA11yPending", `Here are the results for ${q}.`);
+        } catch (_) {}
+        await voice.speak(`Searching for ${q}.`);
+        location.href = url;
+        return "";
+      }
     }
 
     // Open by number (home / search / up-next)
