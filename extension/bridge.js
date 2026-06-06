@@ -14,10 +14,23 @@ chrome.runtime.onMessage.addListener((msg) => {
   }
 });
 
-// Page -> extension (relay status to any listening popup)
-window.addEventListener("message", (e) => {
+// Page -> extension (relay status to any listening popup).
+// When the extension is reloaded while this tab stays open, our chrome.runtime context is
+// invalidated: chrome.runtime.id becomes undefined and sendMessage THROWS synchronously
+// ("Extension context invalidated.") — a .catch() can't see that. Guard on the id, wrap the
+// call, and once the context is gone tear down this listener so it can't keep throwing.
+const onStatus = (e) => {
   const d = e.data;
-  if (e.source === window && d && d.source === STATUS) {
-    chrome.runtime.sendMessage({ source: STATUS, status: d.status, text: d.text }).catch(() => {});
+  if (e.source !== window || !d || d.source !== STATUS) return;
+  if (!chrome.runtime || !chrome.runtime.id) {
+    window.removeEventListener("message", onStatus);
+    return;
   }
-});
+  try {
+    chrome.runtime.sendMessage({ source: STATUS, status: d.status, text: d.text }).catch(() => {});
+  } catch (_) {
+    // Context invalidated mid-flight — stop relaying; this tab needs a refresh.
+    window.removeEventListener("message", onStatus);
+  }
+};
+window.addEventListener("message", onStatus);

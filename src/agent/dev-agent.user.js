@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.9.1
+// @version      0.9.2
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -132,6 +132,16 @@
       isReady: () => wrapped,
       list: () => [...tools.values()],
       signature: () => [...tools.keys()].sort().join(","),
+      has: (name) => tools.has(name),
+      // Invoke a captured provider tool by name and return its raw WebMCP envelope
+      // ({ content: [{ type:"text", text }] }) — callers read res.content[0].text. The
+      // provider's ModelContext has no callTool, so we drive the captured tool directly.
+      // Throws if the tool isn't registered on the current surface, so callers should guard.
+      async call(name, args) {
+        const t = tools.get(name);
+        if (!t) throw new Error(`tool not registered on this surface: ${name}`);
+        return await t.execute(args || {});
+      },
       // Wrap captured WebMCP tools into Prompt-API tools. The shapes nearly match; we only
       // flatten the WebMCP { content:[{text}] } envelope down to a string for the model.
       asPromptApiTools: () =>
@@ -762,7 +772,7 @@
     return null;
   }
   function helpText() {
-    if (location.pathname.startsWith("/watch"))
+    if (location.pathname.startsWith("/watch") || location.pathname.startsWith("/shorts"))
       return "On this video you can say: play, pause, skip forward, skip back, captions on, captions off, next video, or go home. Say repeat to hear something again, or slower and faster to change my speed.";
     return "You can say: list videos, open and a number, next, previous, search for something, load more, or go home. Say a category name like Music to filter. Say repeat, slower, or faster anytime.";
   }
@@ -785,15 +795,20 @@
     return "";
   }
   const callText = async (tool, args) => {
-    const r = await consumer.call(tool, args || {});
-    return r && r.content && r.content[0] ? r.content[0].text : "";
+    if (!consumer.has(tool)) return `That isn't available on this page.`;
+    try {
+      const r = await consumer.call(tool, args || {});
+      return r && r.content && r.content[0] ? r.content[0].text : "";
+    } catch (_) {
+      return `Sorry, I couldn't do that just now.`;
+    }
   };
 
   async function handleCommand(rawText) {
     const t = (rawText || "").trim().toLowerCase().replace(/[.!?]+$/, "");
     if (!t || t.startsWith("[")) return null; // ignore the bracketed greeting trigger
     const path = location.pathname;
-    const onWatch = path.startsWith("/watch");
+    const onWatch = path.startsWith("/watch") || path.startsWith("/shorts");
     const onList = path === "/" || path.startsWith("/feed") || path.startsWith("/results");
 
     // Ergonomics (any surface)
@@ -1038,7 +1053,20 @@
     voice.speak(bits.join(", ") + ". Press Enter to play.");
   }
 
+  // Arrow browsing is only meaningful on the list surfaces (home / search). On /watch and
+  // /shorts the arrow keys belong to the player, and replaying a stale home feed here is the
+  // "it thinks I'm on home" bug — so disarm cleanly instead.
+  function onBrowsableSurface() {
+    const p = location.pathname;
+    return p === "/" || p.startsWith("/feed") || p.startsWith("/results");
+  }
+
   async function browseMove(delta) {
+    if (!onBrowsableSurface()) {
+      stopBrowse();
+      voice.speak("Arrow browsing isn't available on this page. The arrow keys control the video here.");
+      return;
+    }
     if (!browseState.items.length) browseState.items = await feed(20);
     if (!browseState.items.length) {
       voice.speak("There are no videos to browse here.");
@@ -1086,7 +1114,13 @@
   }
 
   async function startBrowse(announce = true) {
-    if (browseState.armed) return browseState.items.length;
+    // Re-arming on a new surface (e.g. home -> search via SPA nav) must refresh the list —
+    // otherwise the stale previous-surface feed lingers. Refresh items, keep the listener.
+    if (browseState.armed) {
+      browseState.index = -1;
+      browseState.items = onBrowsableSurface() ? await feed(20) : [];
+      return browseState.items.length;
+    }
     browseState.armed = true;
     browseState.index = -1;
     browseState.items = await feed(20);
@@ -1102,6 +1136,8 @@
 
   function stopBrowse() {
     browseState.armed = false;
+    browseState.index = -1;
+    browseState.items = []; // drop the surface's list so we never replay it after navigating
     window.removeEventListener("keydown", onBrowseKey, true);
   }
 

@@ -256,7 +256,10 @@
   function detectSurface(pathname) {
     if (pathname === "/" || pathname.startsWith("/feed")) return "home";
     if (pathname.startsWith("/results")) return "search";
-    if (pathname.startsWith("/watch")) return "watch";
+    // Shorts is a video surface too — it has a <video> element, so the watch tools
+    // (play/pause/seek via the generic `video` selector) work. The sidebar/transcript
+    // tools simply no-op there, which is fine.
+    if (pathname.startsWith("/watch") || pathname.startsWith("/shorts")) return "watch";
     if (
       pathname.startsWith("/@") ||
       pathname.startsWith("/channel/") ||

@@ -103,8 +103,9 @@ flowchart TB
 - **`SEL`** — every selector, centralized. A shared `SEL.card` (title/channel/meta/
   duration) is reused by home, search, and up-next via `readVideoCards()`. When a list
   goes blank, `SEL` is the first place to look (YouTube renames classes often).
-- **`detectSurface(pathname)`** — `/`|`/feed*`→home, `/results`→search, `/watch`→watch,
-  `/@`·`/channel/`·`/c/`→channel, else other.
+- **`detectSurface(pathname)`** — `/`|`/feed*`→home, `/results`→search, `/watch`|`/shorts`→watch,
+  `/@`·`/channel/`·`/c/`→channel, else other. (Shorts maps to watch: it has a `<video>`, so
+  `playback_control` works via the generic `video` selector; sidebar/transcript tools no-op.)
 - **Route-scoped registration** — see next diagram.
 
 ### Route-scoped registration (AbortController)
@@ -139,7 +140,7 @@ bookkeeping. Tools are re-created fresh each route via the `*Tools()` factories.
 | every route | `where_am_i`, `get_account` |
 | home (`/`, `/feed*`) | `list_home_feed`, `describe_home`, `open_video`, `load_more_home`, `list_categories`, `select_category` |
 | search (`/results`) | `run_search`, `list_results`, `refine_search`, `open_result` |
-| watch (`/watch`) | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` |
+| watch (`/watch` or `/shorts`) | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` |
 | watch-next (`/watch`) | `list_up_next`, `play_next`, `set_autoplay` |
 | comments (`/watch`) | `get_comments`, `summarize_comments`, `get_pinned_comment` |
 | pip (`/watch`) | `enter_pip`, `exit_pip` |

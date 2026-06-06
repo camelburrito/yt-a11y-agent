@@ -61,7 +61,7 @@ user's existing assistive tech reports stays authoritative.
 |---------|------------------------------|-------|
 | home    | `/` or `/feed*`              | `list_home_feed`, `describe_home`, `open_video`, `load_more_home`, `list_categories`, `select_category` ✅ verified live (chips: `ytd-feed-filter-chip-bar-renderer yt-chip-cloud-chip-renderer`) |
 | search  | `/results`                   | `run_search`, `list_results`, `refine_search`, `open_result` ✅ verified live |
-| watch   | `/watch`                     | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` ✅ verified live (transcript-open best-effort) |
+| watch   | `/watch` **or `/shorts`**    | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` ✅ verified live (transcript-open best-effort). Shorts resolves here so play/pause/seek (generic `video` selector) work; sidebar/transcript tools no-op on Shorts. |
 | watch-next | `/watch` (same surface)   | `list_up_next`, `play_next`, `set_autoplay` ✅ verified live |
 | comments | `/watch` (same surface)    | `get_comments`, `summarize_comments`, `get_pinned_comment` ✅ verified live |
 | pip     | `/watch` (same surface)      | `enter_pip`, `exit_pip` 🟡 button+fallback present; gesture path needs flagged run |
@@ -77,8 +77,17 @@ warmly *without* a name ("Welcome back!"); use the name only if present.
 **Arrow-key browsing** (agent-side, `ytAgent.startBrowse`): on the home feed and search
 results the extension arms arrow keys so the user steps through videos hearing each
 described (Down/Up move, Enter plays, Escape exits). It captures arrows only while armed and
-not in a text field. Off on `/watch` (arrows seek the player). Voice/loop and tools are
-unchanged; this is guided navigation layered on top.
+not in a text field. Off on `/watch` and `/shorts` (arrows seek the player) — `browseMove`
+self-disarms if invoked off a list surface, and `stopBrowse` clears the cached list so a
+stale feed is never replayed after navigating. Voice/loop and tools are unchanged; this is
+guided navigation layered on top.
+
+**Consumer↔provider invocation.** The provider's `ModelContext` exposes only `registerTool`
+(no `callTool`), so the agent wraps `registerTool` to capture every tool into a live registry
+and invokes them via `consumer.call(name, args)` / `consumer.has(name)` — returning the raw
+WebMCP `{content:[{text}]}` envelope. The deterministic command layer and arrow-browse both
+go through this; if `consumer.call` is missing, `feed()` silently returns `[]` ("no videos")
+and `playback_control` no-ops — keep it defined.
 
 Video lists and `get_video_info` include a `thumb` URL (`i.ytimg.com/vi/<id>/hqdefault.jpg`).
 The agent's **consumer-local** `describe_image` tool (not a provider tool) fetches it and

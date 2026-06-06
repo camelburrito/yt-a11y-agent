@@ -58,7 +58,8 @@ control (offer, don't autoplay).**
 | Provider backbone (route-scoped registration via AbortController) | ✅ done, pushed |
 | Home journey tools (`list_home_feed`, `describe_home`, `open_video`, `load_more_home`) | ✅ verified live |
 | Cross-cutting `where_am_i` | ✅ done |
-| Consumer agent (dev harness, on-device Gemini Nano) | ✅ `src/agent/dev-agent.user.js` v0.3.0 — **manual JSON tool loop**; verified end-to-end (tool call → page navigation observed) |
+| Consumer agent (dev harness, on-device Gemini Nano) | ✅ `src/agent/dev-agent.user.js` **v0.9.2** — **manual JSON tool loop**; verified end-to-end (tool call → page navigation observed) |
+| v0.9.2 bug fixes | ✅ (1) **`consumer.call` was missing** — every `feed()`/`callText` threw and was swallowed, so home arrows said "no videos" and play/pause silently failed; added `consumer.call`/`has`. (2) **`/shorts` → "other"** (no playback tools); now resolves to the **watch** surface. (3) **Stale arrow-browse feed** replayed the home list on `/watch` (looked like "thinks I'm on home"); `browseMove` now self-disarms off list surfaces and `stopBrowse`/re-arm clear the cached list. Needs interactive re-verify. |
 | Voice layer (Web Speech STT/TTS) | ✅ in the harness — TTS silence bugs fixed (voices/cancel/resume), confirmed speaking |
 | Proactive `activate()` greeting | ✅ verified speaking interactively |
 | Hands-free conversation loop | ✅ `ytAgent.start()`/`stop()` + push-to-talk (v0.4.0) — greet→listen→respond→listen; stop word / silence / `stop()` ends it |
@@ -150,7 +151,7 @@ control (offer, don't autoplay).**
 |---------|--------|-------|--------|
 | home | `/` or `/feed*` | `list_home_feed`, `describe_home`, `open_video`, `load_more_home`, `list_categories`, `select_category` | ✅ verified live (chips confirmed: 12 categories) |
 | search | `/results` | `run_search`, `list_results`, `refine_search`, `open_result` | ✅ verified live |
-| watch | `/watch` | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` | ✅ verified live (transcript-open best-effort) |
+| watch | `/watch` or `/shorts` | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` | ✅ verified live (transcript-open best-effort). Shorts resolves to this surface (generic `video` selector → play/pause/seek work; sidebar/transcript no-op). |
 | watch-next | `/watch` | `list_up_next`, `play_next`, `set_autoplay` | ✅ verified live |
 | comments | `/watch` | `get_comments`, `summarize_comments`, `get_pinned_comment` | ✅ verified live |
 | pip | `/watch` | `enter_pip`, `exit_pip` | 🟡 button+fallback present; gesture path (q. c) needs flagged run |
