@@ -20,6 +20,8 @@
   "use strict";
 
   const LOG = "[yt-a11y]";
+  const PROVIDER_VERSION = "0.9.4"; // bump on provider changes; printed at boot so a stale
+  // content script (old build still injected in an open tab) is obvious in the console.
 
   // ---------------------------------------------------------------------------
   // WebMCP API resolution.
@@ -1007,5 +1009,5 @@
     setTimeout(() => bootstrap(attempt + 1), 500);
   })(0);
 
-  console.log(`${LOG} userscript loaded (MAIN world). Awaiting WebMCP API…`);
+  console.log(`${LOG} provider v${PROVIDER_VERSION} loaded (MAIN world). Awaiting WebMCP API…`);
 })();
