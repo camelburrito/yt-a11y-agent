@@ -195,12 +195,29 @@ flowchart TB
   Audio tones) signal listening/captured/ready/error so the user is never left in silence; the
   engine speaks **progress cues** (`TOOL_CUE`: "Searching.", "Opening.") for slow tools.
   `listenOnce` resolves on **`onend`** — i.e. only after Chrome has actually released the mic —
-  so TTS never starts while the mic is still open (mic-input + speaker-output simultaneously is
-  the macOS `coreaudiod` contention that froze the whole machine). It also **ducks page media**
-  (`duckMedia`/`restoreMedia`) for the mic window and force-`abort()`s on a 10 s watchdog. There
+  so TTS never starts while the mic is still open. It force-`abort()`s on a 10 s watchdog. There
   is **no continuous recognizer** — the removed `holdStart/holdStop` path was the root of the
-  machine-hang / blocked-mic incidents. `releaseAll()` drops the mic + cancels speech on
-  `visibilitychange`/`blur`/`pagehide`/`beforeunload`.
+  machine-hang / blocked-mic incidents. `releaseAll()` drops the mic + cancels speech +
+  `audio.suspend()`s the earcon context on `visibilitychange`/`blur`/`pagehide`/`beforeunload`.
+- **The freeze gate — `beginListen()`** (macOS `coreaudiod` whole-machine-freeze fix; full
+  diagnosis in [`docs/research/voice-audio-anti-freeze.md`](../research/voice-audio-anti-freeze.md)).
+  Opening a mic capture **while audio is rendering on the output device** forces macOS CoreAudio
+  to reconfigure the output-device session, deadlocking the single system-wide `coreaudiod`
+  daemon → whole-machine beachball. `getUserMedia`/WebRTC (Meet/FaceTime) coexist with playing
+  audio; bare `webkitSpeechRecognition` (processed / Voice-Processing-I/O capture) does not. So
+  **every capture path goes through `captureUtterance` → `await beginListen()` first**: cancel
+  TTS → **await each page `<video>`/`<audio>`'s real `pause` event** (`duckMedia` is awaitable;
+  `m.pause()` returns before the output stream tears down) → **`audio.suspend()`** the earcon
+  `AudioContext` → wait for `speechSynthesis` silence → `OUTPUT_SETTLE_MS` settle → log
+  `beginListen: gate open — synth.speaking=… unpausedMedia=…` (regression canary). `restoreMedia`
+  resumes after every window.
+- **Capture-path cures** — three options layered on the gate: **`webspeech`** (default; cloud Web
+  Speech, gate-guarded), **`nano`** (`setListenMode("nano")` — plain `getUserMedia` → on-device
+  Gemini Nano audio ASR; the **guaranteed freeze-proof** path: no `webkitSpeechRecognition`/VPIO,
+  but slower + needs the multimodal flag), and an opt-in **constrained track** (`setConstrainedSTT`)
+  feeding Web Speech an **echo-cancellation-OFF `getUserMedia` track** via `rec.start(track)` to
+  skip VPIO (off by default — `start(track)` is flag-gated/undetectable). All `getUserMedia` paths
+  set `echoCancellation/noiseSuppression/autoGainControl:false`.
 - **Cross-navigation continuity** — navigating provider tools call `pend()` (sessionStorage);
   the consumer `consumePending()`s it on the next page and speaks it. This is what makes
   "search for X" / "open Y" continue speaking after the full-page load that resets the agent.

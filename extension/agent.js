@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.9.13
+// @version      0.9.14
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -297,9 +297,32 @@
 
     let activeRec = null;
     const LISTEN_WATCHDOG_MS = 10000; // a single listen can NEVER hold the mic longer than this
-    function listenOnce() {
+    // When true, capture through a constrained getUserMedia track (echo-cancellation OFF) handed
+    // to rec.start(track). EC-off capture does NOT engage macOS Voice Processing I/O, which is
+    // what hooks/reconfigures the OUTPUT device and triggers the coreaudiod freeze (see
+    // docs/research/voice-audio-anti-freeze.md). OFF by default: SpeechRecognition.start(track)
+    // is flag-gated (~M135 dev-trial) and not reliably feature-detectable, so if it were silently
+    // ignored we'd open a SECOND capture (worse). Opt in via ytAgent.setConstrainedSTT(true) to
+    // A/B it against the instrumentation; the guaranteed freeze-proof path is nano listen mode.
+    let useConstrained = false;
+    async function listenOnce() {
+      // Acquire the constrained track BEFORE the Promise so getUserMedia rejection is awaitable.
+      let micTrack = null;
+      if (useConstrained && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        try {
+          const s = await navigator.mediaDevices.getUserMedia({
+            audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 },
+          });
+          micTrack = s.getAudioTracks()[0] || null;
+        } catch (_) {
+          micTrack = null; // fall back to the bare path (still behind the quiesce gate)
+        }
+      }
       return new Promise((resolve, reject) => {
-        if (!SR) return reject(new Error("SpeechRecognition not supported in this browser."));
+        if (!SR) {
+          if (micTrack) try { micTrack.stop(); } catch (_) {}
+          return reject(new Error("SpeechRecognition not supported in this browser."));
+        }
         const rec = new SR();
         activeRec = rec;
         rec.lang = "en-US";
@@ -319,6 +342,10 @@
           settled = true;
           clearTimeout(watchdog);
           activeRec = null;
+          if (micTrack) {
+            try { micTrack.stop(); } catch (_) {} // always free our own getUserMedia track
+            micTrack = null;
+          }
           if (err) reject(err);
           else if (result && result.trim()) resolve(result);
           else reject(new Error("no speech detected"));
@@ -335,7 +362,28 @@
         };
         rec.onerror = (e) => settle(new Error("speech recognition error: " + e.error));
         rec.onend = () => settle(); // mic fully released at this point
-        rec.start();
+        try {
+          if (micTrack) {
+            rec.start(micTrack); // EC-off track — skips Voice Processing I/O (no output-device reconfigure)
+            log("listen: constrained EC-off track");
+          } else {
+            rec.start();
+          }
+        } catch (e) {
+          // rec.start(track) unsupported on this build → drop the track and use the bare path.
+          if (micTrack) {
+            try { micTrack.stop(); } catch (_) {}
+            micTrack = null;
+            try {
+              rec.start();
+              log("listen: bare (start(track) unsupported)");
+            } catch (e2) {
+              return settle(e2);
+            }
+          } else {
+            return settle(e);
+          }
+        }
       });
     }
     // Abort an in-progress listen (used by stop()).
@@ -378,6 +426,11 @@
       listVoices,
       setRate,
       setSpeechVolume,
+      setConstrained: (b) => {
+        useConstrained = !!b;
+        return useConstrained;
+      },
+      isConstrained: () => useConstrained,
       supported: { tts: !!synth, stt: !!SR },
     };
   })();
@@ -411,6 +464,14 @@
       captured: () => tone(900, 0.08, "sine", 0.05), // got your voice
       ready: () => tone(520, 0.1, "sine", 0.04), // done / your turn
       error: () => tone(200, 0.2, "triangle", 0.05), // didn't catch it
+      // Suspend the earcon AudioContext so it holds NO live CoreAudio render thread while the
+      // mic is open — an always-on output context is one of the things contending with capture
+      // at the freeze instant. tone() resumes it automatically the next time an earcon plays.
+      suspend: () => {
+        try {
+          if (ctx && ctx.state === "running") ctx.suspend();
+        } catch (_) {}
+      },
       setVolume: (v) => {
         vol = Math.max(0, Math.min(2, Number(v)));
         return vol;
@@ -432,7 +493,12 @@
     // Record one utterance: wait for speech, stop after `silenceMs` of trailing quiet, or
     // `maxMs` hard cap. Returns a Blob, or null if nobody spoke. Energy-based VAD.
     async recordUtterance({ maxMs = 12000, silenceMs = 1200, startTimeoutMs = 6000 } = {}) {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // echoCancellation OFF: EC engages macOS Voice Processing I/O, which hooks/reconfigures the
+      // OUTPUT device — the coreaudiod freeze trigger. Plain getUserMedia (the WebRTC path that
+      // Meet/FaceTime use and that never freezes) records fine without it.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 },
+      });
       this._stream = stream;
       const rec = new MediaRecorder(stream);
       this._rec = rec;
@@ -945,6 +1011,7 @@
   // Capture one spoken utterance using the selected listen mode. Nano ASR is experimental
   // (slow / can jank the page); on any non-silence error it falls back to Web Speech.
   async function captureUtterance() {
+    await beginListen(); // quiesce ALL output before any mic path opens (the freeze gate)
     if (state.listenMode === "nano") {
       try {
         return await nanoAsr.listenOnce();
@@ -959,11 +1026,15 @@
   }
 
   async function converse() {
-    const heard = await captureUtterance();
-    log(`heard: ${heard}`);
-    const reply = await ask(heard);
-    await voice.speak(reply);
-    return { heard, reply };
+    try {
+      const heard = await captureUtterance();
+      log(`heard: ${heard}`);
+      const reply = await ask(heard);
+      await voice.speak(reply);
+      return { heard, reply };
+    } finally {
+      restoreMedia(); // captureUtterance ducked the page media via beginListen — resume it
+    }
   }
 
   // Continuous hands-free conversation: greet, then listen → respond → listen … until the
@@ -1003,6 +1074,7 @@
       if (!state.running) break;
       await voice.speak(reply);
     }
+    restoreMedia(); // beginListen ducked the page media each turn — resume on the way out
     state.running = false;
     return "conversation ended";
   }
@@ -1272,15 +1344,33 @@
   // and it also makes the mic hear the video/our TTS. We pause for the capture+reply window,
   // then resume. Acting on the player's native pause is read-and-act safe (no DOM/a11y edits).
   let duckedMedia = [];
+  // Pause page media and AWAIT it actually pausing. m.pause() returns immediately while the
+  // underlying CoreAudio output stream tears down asynchronously; opening the mic before that
+  // teardown is the non-atomic race that left audio still rendering at capture-open. We resolve
+  // on each element's "pause" event (or a 300ms cap so a missing event can't hang the turn).
   function duckMedia() {
+    const waits = [];
     try {
       document.querySelectorAll("video, audio").forEach((m) => {
         if (!m.paused) {
+          const done = new Promise((res) => {
+            let t = setTimeout(res, 300);
+            m.addEventListener(
+              "pause",
+              () => {
+                clearTimeout(t);
+                res();
+              },
+              { once: true }
+            );
+          });
           m.pause();
           duckedMedia.push(m);
+          waits.push(done);
         }
       });
     } catch (_) {}
+    return Promise.all(waits);
   }
   function restoreMedia() {
     const list = duckedMedia;
@@ -1291,6 +1381,37 @@
         if (p && p.catch) p.catch(() => {});
       } catch (_) {}
     });
+  }
+
+  // ===========================================================================
+  // THE FREEZE GATE. Before ANY mic opens, guarantee NOTHING is rendering on the output device:
+  // macOS opening a capture against live output forces CoreAudio to reconfigure the output
+  // device's session, which deadlocks the single system-wide coreaudiod daemon → whole-machine
+  // beachball (full diagnosis: docs/research/voice-audio-anti-freeze.md). Every capture path —
+  // tap-to-talk, converse()/start(), nano — MUST await this first. It is the universal floor;
+  // the constrained-track / nano paths are the deeper cures layered on top.
+  // ===========================================================================
+  const OUTPUT_SETTLE_MS = 200; // CoreAudio output-stream teardown headroom before capture opens
+  const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+  async function waitSynthQuiet(maxMs = 600) {
+    if (typeof speechSynthesis === "undefined") return;
+    const t0 = nowms();
+    while (speechSynthesis.speaking && nowms() - t0 < maxMs) await delay(30);
+  }
+  async function beginListen() {
+    voice.cancelSpeech(); // 1. stop our own TTS output
+    await duckMedia(); // 2. pause page <video>/<audio> and AWAIT the real pause event
+    audio.suspend(); // 3. drop the earcon AudioContext's render thread
+    await waitSynthQuiet(); // 4. belt-and-suspenders: confirm TTS is actually silent
+    await delay(OUTPUT_SETTLE_MS); // 5. let CoreAudio tear the output stream down before capture
+    // Instrumentation: operationalize "nothing is rendering at mic-open" so a regression is
+    // visible in the logs the moment it reappears (see verification plan in the research doc).
+    let unpaused = 0;
+    try {
+      unpaused = [...document.querySelectorAll("video, audio")].filter((m) => !m.paused).length;
+    } catch (_) {}
+    const speaking = typeof speechSynthesis !== "undefined" && speechSynthesis.speaking;
+    log(`beginListen: gate open — synth.speaking=${speaking} unpausedMedia=${unpaused} constrainedSTT=${voice.isConstrained()}`);
   }
 
   async function handleHeard(text, gen) {
@@ -1336,6 +1457,7 @@
     const myGen = talk.gen;
     voice.cancelSpeech();
     voice.abortListen();
+    nanoAsr.abort(); // barge-in must also stop a nano recording, not just Web Speech
     // If we were already listening, this press cancels it (toggle off) without opening a new mic.
     if (talk.state === "listening") {
       talk.state = "idle";
@@ -1344,11 +1466,13 @@
       return;
     }
     talk.state = "listening";
-    audio.listening();
-    duckMedia(); // pause the video/audio before opening the mic — avoids coreaudiod contention
+    audio.listening(); // play the "listening" earcon BEFORE the gate (beginListen suspends the ctx)
     let heard;
     try {
-      heard = await voice.listenOnce(); // auto-ends on pause; browser frees the mic
+      // captureUtterance runs the freeze gate (beginListen: cancel TTS, await media pause, suspend
+      // earcons, settle) THEN opens the mic via the selected listen mode — so the tap path gets the
+      // same quiescence + listenMode (webspeech/nano) as converse()/start().
+      heard = await captureUtterance();
     } catch (_) {
       audio.error();
       if (talk.gen === myGen) talk.state = "idle";
@@ -1405,6 +1529,9 @@
     try {
       restoreMedia(); // never strand a video we paused for the mic (only resumes ones we paused)
     } catch (_) {}
+    try {
+      audio.suspend(); // drop the earcon AudioContext's render thread on release
+    } catch (_) {}
     talk.gen++; // invalidate any in-flight turn so its reply can't speak after release
     talk.state = "idle";
     state.running = false;
@@ -1457,17 +1584,32 @@
     setListenMode(mode) {
       state.listenMode = mode === "nano" ? "nano" : "webspeech";
       if (state.listenMode === "nano")
-        log("listen mode: nano (experimental — slower, may briefly freeze the page per turn)");
-      else log("listen mode: webspeech");
+        log(
+          "listen mode: nano — on-device audio ASR (slower per turn). This is the FREEZE-PROOF " +
+            "capture path: plain getUserMedia, no webkitSpeechRecognition, so no macOS Voice " +
+            "Processing I/O / coreaudiod contention. Needs chrome://flags/#prompt-api-for-gemini-nano-multimodal-input."
+        );
+      else log("listen mode: webspeech (cloud Web Speech; freeze-guarded by the output-quiescence gate)");
       return state.listenMode;
     },
+    // A/B the EC-off constrained-track capture for Web Speech (see docs/research/voice-audio-anti-freeze.md):
+    // ON skips macOS Voice Processing I/O when SpeechRecognition.start(track) is honored, but that API
+    // is flag-gated/undetectable so it's OFF by default. For a guaranteed freeze-proof path use nano mode.
+    setConstrainedSTT: (b) => voice.setConstrained(b),
     useEngine(fn) {
       state.engine = typeof fn === "function" ? fn : geminiEngine;
       destroySession();
       log("engine:", state.engine === geminiEngine ? "Gemini Nano (default)" : "custom");
     },
     speak: voice.speak,
-    listen: captureUtterance, // respects listenMode
+    // respects listenMode; runs the freeze gate, and restores ducked media after a standalone listen.
+    listen: async () => {
+      try {
+        return await captureUtterance();
+      } finally {
+        restoreMedia();
+      }
+    },
     describeImage, // (url, question?) -> spoken-friendly description via Nano vision
     // Describe the thumbnail of item `index` on the current surface (home/search/up-next).
     async describeThumbnail(index = 0, question) {

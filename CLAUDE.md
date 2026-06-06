@@ -132,21 +132,43 @@ boundary text-only (provider passes a URL; the consumer does the vision).
 - **⚠️ NEVER hold the mic when the user isn't actively talking.** The extension auto-injects on
   every YouTube tab and persists; a stuck-open mic blocks other apps (video calls) and a
   runaway recognizer can hang the machine. Safeguards (do not regress): tap-to-talk uses
-  **non-continuous** recognition, and **`listenOnce` calls `rec.abort()` the instant
-  `onresult` fires** — do NOT wait for Chrome's natural `onend`, which leaves the session (and
-  the mic indicator) open through the LLM + TTS reply, and the live mic can even hear our own
-  TTS over the speakers and refuse to end. `listenOnce` also has a **10 s watchdog**
-  (`LISTEN_WATCHDOG_MS`) that force-`abort()`s if `onend`/`onresult` never fire. **Page media
-  is paused for the mic window** (`duckMedia`/`restoreMedia` around `listenOnce`): opening Web
-  Speech while the `<video>` blasts audio is the macOS `coreaudiod`-contention trigger that
-  beachballed the whole machine (reported repeatedly; only this site, since Meet/FaceTime use
-  WebRTC not `webkitSpeechRecognition`). We pause only media we find playing and resume only
-  those — also on `releaseAll`, so a video is never stranded paused.
-  and `releaseAll()` (mic abort + stop recording + cancel speech + bump `talk.gen` + end loop)
-  fires on **`visibilitychange` (hidden) / `blur` / `pagehide` / `beforeunload`**, plus
-  `ytAgent.release()`. Any new mic / `getUserMedia` path must be covered by these and always
-  stop its stream in a `finally`. **Never reintroduce a continuous recognizer** — that was the
-  root of the machine-hang / blocked-video-call incidents.
+  **non-continuous** recognition; **`listenOnce` captures the transcript on `onresult`, calls
+  `rec.stop()`, and resolves only on `onend`** — i.e. once Chrome has actually *released* the
+  mic — so the caller's TTS reply never starts while the mic is still open. (Do NOT "resolve on
+  `onresult`" / start TTS early: mic-input + speaker-output simultaneously is the macOS
+  contention that freezes the machine.) `listenOnce` also has a **10 s watchdog**
+  (`LISTEN_WATCHDOG_MS`) that force-`abort()`s if `onend`/`onresult` never fire.
+- **⚠️ THE FREEZE GATE — `beginListen()` (the macOS coreaudiod whole-machine freeze fix).** Root
+  cause (full diagnosis: `docs/research/voice-audio-anti-freeze.md`): opening a mic capture while
+  audio is *rendering on the output device* forces macOS CoreAudio to reconfigure the output
+  device session, which deadlocks the single system-wide `coreaudiod` daemon → beachball. Bare
+  `webkitSpeechRecognition` uses the processed (echo-cancellation / Voice-Processing-I/O) capture
+  path, which hooks the output device; `getUserMedia`/WebRTC (Meet, FaceTime) coexist fine, which
+  is why only this site froze. **Every capture path (`onTalkDown`, `converse()`/`start()`, nano)
+  goes through `captureUtterance` → `await beginListen()` FIRST.** `beginListen` (1) cancels our
+  TTS, (2) **awaits the real `pause` event** of every page `<video>`/`<audio>` (`duckMedia` is
+  awaitable — `m.pause()` returns before the output stream tears down, so we wait for it), (3)
+  **`audio.suspend()`s the earcon `AudioContext`** (an always-on Web Audio render thread), (4)
+  waits for `speechSynthesis` to go silent, (5) waits `OUTPUT_SETTLE_MS` for CoreAudio teardown,
+  then logs `beginListen: gate open — synth.speaking=… unpausedMedia=…` (a regression shows here).
+  Do NOT open a mic outside this gate, and do NOT duck without an awaited pause.
+- **Capture path / the deeper cures.** The mic can use one of: **webspeech** (default — cloud Web
+  Speech, freeze-guarded by the gate); **nano** (`setListenMode("nano")` — on-device audio ASR via
+  plain `getUserMedia`, **the guaranteed freeze-proof path**: no `webkitSpeechRecognition`, no VPIO;
+  slower, needs `#prompt-api-for-gemini-nano-multimodal-input`); and an **opt-in constrained-track**
+  leg (`setConstrainedSTT(true)`) that feeds Web Speech an **echo-cancellation-OFF `getUserMedia`
+  track** via `rec.start(track)` to skip VPIO. Constrained is **OFF by default** because
+  `SpeechRecognition.start(track)` is flag-gated (~M135 dev-trial) and not reliably
+  feature-detectable — a silent-ignore would open a second capture. **All `getUserMedia` paths use
+  `echoCancellation/noiseSuppression/autoGainControl:false`** (EC is what engages VPIO). Any new
+  mic path must (a) run through `beginListen`, (b) use EC-off constraints, (c) stop its stream/track
+  in a `finally`.
+- **Page media is restored** (`restoreMedia`) after every mic window — by `onTalkDown`, by
+  `converse()`/`start()`/`ytAgent.listen`, and by `releaseAll()` — so a video is never stranded
+  paused. **`releaseAll()`** (mic abort + stop recording + cancel speech + restore media +
+  `audio.suspend()` + bump `talk.gen` + end loop) fires on **`visibilitychange` (hidden) / `blur`
+  / `pagehide` / `beforeunload`**, plus `ytAgent.release()`. **Never reintroduce a continuous
+  recognizer** — that was the root of the machine-hang / blocked-video-call incidents.
 - **Model components**: text / audio / image are **separate** on-device downloads — each
   fetches the first time its modality is used. So the audio adapter is only pulled if `nano`
   listen mode is on (default Web Speech avoids it), and the image adapter only on vision.
@@ -214,6 +236,17 @@ boundary text-only (provider passes a URL; the consumer does the vision).
    against the installed Chrome) runs the provider's real extraction logic against live
    YouTube and prints what each journey scrapes. Run it after any `SEL`/`readVideoCards`
    change; no flags needed (it checks the DOM layer, not WebMCP/Gemini).
+5. **Freeze diagnosis (macOS).** The whole-machine-freeze root cause is still *inferred*, not
+   captured — confirm it before trusting any one fix (we've misattributed this once). To get a
+   real artifact, in a Terminal run `log stream --predicate 'process == "coreaudiod"' --info`
+   (or `log show --last 5m --predicate 'process == "coreaudiod"'` *after* recovery), reproduce
+   on the **unpatched** build with a `<video>` playing, and look for `default output device's
+   sample rate was changed`, `Start: Mach message timeout. Apparently deadlocked`, or
+   `HALS_OverloadMessage` at the instant the mic opens. Then A/B: webspeech+gate (default),
+   `setConstrainedSTT(true)`, and `setListenMode("nano")` — the `[yt-a11y-agent] beginListen:
+   gate open …` log line should show `unpausedMedia=0 synth.speaking=false` every time. Test the
+   worst case (**AirPods/Bluetooth** as output forces the 48→16 kHz aggregate path) and barge-in
+   (rapid taps). Full plan: `docs/research/voice-audio-anti-freeze.md`.
 
 ## Status
 
