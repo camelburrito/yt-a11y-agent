@@ -196,8 +196,10 @@ flowchart TB
 - **Arrow-key browse mode** — `startBrowse`/`stopBrowse` (armed by the extension on home +
   search): captures arrows (only while armed, not in text fields) so the user steps through
   the current surface's videos hearing each described — Down/Up move, Enter plays (`openIndex`),
-  Escape exits. `feed()` pulls the items from the surface's list tool. Off on `/watch` (arrows
-  seek the player). A guided-navigation layer; tools/voice unchanged.
+  Escape exits. The keydown listener stays attached after Escape (inert while disarmed), so once
+  `everArmed` an arrow press on a list surface re-arms — Escape is never a keyboard dead end.
+  `feed()` pulls the items from the surface's list tool. Off on `/watch` (arrows seek the
+  player). A guided-navigation layer; tools/voice unchanged.
 - **Listen mode** — `captureUtterance()` dispatches on `state.listenMode`. Default
   **`webspeech`** (Web Speech `SpeechRecognition` — fast, streaming). Opt-in **`nano`**
   (`nanoAsr`: VAD mic capture → on-device Gemini Nano audio transcription) is **experimental**

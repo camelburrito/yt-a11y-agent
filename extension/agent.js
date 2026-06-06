@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.9.12
+// @version      0.9.13
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -1099,7 +1099,7 @@
   // ONLY while armed and when focus isn't in a text field (so it never fights the search
   // box). While armed it takes over arrow keys (intended guided nav); Escape/stopBrowse hand
   // them back to the page / screen reader.
-  const browseState = { armed: false, index: -1, items: [] };
+  const browseState = { armed: false, index: -1, items: [], everArmed: false };
 
   function describeBrowseItem() {
     const it = browseState.items[browseState.index];
@@ -1183,38 +1183,40 @@
   }
 
   function onBrowseKey(e) {
-    if (!browseState.armed) return;
     const t = e.target;
     const tag = (t && t.tagName) || "";
     if (/^(INPUT|TEXTAREA|SELECT)$/.test(tag) || (t && t.isContentEditable)) return;
-    switch (e.key) {
-      case "ArrowDown":
-      case "ArrowRight":
+    const dir = e.key === "ArrowDown" || e.key === "ArrowRight" ? 1 : e.key === "ArrowUp" || e.key === "ArrowLeft" ? -1 : 0;
+    // Not browsing right now. The listener stays attached after Escape so the user is never
+    // stranded: once they've browsed at least once this session, pressing an arrow on a list
+    // surface re-arms browsing and steps. Every other key — and any arrow on /watch, /shorts,
+    // or off a list surface — falls straight through to the page / AT / player untouched.
+    if (!browseState.armed) {
+      if (dir && browseState.everArmed && onBrowsableSurface()) {
         e.preventDefault();
         e.stopPropagation();
-        browseMove(1);
-        break;
-      case "ArrowUp":
-      case "ArrowLeft":
-        e.preventDefault();
-        e.stopPropagation();
-        browseMove(-1);
-        break;
-      case "Enter": {
-        const it = browseState.index >= 0 ? browseState.items[browseState.index] : null;
-        if (it) {
-          e.preventDefault();
-          e.stopPropagation();
-          openIndex(it.index); // 1-based index the provider expects
-        }
-        break;
+        startBrowse(false).then(() => browseMove(dir));
       }
-      case "Escape":
-        stopBrowse();
-        voice.speak("Exited browsing.");
-        break;
-      default:
-        break;
+      return;
+    }
+    if (dir) {
+      e.preventDefault();
+      e.stopPropagation();
+      browseMove(dir);
+      return;
+    }
+    if (e.key === "Enter") {
+      const it = browseState.index >= 0 ? browseState.items[browseState.index] : null;
+      if (it) {
+        e.preventDefault();
+        e.stopPropagation();
+        openIndex(it.index); // 1-based index the provider expects
+      }
+      return;
+    }
+    if (e.key === "Escape") {
+      stopBrowse();
+      voice.speak("Exited browsing. Press an arrow key to resume.");
     }
   }
 
@@ -1227,9 +1229,10 @@
       return browseState.items.length;
     }
     browseState.armed = true;
+    browseState.everArmed = true;
     browseState.index = -1;
     browseState.items = await feed(20);
-    window.addEventListener("keydown", onBrowseKey, true);
+    window.addEventListener("keydown", onBrowseKey, true); // idempotent; stays attached so Escape can re-arm
     log(`browse mode armed (${browseState.items.length} items)`);
     if (announce && browseState.items.length) {
       voice.speak(
@@ -1243,7 +1246,8 @@
     browseState.armed = false;
     browseState.index = -1;
     browseState.items = []; // drop the surface's list so we never replay it after navigating
-    window.removeEventListener("keydown", onBrowseKey, true);
+    // Keep the keydown listener attached: while disarmed it's inert (passes keys through), but
+    // it lets a single arrow press re-arm browsing so Escape is never a keyboard dead end.
   }
 
   // ===========================================================================
@@ -1443,7 +1447,7 @@
     release: releaseAll, // panic: drop the mic + stop everything right now
     isRunning: () => state.running,
     // Arrow-key feed browsing (guided navigation with spoken descriptions).
-    startBrowse, // (announce=true) -> arms arrows: Down/Up move, Enter plays, Escape exits
+    startBrowse, // (announce=true) -> arms arrows: Down/Up move, Enter plays, Escape exits (an arrow re-arms)
     stopBrowse,
     isBrowsing: () => browseState.armed,
     feed, // (limit) -> current surface's video list

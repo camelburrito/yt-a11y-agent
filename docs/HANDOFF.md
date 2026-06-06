@@ -163,7 +163,7 @@ control (offer, don't autoplay).**
 | comments | `/watch` | `get_comments`, `summarize_comments`, `get_pinned_comment` | ✅ verified live |
 | pip | `/watch` | `enter_pip`, `exit_pip` | 🟡 button+fallback present; gesture path (q. c) needs flagged run |
 | (every route) | — | `where_am_i` ✅; `get_account` ✅ (`signedIn` reliable; `name` is null — only in the account menu, which we don't open) | ✅ |
-| (agent, list surfaces) | home + search | arrow-key browse mode (`startBrowse`): Down/Up move, Enter plays, Escape exits; + personalized welcome (`get_account`) | new — verify interactively |
+| (agent, list surfaces) | home + search | arrow-key browse mode (`startBrowse`): Down/Up move, Enter plays, Escape exits (an arrow re-arms — never a keyboard dead end); + personalized welcome (`get_account`) | new — verify interactively |
 | home (planned) | | `list_categories`, `open_category` (filter chip bar) | ⬜ |
 
 Shared extraction: home/search/up-next all use `readVideoCards(scope, containerSel, limit)`

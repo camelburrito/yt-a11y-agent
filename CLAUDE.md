@@ -83,9 +83,13 @@ warmly *without* a name ("Welcome back!"); use the name only if present.
 **Arrow-key browsing** (agent-side, `ytAgent.startBrowse`): on the home feed and search
 results the extension arms arrow keys so the user steps through videos hearing each
 described (Down/Up move, Enter plays, Escape exits). It captures arrows only while armed and
-not in a text field. Off on `/watch` and `/shorts` (arrows seek the player) — `browseMove`
-self-disarms if invoked off a list surface, and `stopBrowse` clears the cached list so a
-stale feed is never replayed after navigating. **Browse reads up to `BROWSE_LIMIT` (100)
+not in a text field. **Escape is never a keyboard dead end:** once the user has browsed at
+least once this session (`browseState.everArmed`), the keydown listener stays attached after
+`stopBrowse`, so a single arrow press on a list surface **re-arms** browsing and steps —
+Escape hands arrows back to the page/AT for the moment, an arrow takes them back. Off on
+`/watch` and `/shorts` (arrows seek the player) — while disarmed the listener is inert and
+passes keys through, `browseMove` self-disarms if invoked off a list surface, and `stopBrowse`
+clears the cached list so a stale feed is never replayed after navigating. **Browse reads up to `BROWSE_LIMIT` (100)
 cards, not 20, and auto-extends at the end** — pressing Down on the last item calls
 `growFeed()` (which invokes `load_more_home` then re-reads) so the user can page past the
 initial batch; saying "more" while browsing also refreshes the cached list. Voice/loop and
