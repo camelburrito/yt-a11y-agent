@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.9.20
+// @version      0.9.21
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -664,6 +664,9 @@
   let imageBase = null;
   async function describeImage(url, question) {
     if (!url) throw new Error("describeImage needs a url");
+    // Vision is Nano inference too — same machine-freeze risk class as text. Gated by the same
+    // kill switch (state.modelEnabled, default OFF); ytAgent.setModel(true) opts in.
+    if (!state.modelEnabled) return "Image descriptions are off while the on-device model is disabled.";
     const LM = getLanguageModel();
     if (!LM) throw new Error("Prompt API unavailable for vision.");
     const r = await fetch(url);
@@ -733,6 +736,19 @@
     // "webspeech" (default, fast, streaming) or "nano" (on-device audio transcription —
     // EXPERIMENTAL: slower and can briefly jank the page during inference).
     listenMode: "webspeech",
+    // ⚠️  Model kill switch — OFF by default. On this machine a single Nano `session.prompt()` has
+    // run 200s and beachballed the ENTIRE machine (took down other apps, incl. the dev terminal),
+    // and it is unproven that AbortController actually stops the native inference. Until that's
+    // measured (or a cloud path exists), the model must be explicit opt-in: `ytAgent.setModel(true)`
+    // (persisted in localStorage). Everything operational — greeting, commands, browse — is
+    // deterministic and works with the model off.
+    modelEnabled: (() => {
+      try {
+        return localStorage.getItem("ytA11yModelEnabled") === "1";
+      } catch (_) {
+        return false;
+      }
+    })(),
   };
 
   async function availability() {
@@ -1112,6 +1128,15 @@
       if (cmd) state.lastReply = cmd;
       log("reply (command):", cmd);
       return cmd; // "" = handled silently (already spoke / no reply needed)
+    }
+    // Model kill switch (see state.modelEnabled): with the model off, an unrecognized utterance
+    // gets a short deterministic coaching reply instead of risking a machine-freezing inference.
+    if (!state.modelEnabled) {
+      log('model is OFF (kill switch) — utterance not handled deterministically:', utterance);
+      log("re-enable for a measurement run with ytAgent.setModel(true)");
+      const reply = "I only handle direct commands right now. Try play, pause, next, search, list, or go home.";
+      state.lastReply = reply;
+      return reply;
     }
     const reply = await state.engine(utterance);
     state.lastReply = reply;
@@ -1755,6 +1780,19 @@
       destroySession();
       log("engine:", state.engine === geminiEngine ? "Gemini Nano (default)" : "custom");
     },
+    // Model kill switch. OFF by default — on-device Nano inference has beachballed this whole
+    // machine (200s `session.prompt()`), and abort() stopping the native inference is UNPROVEN.
+    // `ytAgent.setModel(true)` opts in (persisted) — use it for the instrumented measurement run,
+    // watch the `max main-thread freeze` log, and turn it back off if the machine wedges.
+    setModel(on) {
+      state.modelEnabled = !!on;
+      try {
+        localStorage.setItem("ytA11yModelEnabled", on ? "1" : "0");
+      } catch (_) {}
+      if (!on) destroySession(); // drop any live session; nothing should keep the model warm
+      log(`model: ${on ? "ON (opt-in — watch the max main-thread freeze log; ytAgent.setModel(false) to kill)" : "OFF (deterministic-only; commands, greeting, and browse all work)"}`);
+      return state.modelEnabled;
+    },
     speak: voice.speak,
     // respects listenMode; runs the freeze gate, and restores ducked media after a standalone listen.
     listen: async () => {
@@ -1802,7 +1840,8 @@
     if (consumer.wrap()) {
       availability().then((a) =>
         log(
-          `ready. Gemini Nano: ${a}. voice: tts=${voice.supported.tts} stt=${voice.supported.stt}. ` +
+          `ready. Gemini Nano: ${a}. model: ${state.modelEnabled ? "ON (opt-in)" : "OFF (kill switch — deterministic-only; ytAgent.setModel(true) to opt in)"}. ` +
+            `voice: tts=${voice.supported.tts} stt=${voice.supported.stt}. ` +
             `Try: ytAgent.start() for hands-free voice, ytAgent.ask("...") to type, ` +
             `or ytAgent.enablePushToTalk() for a hotkey.`
         )

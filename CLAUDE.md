@@ -136,6 +136,16 @@ boundary text-only (provider passes a URL; the consumer does the vision).
   tool on `/watch`, actuates the page `<video>` elsewhere), because a "pause" on the home page was
   falling through to Nano. **Rule: never let a common command reach the model; the model is a
   last-resort, time-boxed fallback only.**
+- **⚠️ Model kill switch (v0.9.21) — Nano is OFF by default.** A repeat beachball took down the
+  whole machine (including the dev terminal) even after the 12 s abort cap shipped, and it is
+  **unproven** that `AbortController` stops the native inference (spec only mandates promise
+  rejection). So **all** Nano inference — text turns (`geminiEngine`) *and* vision
+  (`describeImage`) — is gated behind `state.modelEnabled` (persisted in
+  `localStorage.ytA11yModelEnabled`, default OFF). With the model off, an unrecognized utterance
+  gets a short deterministic coaching reply; greeting, commands, and arrow-browse all work
+  normally. Opt in with `ytAgent.setModel(true)` (only for instrumented measurement runs — watch
+  the `max main-thread freeze` log); `setModel(false)` also drops any live session. The startup
+  banner logs the switch state. Do not add any model call outside this gate.
 - **TTS voice (safeguard, not the freeze cause).** `pickVoice()` still prefers **LOCAL, COMPACT**
   voices and excludes `Enhanced/Premium/Siri/Eloquence` (`HEAVY_VOICE`) — a reasonable safeguard,
   though on the dev Mac no heavy voices were installed (compact "Samantha" was already used, so
