@@ -4,7 +4,30 @@ Status: research/spec. Drives changes to `src/agent/dev-agent.user.js` (voice la
 generated `extension/agent.js`. Read alongside `docs/HANDOFF.md` and `CLAUDE.md` (the
 "NEVER hold the mic" / "prefer LOCAL voices" / on-device-only rules this doc must respect).
 
-## The bug
+## ⚠️ UPDATE (2026-06-06): evidence reattributed the freeze to the MODEL, not audio
+
+The instrumented `coreaudiod` capture this doc demanded came back **clean** — none of the
+predicted deadlock signatures (`default output device's sample rate was changed`,
+`Start: Mach message timeout. Apparently deadlocked`, `HALS_OverloadMessage`). On the **bare**
+`webkitSpeechRecognition` path (behind the v0.9.14 gate) the mic and speaker opened as
+**separate, clean 48 kHz devices** — no 16 kHz VPIO aggregate, no output-device reconfigure.
+So the VPIO/CoreAudio chain below was **plausible but wrong** for this hardware (the reviewers'
+"diagnosis is unverified inference" caveat was correct — this is the second misattribution after
+v0.9.10's TTS-stall).
+
+**Actual cause:** the freeze tracks **on-device Gemini Nano load** — `LM.create()=22.8s`,
+`ensureSession()=29s`, plus a model download — which saturates the machine. And the session was
+rebuilt on **every YouTube surface change** (the tool catalog was in `initialPrompts`, so the
+signature changed per route), so normal navigation paid that ~22s load repeatedly. Fixed in
+v0.9.15: **persistent session** (catalog moved to the per-turn prompt → `LM.create()` once per
+tab) + **deterministic-first** routing so common commands never load the model.
+
+What still holds from the audio work: the v0.9.14 **output-quiescence gate is good hygiene** and
+the `beginListen: gate open — … unpausedMedia=0` instrumentation confirmed no audio overlap at
+mic-open. Keep it; it just wasn't the cure. The sections below are retained as the original
+(now-superseded) audio hypothesis and the still-valid capture/verification recipe.
+
+## The bug (original audio hypothesis — superseded; see update above)
 
 On macOS Chrome, opening `webkitSpeechRecognition` (the mic) while the YouTube `<video>` is
 playing audio and/or `speechSynthesis` TTS is speaking **freezes the whole machine** (beachball),

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.9.14
+// @version      0.9.15
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -735,9 +735,15 @@
   // executes. Instead we drive tools manually (see geminiEngine): the system prompt
   // instructs the model to emit ONE line of strict JSON per turn, which we parse and run.
   async function ensureSession() {
-    const sig = consumer.signature();
-    if (state.session && state.sessionSig === sig) return state.session;
-    destroySession(); // toolset changed (route change) or first run -> rebuild
+    // ONE persistent session for the whole browser tab. We deliberately do NOT key the session
+    // on the toolset. Embedding the per-surface tool catalog in initialPrompts meant every
+    // YouTube route change (home<->watch<->search) changed the signature and rebuilt the
+    // session — and each LM.create() is a ~20s on-device model load that pegs the machine
+    // (THE "whole machine freezes when the mic is used" report — confirmed by a clean coreaudiod
+    // log + LM.create()=22s/ensureSession=29s in the timing logs; it was the model, not audio).
+    // The catalog is passed per-turn in geminiEngine instead, so the model still sees the
+    // current surface's tools while the session is created once and reused everywhere.
+    if (state.session) return state.session;
 
     const LM = getLanguageModel();
     if (!LM) {
@@ -754,33 +760,22 @@
       voice.speak("Setting up the on-device model, one moment."); // communicate the one-time fetch
     }
 
-    const catalog = consumer
-      .list()
-      .concat(localTools) // provider WebMCP tools + consumer-local tools (e.g. describe_image)
-      .map(
-        (t) =>
-          `- ${t.name}: ${t.description || ""} | args: ${JSON.stringify(
-            t.inputSchema || { type: "object", properties: {} }
-          )}`
-      )
-      .join("\n");
     const sys =
       SYSTEM +
       "\n\n" +
       "You control the page through tools. On EVERY turn reply with ONE line of strict JSON, nothing else, no markdown fences.\n" +
+      "Each turn begins by listing the tools available on the CURRENT page (they change as the user navigates).\n" +
       'To use a tool, include ALL its required args. Example: {"action":"call","tool":"open_video","args":{"index":3}}\n' +
       'When you can answer the user: {"action":"final","say":"<the reply to speak>"}\n' +
-      'Videos are numbered starting at 1; pass the exact number the user says (e.g. "open video 5" -> {"action":"call","tool":"open_video","args":{"index":5}}).\n' +
-      "Available tools:\n" +
-      catalog;
+      'Videos are numbered starting at 1; pass the exact number the user says (e.g. "open video 5" -> {"action":"call","tool":"open_video","args":{"index":5}}).';
 
     const tCreate = nowms();
     state.session = await LM.create({
       initialPrompts: [{ role: "system", content: sys }],
       monitor: dlMonitor,
     });
-    state.sessionSig = sig;
-    log(`LM.create() took ${Math.round(nowms() - tCreate)}ms (availability="${avail}"); tools: ${sig || "(none)"}`);
+    state.sessionSig = "persistent";
+    log(`LM.create() took ${Math.round(nowms() - tCreate)}ms (availability="${avail}") — one-time; session now persists across routes`);
     return state.session;
   }
 
@@ -803,7 +798,14 @@
     const session = await ensureSession();
     log(`ensureSession() ${Math.round(nowms() - tSess)}ms`);
     const tools = consumer.asPromptApiTools().concat(localTools);
-    let turn = `User said: ${utterance}`;
+    // The session is surface-agnostic (created once), so tell the model the CURRENT page's tools
+    // each turn. This is what lets one persistent session serve every route without a rebuild.
+    const catalog = consumer
+      .list()
+      .concat(localTools)
+      .map((t) => `- ${t.name}: ${t.description || ""} | args: ${JSON.stringify(t.inputSchema || { type: "object", properties: {} })}`)
+      .join("\n");
+    let turn = `Tools available on this page right now:\n${catalog}\n\nUser said: ${utterance}`;
     for (let i = 0; i < MANUAL_LOOP_HOPS; i++) {
       const tP = nowms();
       const raw = await session.prompt(turn);
@@ -949,7 +951,17 @@
       }
       return msg;
     }
-    if (/^(list|what'?s here|read( the)? titles|list (videos|results))$/.test(t)) return await listHere();
+    // "list" / "what's on my feed" / "what's here" → read the current surface's videos INSTANTLY,
+    // no model round-trip. (Before, "what's on my home feed" fell through to the ~29s on-device
+    // model, which then misrouted to select_category Music and errored — measured in the wild.)
+    if (/^(list|read)( (it|them|the))?( (videos|results|titles|feed|list|home ?feed))?$/.test(t)) return await listHere();
+    if (
+      onList &&
+      (/^what'?s (here|playing|recommended|on (this page|youtube|screen)|(on |in )?(my )?(home ?)?(feed|page))$/.test(t) ||
+        /^(show|tell|read|give)( me)?( my| the)? ?(home ?)?(feed|videos|results|recommendations|list)$/.test(t) ||
+        /^what (videos|results|else)( do you have| are (there|here)| can i (watch|see))?$/.test(t))
+    )
+      return await listHere();
 
     // List categories (home) — deterministic so it never hits the slow on-device model.
     if ((path === "/" || path.startsWith("/feed")) && /\bcategor(y|ies)\b/.test(t) && /^(list|read|what|which|show|tell|name)\b/.test(t)) {
