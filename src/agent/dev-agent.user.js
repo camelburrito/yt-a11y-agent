@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.9.17
+// @version      0.9.18
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -182,22 +182,32 @@
     // are instant and never touch the network. We only fall back to an online voice if there is
     // no local English voice at all. A user override (setVoice) still wins if it's local.
     let preferredVoiceName = null;
+    // ⚠️ AVOID macOS "Enhanced"/"Premium" and Siri/Eloquence voices. They synthesize with a large
+    // neural model that can STALL — even beachball — the whole machine for the duration of the
+    // utterance (longer text → longer freeze; this was the "machine hangs during speak()" report,
+    // confirmed by a CLEAN coreaudiod log: the freeze is in speechsynthesisd, not the audio
+    // device). The old regex matched "Samantha (Enhanced)" / "Aaron" (Siri) — i.e. we were
+    // picking the heavy voice. Prefer the lightweight COMPACT local voices instead.
+    const HEAVY_VOICE = /\b(enhanced|premium|eloquence|siri)\b|\((enhanced|premium)\)/i;
     function pickVoice() {
       const vs = synth ? synth.getVoices() : [];
       if (!vs.length) return null;
       const en = vs.filter((v) => v.lang && v.lang.toLowerCase().startsWith("en"));
       const pool = en.length ? en : vs;
-      const local = pool.filter((v) => v.localService);
-      const safe = local.length ? local : pool; // only go online if no local voice exists
+      const local = pool.filter((v) => v.localService); // no per-utterance network fetch
+      const light = local.filter((v) => !HEAVY_VOICE.test(v.name)); // drop Enhanced/Premium/Siri
+      const safe = light.length ? light : local.length ? local : pool;
       if (preferredVoiceName) {
         const m = safe.find((v) => v.name.toLowerCase().includes(preferredVoiceName.toLowerCase()));
         if (m) return m;
       }
       return (
-        // Good, natural-sounding LOCAL macOS/Windows voices (no network).
-        safe.find((v) => /(samantha|alex|karen|daniel|moira|tessa|fiona|victoria|aaron|allison|ava|susan|zoe)/i.test(v.name)) ||
-        safe.find((v) => v.default) || // the system default local voice (reliable)
-        null // null = let the browser use its own default rather than force a maybe-broken one
+        // Classic, lightweight COMPACT macOS/Windows voices (anchored so we match the plain
+        // "Samantha", not "Samantha (Enhanced)" — which is already excluded from `safe` anyway).
+        safe.find((v) => /^(samantha|alex|daniel|karen|moira|tessa|fiona|victoria|allison|ava|susan|zoe|fred)\b/i.test(v.name)) ||
+        safe.find((v) => v.default && !HEAVY_VOICE.test(v.name)) ||
+        safe[0] || // any light local voice beats forcing the browser default (which may BE the heavy one)
+        null
       );
     }
     function setVoice(name) {
