@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.9.15
+// @version      0.9.16
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -867,11 +867,22 @@
       return "On this video you can say: play, pause, skip forward, skip back, captions on, captions off, next video, or go home. Say repeat to hear something again, or slower and faster to change my speed.";
     return "You can say: list videos, open and a number, next, previous, search for something, load more, or go home. Say a category name like Music to filter. Say repeat, slower, or faster anytime.";
   }
+  // Strip emoji/symbols and trim over-long tails so spoken replies stay short and the local TTS
+  // engine doesn't grind (a wall of long, mixed-script + emoji titles was a ~6s utterance).
+  function speakableTitle(s, max = 70) {
+    let t = (s || "")
+      .replace(/[\u{1F000}-\u{1FAFF}\u{2190}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{1F1E6}-\u{1F1FF}]/gu, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (t.length > max) t = t.slice(0, max).replace(/\s+\S*$/, "") + "…";
+    return t || "untitled";
+  }
   async function listHere() {
     const items = await feed(20);
     if (!items.length) return "There's nothing to list here.";
-    const top = items.slice(0, 5).map((v) => `${v.index}, ${v.title}`).join(". ");
-    return `${items.length} videos. ${top}. Say open and a number, or next.`;
+    // Read only the first 3, cleaned + truncated — keeps the utterance short (≈2s, not 6s).
+    const top = items.slice(0, 3).map((v) => `${v.index}, ${speakableTitle(v.title)}`).join(". ");
+    return `${items.length} videos. ${top}. Say open and a number, next, or more.`;
   }
   async function openByNumber(n) {
     const items = await feed(60);
