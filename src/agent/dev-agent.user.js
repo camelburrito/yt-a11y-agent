@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.9.19
+// @version      0.9.20
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -837,7 +837,26 @@
     // Whole-turn deadline: abort the model if it blows the budget (see MODEL_TURN_BUDGET_MS) so a
     // stalled Nano inference can't beachball the machine. The signal is passed to every prompt.
     const ac = new AbortController();
-    const deadline = setTimeout(() => ac.abort(), MODEL_TURN_BUDGET_MS);
+    const tAbort = { at: 0 };
+    const deadline = setTimeout(() => {
+      tAbort.at = nowms();
+      ac.abort();
+    }, MODEL_TURN_BUDGET_MS);
+    // CRUX INSTRUMENTATION (do NOT assume — measure): a main-thread liveness probe. If the renderer
+    // is wedged by the inference, requestAnimationFrame stops firing; the largest gap ≈ how long the
+    // thread was frozen. After the turn we log it next to whether/when abort fired. This is how we
+    // settle empirically whether the 12s abort actually frees the machine at 12s, or whether the
+    // beachball runs the full inference regardless (the open question the research couldn't prove).
+    let lastFrame = nowms(), maxFrameGap = 0, hbOn = true;
+    const hasRAF = typeof requestAnimationFrame !== "undefined";
+    const beat = () => {
+      const n = nowms();
+      const g = n - lastFrame;
+      lastFrame = n;
+      if (g > maxFrameGap) maxFrameGap = g;
+      if (hbOn && hasRAF) requestAnimationFrame(beat);
+    };
+    if (hasRAF) requestAnimationFrame(beat);
     try {
       for (let i = 0; i < MANUAL_LOOP_HOPS; i++) {
         const tP = nowms();
@@ -846,13 +865,18 @@
           raw = await session.prompt(turn, { signal: ac.signal });
         } catch (e) {
           if (ac.signal.aborted) {
-            log(`session.prompt ABORTED at ${MODEL_TURN_BUDGET_MS}ms budget (hop ${i}) — model was stalling`);
+            const sinceAbort = Math.round(nowms() - tAbort.at);
+            log(
+              `session.prompt ABORTED (hop ${i}): promise settled ${sinceAbort}ms AFTER abort() — ` +
+                `if this is ~0ms the model honored abort; if it's seconds, the inference kept running. ` +
+                `max main-thread freeze so far ${Math.round(maxFrameGap)}ms`
+            );
             destroySession(); // a wedged session won't recover; rebuild on the next turn
             return "That took too long on the on-device model, so I stopped it. Try a direct command like play, pause, next, search, or list.";
           }
           throw e;
         }
-        log(`session.prompt() hop ${i} ${Math.round(nowms() - tP)}ms`);
+        log(`session.prompt() hop ${i} ${Math.round(nowms() - tP)}ms (main-thread freeze so far ${Math.round(maxFrameGap)}ms)`);
         const step = parseAction(raw);
         if (!step) return raw.trim(); // model returned plain prose; just use it
         if (step.action === "final") return step.say || "";
@@ -882,6 +906,8 @@
       return "Sorry, I couldn't complete that.";
     } finally {
       clearTimeout(deadline);
+      hbOn = false;
+      log(`model turn done — max main-thread freeze ${Math.round(maxFrameGap)}ms (≈ how long the page was beachballed)`);
     }
   }
   state.engine = geminiEngine;
@@ -955,7 +981,11 @@
 
   async function handleCommand(rawText) {
     const t = (rawText || "").trim().toLowerCase().replace(/[.!?]+$/, "");
-    if (!t || t.startsWith("[")) return null; // ignore the bracketed greeting trigger
+    if (!t) return null;
+    // Bracketed text was the old greeting prompt. Return "" (handled, silent) — NOT null — so a
+    // stray bracketed string can never fall through to the unbounded on-device model. The greeting
+    // is now composed deterministically in activate(); nothing should send bracketed text anymore.
+    if (t.startsWith("[")) return "";
     const path = location.pathname;
     const onWatch = path.startsWith("/watch") || path.startsWith("/shorts");
     const onList = path === "/" || path.startsWith("/feed") || path.startsWith("/results");
@@ -1089,12 +1119,45 @@
     return reply;
   }
 
-  // Simulates the browser/AT opt-in handoff: greet + orient proactively (fresh session).
+  // Greet + orient proactively. Composed DETERMINISTICALLY — it must NEVER call the model. The
+  // old version sent a bracketed prompt to Nano (bracketed text bypasses handleCommand) AND first
+  // ran destroySession(), forcing a cold ~20-29s LM.create + a multi-hop unbounded inference on
+  // the home page. That greeting is the confirmed "freezes even on home" trigger (it fires from
+  // Alt+Shift+A, the popup Activate button, and the top of start()). We read the same tools
+  // directly — instant, freeze-proof.
   async function activate() {
-    destroySession();
-    const reply = await ask(
-      "[Session start. First call get_account, then greet the user (by name if signed in). Say what page they're on. If on the HOME page, also call list_categories and list_home_feed: name the available categories, read the first few video titles, and tell them they can use the up/down arrow keys to browse videos one at a time or name a category. End with a question.]"
-    );
+    const path = location.pathname;
+    const onHome = path === "/" || path.startsWith("/feed");
+    let signedIn = false, name = null;
+    try {
+      const acct = JSON.parse(await callText("get_account"));
+      signedIn = !!acct.signedIn;
+      name = acct.name || null;
+    } catch (_) {}
+    // signedIn is reliable; name is usually null (we won't open the account menu) — greet warmly.
+    const hello = signedIn ? (name ? `Welcome back, ${name}.` : "Welcome back.") : "Hi there.";
+    let reply;
+    if (onHome) {
+      let cats = [];
+      try {
+        const c = JSON.parse(await callText("list_categories"));
+        if (Array.isArray(c)) cats = c;
+      } catch (_) {}
+      let items = [];
+      try {
+        items = await feed(20);
+      } catch (_) {}
+      const feedLine = items.length ? ` Top videos: ${items.slice(0, 3).map((v) => speakableTitle(v.title)).join("; ")}.` : "";
+      const catLine = cats.length ? ` Categories you can pick: ${cats.slice(0, 6).join(", ")}.` : "";
+      reply = `${hello} You're on the YouTube home page.${feedLine}${catLine} Use the up and down arrow keys to browse videos one at a time, name a category to filter, or say "search" and what you're looking for. What would you like to do?`;
+    } else if (path.startsWith("/watch") || path.startsWith("/shorts")) {
+      reply = `${hello} You're on a video. Say play, pause, skip forward, skip back, captions on or off, next video, or go home. What would you like to do?`;
+    } else if (path.startsWith("/results")) {
+      reply = `${hello} You're on the search results. Use the up and down arrow keys to browse results, say "open" with a number, or search for something else. What would you like to do?`;
+    } else {
+      reply = `${hello} You're on YouTube. Say go home, search and a topic, play, pause, or next. What would you like to do?`;
+    }
+    state.lastReply = reply;
     await voice.speak(reply);
     return reply;
   }
