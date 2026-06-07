@@ -4,6 +4,27 @@ Status: research/spec. Drives changes to `src/agent/dev-agent.user.js` (voice la
 generated `extension/agent.js`. Read alongside `docs/HANDOFF.md` and `CLAUDE.md` (the
 "NEVER hold the mic" / "prefer LOCAL voices" / on-device-only rules this doc must respect).
 
+## ✅ RESOLVED (2026-06-06): the freeze is UNBOUNDED on-device Nano inference
+
+Final isolation settled it. `ytAgent.ask("pause")` typed in the console (no mic, no earcon, no
+TTS) did **not** freeze; saying "pause" with **earcons disabled** (`setEarconVolume(0)`) DID — and
+the log showed **`session.prompt() hop 0 200828ms`** (3+ minutes). The beachball duration == the
+`session.prompt()` duration. The audio hypotheses in this doc were **all wrong** and were
+disproven by direct reproduction on the machine: 3 clean `coreaudiod` captures; a muted 12 s TTS
+run with **zero** main-thread stalls; 64 GB RAM at 58 % free; Chrome exposing only compact voices.
+Five theories, four killed by evidence — the reviewers' "unverified inference" warning held the
+whole way.
+
+**Fix (v0.9.19):** (1) `MODEL_TURN_BUDGET_MS` (12 s) — every `session.prompt()` runs under an
+`AbortController`; on timeout we abort, `destroySession()`, and return a spoken fallback, so a
+stalled Nano can never freeze the page for minutes. (2) Playback verbs (pause/play/skip/captions/
+next) are now deterministic on **every** surface (they were gated behind `onWatch`, so "pause" on
+the home page fell through to Nano). General rule: **never let a common command reach the model**;
+the model is a time-boxed last resort. Note: even "healthy" Nano here was sometimes 200 s — the
+on-device model is unreliable on this hardware, so deterministic coverage is the real UX.
+
+The audio sections below are retained only as a record of the (wrong) earlier hypothesis.
+
 ## ⚠️ UPDATE (2026-06-06): evidence reattributed the freeze to the MODEL, not audio
 
 The instrumented `coreaudiod` capture this doc demanded came back **clean** — none of the

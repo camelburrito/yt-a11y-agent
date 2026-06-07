@@ -122,20 +122,27 @@ boundary text-only (provider passes a URL; the consumer does the vision).
   the 5th). Tools read args **leniently** (`argIndex`/`argName`) because the small on-device
   model often mislabels them (e.g. omits `index`); the system prompt also gives a concrete
   `{"args":{"index":5}}` example.
-- **⚠️ TTS voice — THE whole-machine-freeze cause (v0.9.18).** `pickVoice()` prefers **LOCAL,
-  lightweight COMPACT** voices and **excludes macOS "Enhanced"/"Premium"/Siri/Eloquence** voices
-  (`HEAVY_VOICE` regex). Those heavy neural voices synthesize with a large model that **stalls —
-  beachballs — the entire machine for the duration of the utterance** (longer text → longer
-  freeze; short text barely registers). This was the real "whole machine hangs when the mic is
-  used" bug: **not** the mic and **not** the on-device model — confirmed by THREE clean
-  `coreaudiod` captures (the freeze is in `speechsynthesisd`, above the audio device). The old
-  regex matched "Samantha (Enhanced)" / "Aaron" (Siri), so we were *selecting* the heavy voice.
-  Also **do NOT prefer "Google"/online voices** (they fetch audio per utterance; a stall = ~25 s
-  for one word — v0.9.10). `pickVoice()` returns a light local voice even as last resort rather
-  than `null` (browser default may BE the heavy voice). `speak()` keeps a length-scaled
-  **watchdog** that resolves if an utterance never ends. A one-time `[yt-a11y-agent] TTS voice:
-  <name>` log shows what was chosen. `ytAgent.setVoice("name")` overrides (still local-only);
-  `ytAgent.listVoices()` lists them.
+- **⚠️ THE whole-machine-freeze cause = unbounded on-device Nano inference (v0.9.19, EVIDENCE-CONFIRMED).**
+  The beachball was finally pinned by a clean isolation test: typing `ytAgent.ask("pause")` (no
+  mic/earcon/TTS) did **not** freeze, but saying "pause" with **earcons off** DID — and the log
+  showed **`session.prompt() hop 0 200828ms`** (3+ minutes of Gemini Nano inference) == the freeze
+  duration. It was **never** the mic, audio device, TTS, or voice (all ruled out by reproduction:
+  3 clean `coreaudiod` captures, a 12 s muted TTS run with 0 main-thread stalls, 64 GB/58%-free
+  memory, and Chrome exposing only compact voices). Two fixes: (1) **`MODEL_TURN_BUDGET_MS`
+  (12 s) hard cap** — `geminiEngine` runs every `session.prompt()` under an `AbortController` and
+  aborts + `destroySession()` + returns a fallback if Nano stalls, so inference can never freeze
+  the page for minutes; (2) **deterministic-first must cover the common verbs** — playback
+  (`pause`/`play`/`skip`/`captions`/`next`) is now handled on **every** surface (uses the provider
+  tool on `/watch`, actuates the page `<video>` elsewhere), because a "pause" on the home page was
+  falling through to Nano. **Rule: never let a common command reach the model; the model is a
+  last-resort, time-boxed fallback only.**
+- **TTS voice (safeguard, not the freeze cause).** `pickVoice()` still prefers **LOCAL, COMPACT**
+  voices and excludes `Enhanced/Premium/Siri/Eloquence` (`HEAVY_VOICE`) — a reasonable safeguard,
+  though on the dev Mac no heavy voices were installed (compact "Samantha" was already used, so
+  this was **not** the freeze here). **Do NOT prefer "Google"/online voices** (per-utterance fetch;
+  a stall = ~25 s — v0.9.10). `pickVoice()` returns a light local voice as last resort rather than
+  `null`. `speak()` has a length-scaled **watchdog**. One-time `TTS voice: <name>` log; override
+  with `ytAgent.setVoice("name")`, list with `ytAgent.listVoices()`.
 - **⚠️ NEVER hold the mic when the user isn't actively talking.** The extension auto-injects on
   every YouTube tab and persists; a stuck-open mic blocks other apps (video calls) and a
   runaway recognizer can hang the machine. Safeguards (do not regress): tap-to-talk uses

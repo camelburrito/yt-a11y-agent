@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.9.18
+// @version      0.9.19
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -36,6 +36,11 @@
   const stamp = () => `+${((nowms() - T0) / 1000).toFixed(2)}s`;
   const log = (...a) => console.log(LOG, stamp(), ...a);
   const MANUAL_LOOP_HOPS = 4; // max tool-call round-trips per ask() in the manual JSON loop
+  // ⚠️ Hard cap on a whole on-device-model turn. Nano `session.prompt()` is UNBOUNDED and was
+  // measured running 200829ms (3+ min) on a trivial input — that is THE whole-machine beachball
+  // (confirmed: clean coreaudiod, no audio/voice involvement, freeze == the prompt duration).
+  // We abort the turn past this budget so a stalled model can never freeze the page for minutes.
+  const MODEL_TURN_BUDGET_MS = 12000;
 
   // Crisp spoken cues so the user knows what we're doing during slow/navigating tools —
   // no endless silent waiting. One or two words; only for tools worth narrating.
@@ -829,37 +834,55 @@
       .map((t) => `- ${t.name}: ${t.description || ""} | args: ${JSON.stringify(t.inputSchema || { type: "object", properties: {} })}`)
       .join("\n");
     let turn = `Tools available on this page right now:\n${catalog}\n\nUser said: ${utterance}`;
-    for (let i = 0; i < MANUAL_LOOP_HOPS; i++) {
-      const tP = nowms();
-      const raw = await session.prompt(turn);
-      log(`session.prompt() hop ${i} ${Math.round(nowms() - tP)}ms`);
-      const step = parseAction(raw);
-      if (!step) return raw.trim(); // model returned plain prose; just use it
-      if (step.action === "final") return step.say || "";
-      if (step.action === "call") {
-        const tool = tools.find((t) => t.name === step.tool);
-        if (!tool) {
-          turn = `No tool "${step.tool}". Available: ${tools
-            .map((t) => t.name)
-            .join(", ")}. Reply with valid JSON.`;
+    // Whole-turn deadline: abort the model if it blows the budget (see MODEL_TURN_BUDGET_MS) so a
+    // stalled Nano inference can't beachball the machine. The signal is passed to every prompt.
+    const ac = new AbortController();
+    const deadline = setTimeout(() => ac.abort(), MODEL_TURN_BUDGET_MS);
+    try {
+      for (let i = 0; i < MANUAL_LOOP_HOPS; i++) {
+        const tP = nowms();
+        let raw;
+        try {
+          raw = await session.prompt(turn, { signal: ac.signal });
+        } catch (e) {
+          if (ac.signal.aborted) {
+            log(`session.prompt ABORTED at ${MODEL_TURN_BUDGET_MS}ms budget (hop ${i}) — model was stalling`);
+            destroySession(); // a wedged session won't recover; rebuild on the next turn
+            return "That took too long on the on-device model, so I stopped it. Try a direct command like play, pause, next, search, or list.";
+          }
+          throw e;
+        }
+        log(`session.prompt() hop ${i} ${Math.round(nowms() - tP)}ms`);
+        const step = parseAction(raw);
+        if (!step) return raw.trim(); // model returned plain prose; just use it
+        if (step.action === "final") return step.say || "";
+        if (step.action === "call") {
+          const tool = tools.find((t) => t.name === step.tool);
+          if (!tool) {
+            turn = `No tool "${step.tool}". Available: ${tools
+              .map((t) => t.name)
+              .join(", ")}. Reply with valid JSON.`;
+            continue;
+          }
+          // Crisp progress cue (fire-and-forget) so the user hears we're working.
+          if (TOOL_CUE[step.tool]) voice.speak(TOOL_CUE[step.tool]);
+          let result;
+          const tExec = nowms();
+          try {
+            result = await tool.execute(step.args || {});
+          } catch (e) {
+            result = "tool error: " + ((e && e.message) || e);
+          }
+          log(`tool ${step.tool} ${Math.round(nowms() - tExec)}ms ->`, result);
+          turn = `Result of ${step.tool}:\n${result}\n\nNow call another tool or give the final answer as JSON.`;
           continue;
         }
-        // Crisp progress cue (fire-and-forget) so the user hears we're working.
-        if (TOOL_CUE[step.tool]) voice.speak(TOOL_CUE[step.tool]);
-        let result;
-        const tExec = nowms();
-        try {
-          result = await tool.execute(step.args || {});
-        } catch (e) {
-          result = "tool error: " + ((e && e.message) || e);
-        }
-        log(`tool ${step.tool} ${Math.round(nowms() - tExec)}ms ->`, result);
-        turn = `Result of ${step.tool}:\n${result}\n\nNow call another tool or give the final answer as JSON.`;
-        continue;
+        return raw.trim();
       }
-      return raw.trim();
+      return "Sorry, I couldn't complete that.";
+    } finally {
+      clearTimeout(deadline);
     }
-    return "Sorry, I couldn't complete that.";
   }
   state.engine = geminiEngine;
 
@@ -1015,12 +1038,35 @@
       if (m && (path === "/" || path.startsWith("/feed"))) return await callText("select_category", { name: m[1] });
     }
 
-    // Playback (watch)
-    if (onWatch) {
-      if (/^(pause|pause( the)? video)$/.test(t)) return await callText("playback_control", { action: "pause" });
-      if (/^(play|resume|continue|unpause|play( the)? video)$/.test(t)) return await callText("playback_control", { action: "play" });
-      if (/(skip|jump|go)\b.*(ahead|forward)|fast ?forward/.test(t)) return await callText("playback_control", { action: "forward", value: parseNum(t) || 10 });
-      if (/(skip back|rewind|go back)/.test(t)) return await callText("playback_control", { action: "back", value: parseNum(t) || 10 });
+    // Playback controls — handled on EVERY surface, never gated behind onWatch. A missed media
+    // verb (e.g. "pause" on the home page) used to fall through to the on-device model, which ran
+    // for 200s and beachballed the machine. On /watch we use the provider tool (proper YouTube
+    // controls); elsewhere we actuate the page's <video> directly (read-and-act safe). Either way
+    // this returns instantly and Nano is never involved.
+    {
+      const vid = () => document.querySelector("video");
+      if (/^(pause|pause( the)? video|stop( the)? video)$/.test(t)) {
+        if (consumer.has("playback_control")) return await callText("playback_control", { action: "pause" });
+        const v = vid(); if (v && !v.paused) { try { v.pause(); } catch (_) {} return "Paused."; }
+        return "Nothing is playing right now.";
+      }
+      if (/^(resume|continue|unpause|play( the)? video)$/.test(t) || (onWatch && /^play$/.test(t))) {
+        if (consumer.has("playback_control")) return await callText("playback_control", { action: "play" });
+        const v = vid(); if (v) { try { const p = v.play(); if (p && p.catch) p.catch(() => {}); } catch (_) {} return "Playing."; }
+        return "There's no video here to play.";
+      }
+      if (/(skip|jump|go)\b.*(ahead|forward)|fast ?forward/.test(t)) {
+        const n = parseNum(t) || 10;
+        if (consumer.has("playback_control")) return await callText("playback_control", { action: "forward", value: n });
+        const v = vid(); if (v) { try { v.currentTime += n; } catch (_) {} return `Skipped ahead ${n} seconds.`; }
+        return "There's no video here to skip.";
+      }
+      if (/(skip back|rewind)\b/.test(t)) {
+        const n = parseNum(t) || 10;
+        if (consumer.has("playback_control")) return await callText("playback_control", { action: "back", value: n });
+        const v = vid(); if (v) { try { v.currentTime -= n; } catch (_) {} return `Skipped back ${n} seconds.`; }
+        return "There's no video here to skip.";
+      }
       if (/captions?\b.*\bon\b|subtitles?\b.*\bon\b/.test(t)) return await callText("set_captions", { on: true });
       if (/captions?\b.*\boff\b|subtitles?\b.*\boff\b/.test(t)) return await callText("set_captions", { on: false });
       if (/^(next( video| up)?|play next)$/.test(t)) return await callText("play_next");
