@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.9.16
+// @version      0.9.17
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -231,6 +231,7 @@
     let pendingResolve = null;
     let speakTimer = null;
     let resumeTimer = null;
+    let loggedVoice = false; // one-time log of the selected TTS voice (diagnosing the speak() freeze)
     function flushSpeak() {
       if (speakTimer) {
         clearTimeout(speakTimer);
@@ -257,6 +258,10 @@
           u.volume = volume;
           const v = pickVoice();
           if (v) u.voice = v;
+          if (!loggedVoice) {
+            loggedVoice = true;
+            log(`TTS voice: ${v ? `${v.name} (local=${v.localService})` : "browser default"}`);
+          }
           // Watchdog: if the utterance neither ends nor errors in a reasonable window (a
           // stalled/online voice can take ~25s for one word), cancel and move on so a turn is
           // never blocked. Budget scales with text length but caps generously for long greetings.
@@ -455,6 +460,14 @@
         o.connect(g);
         g.connect(ctx.destination);
         const t = ctx.currentTime;
+        // Suspend the context the instant the tone ends so it never holds an open output stream
+        // on coreaudiod alongside a following speechSynthesis utterance — a second live output
+        // client during TTS is a prime suspect for the macOS whole-machine freeze during speak().
+        o.onended = () => {
+          try {
+            if (ctx && ctx.state === "running") ctx.suspend();
+          } catch (_) {}
+        };
         o.start(t);
         o.stop(t + (dur || 0.1));
       } catch (_) {}
