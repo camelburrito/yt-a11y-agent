@@ -1,7 +1,7 @@
 # Architecture — YouTube A11y Agent
 
 > Canonical architecture reference. Grounded in the actual code; keep it in sync when the
-> code changes (see "Keeping this doc current" at the bottom). Last updated: 2026-06-04.
+> code changes (see "Keeping this doc current" at the bottom). Last updated: 2026-06-07.
 
 ## What this is
 
@@ -23,7 +23,7 @@ flowchart TB
     subgraph page[youtube.com page · MAIN world]
       consumer[Consumer agent<br/>src/agent/dev-agent.user.js]
       provider[Tool provider<br/>src/youtube-a11y-agent.user.js]
-      mc[(navigator.modelContext)]
+      mc[(modelContext)]
       dom[YouTube DOM<br/>+ a11y tree]
     end
   end
@@ -74,7 +74,8 @@ flowchart LR
   in production, for persistence across navigations + out-of-page UI). On-device Gemini
   Nano, so no API key, no network, no CSP problem.
 - **L3 Provider** — `src/youtube-a11y-agent.user.js`. Runs in the page's MAIN world
-  (`@grant none`) so `navigator.modelContext` is visible.
+  (`@grant none`) so `modelContext` is visible (`document.modelContext`, or
+  `navigator.modelContext` on Chrome 149).
 
 ## Provider internals
 
@@ -114,7 +115,7 @@ flowchart TB
 sequenceDiagram
   participant YT as YouTube SPA
   participant S as provider script
-  participant MC as navigator.modelContext
+  participant MC as modelContext
   Note over S: on load + yt-navigate-finish + popstate + 1s poll
   YT->>S: route changed (e.g. home → watch)
   S->>S: surface changed?
@@ -170,11 +171,26 @@ flowchart TB
 - **Bridge** — the provider's `ModelContext` exposes only `registerTool` (no list/call),
   so the consumer wraps `registerTool` to build a live registry, honoring each tool's
   `AbortSignal` to drop it when its route ends.
-- **Engine** — runs `LanguageModel` (Gemini Nano) sessions via a **manual JSON tool loop**
-  (`geminiEngine`): Nano's native `create({ tools })` auto-loop is unreliable (narrates
-  instead of calling), so the system prompt requests one strict-JSON action per turn, which
-  we parse, execute against the captured tool, and feed back. Session rebuilds on toolset
-  change.
+- **Engines (two, one protocol)** — both drive tools via the same **manual JSON tool loop**
+  (`JSON_PROTOCOL`: one strict-JSON action per turn, which we parse, execute against the
+  captured tool, and feed back):
+  - **`geminiEngine`** — on-device Gemini Nano (`LanguageModel`), one persistent session
+    per tab, every `session.prompt()` under the 12 s `MODEL_TURN_BUDGET_MS` abort.
+    (Nano's native `create({ tools })` auto-loop narrates instead of calling — and Prompt
+    API function calling is still only "Proposed" in Chromium, so the manual loop stays.)
+  - **`cloudEngine`** — opt-in **BYOK** Gemini API fallback (`gemini-3.1-flash-lite`,
+    pinned stable). Stateless: replays the persisted conversation as real `contents` turns;
+    uses JSON response mode (`responseMimeType`) so the protocol is near-deterministic;
+    every fetch is time-boxed (`CLOUD_TIMEOUT_MS`, and a fetch abort *reliably* ends a
+    request — unlike Nano's abort). Off-device ⇒ **cannot freeze the machine**.
+  - **Dispatch** (`ask()`): deterministic command layer first → kill switch
+    (`state.modelEnabled`, default OFF) → `modelChoice()`: explicit `setEngine()` override,
+    else "auto" prefers cloud when configured (`setCloudKey` dev key or the extension's
+    service-worker transport), else Nano. A custom `useEngine(fn)` mock always wins.
+- **Conversation memory (`convo`)** — the last `CONVO_MAX` turns persist in the tab's
+  `sessionStorage`, surviving the full-page loads that `open_video`/`run_search` trigger.
+  Nano gets a compact "Recent conversation" block per turn; the cloud engine gets the
+  history as real turns; `state.lastReply` ("repeat") is restored from it on load.
 - **Voice** — Web Speech `speechSynthesis` / `SpeechRecognition`, out-of-band from tools.
   `speak()` waits for `voiceschanged`, picks a **local** voice (`pickVoice()` prefers
   `localService` voices; online "Google" voices fetch per-utterance audio that can stall ~25 s
@@ -221,6 +237,13 @@ flowchart TB
 - **Cross-navigation continuity** — navigating provider tools call `pend()` (sessionStorage);
   the consumer `consumePending()`s it on the next page and speaks it. This is what makes
   "search for X" / "open Y" continue speaking after the full-page load that resets the agent.
+- **Gesture relay** (`armGestureRelay`) — for activation-gated APIs. Measured live
+  (2026-06-07, `scripts/verify-gestures.mjs`): `requestPictureInPicture` needs *transient*
+  user activation (~5 s window), which voice latency outlives, and the native PiP button is
+  equally gated — and a bare Shift press grants **no** activation. So the deterministic
+  "picture in picture" command arms a one-shot keydown: the user's next keypress runs
+  `enter_pip` *inside* the trusted handler, where activation is fresh. Escape cancels; the
+  talk key passes through to a new voice turn.
 - **Arrow-key browse mode** — `startBrowse`/`stopBrowse` (armed by the extension on home +
   search): captures arrows (only while armed, not in text fields) so the user steps through
   the current surface's videos hearing each described — Down/Up move, Enter plays (`openIndex`),
@@ -273,12 +296,31 @@ sequenceDiagram
 
 | Decision | Why |
 |----------|-----|
-| MAIN world (`@grant none`) | `navigator.modelContext` is page-context; invisible from isolated worlds |
-| On-device Gemini Nano (Prompt API) | No key, no network, dodges YouTube CSP; user's chosen engine |
+| MAIN world (`@grant none`) | `document.modelContext` (Chrome 149: `navigator.modelContext`) is page-context; invisible from isolated worlds |
+| Deterministic-first; models behind one kill switch | Common verbs must never wait on (or be misrouted by) a model; `state.modelEnabled` default OFF gates Nano **and** cloud |
+| On-device Gemini Nano (Prompt API) | No key, no network; but unbounded inference froze the dev machine → 12 s abort + kill switch |
+| **BYOK cloud fallback (Gemini API)** | Off-device = no freeze risk; public repo = key is the *user's*, never in code: dev key in localStorage, extension key in `chrome.storage.local` read only by the service worker |
 | Read-and-act, no DOM injection | AT-safe; the user's screen reader stays authoritative |
-| Tools text-only; media out-of-band | WebMCP has no standardized multimodal tool I/O yet |
+| Tools text-only; media out-of-band | Settled (see "Media contract" below): WebMCP defines no tool-result content model, and consumer model output is text-only anyway |
 | Centralized `SEL` + shared `readVideoCards` | YouTube selector churn — one place to fix drift |
 | Route-scoped registration | Agent only ever sees tools relevant to the current surface |
+
+## Media contract (settled 2026-06-07 — was open question d)
+
+Who owns speech/listening/vision in this stack, and why this doesn't change when the
+consumer is the extension:
+
+| Modality | Owner | Rationale |
+|----------|-------|-----------|
+| TTS (speaking) | **Consumer agent** (`voice.speak`, single interrupt-driven channel) | No standard assigns TTS to browser/AT; model output is text; the agent is the only layer that knows turn state (barge-in, earcons, progress cues) |
+| STT (listening) | **Consumer agent** (`captureUtterance` behind the `beginListen` freeze gate) | Mic lifecycle is safety-critical (coreaudiod); must stay with the layer that owns the gate |
+| Vision | **Consumer-local tool** (`describe_image`) | Provider passes a `thumb` URL (text); the consumer does the model call (Nano image input, or the cloud engine's `inlineData`) |
+| Tool I/O | **Text only** | WebMCP (draft 2026-06-05) defines **no content-type model** for tool results — multimodal lives in open issues (#41 image I/O, #86 content types, #81 file attachments) with zero merged PRs. The underlying MCP spec (2025-11-25) has `text`/`image`/`audio`/`resource_link` blocks — our `{content:[{type:"text"}]}` envelope and thumb-URL pattern map cleanly onto it (URL ⇒ `resource_link`) when WebMCP adopts a content model. |
+| Consumer model output | **Text only** | Chrome Prompt API (shipped 148) accepts image+audio *input* but emits only text — so speech synthesis can't move into the model layer even in principle today |
+
+Revisit triggers: WebMCP merges a content model (watch webmcp#86/#41), or the Prompt API
+gains output modalities. Until then: **no refactor needed**, and the pattern is
+forward-compatible.
 
 ## Verified vs. pending
 
@@ -300,11 +342,21 @@ sequenceDiagram
     `ytd-feed-filter-chip-bar-renderer yt-chip-cloud-chip-renderer`). **Account name** is NOT
     in the DOM (only after opening the account menu, which we don't); `get_account` returns
     reliable `signedIn` and `name: null`, so greet warmly without a name.
-- **Partial / needs a flagged interactive run:**
-  - **PiP (open question c)** — button + fallback are present; which path actually fires
-    (direct API vs. native-button gesture) needs a real tool call under the flags.
-  - **Transcript open** — reading an open transcript works; opening a closed one is
-    best-effort.
+- **Verified live (2026-06-07, `scripts/verify-gestures.mjs` — trusted CDP input, clean
+  no-gesture controls):**
+  - **PiP (open question c) — RESOLVED.** `requestPictureInPicture` with no gesture →
+    `NotAllowedError`; immediately after a trusted keypress → succeeds; 6 s after →
+    activation expired, fails; untrusted `el.click()` on the native PiP button without
+    activation → no PiP (equally gated). A bare Shift keydown grants **no** activation.
+    ⇒ the consumer's **gesture relay** is the working path.
+  - **Transcript open** — `SEL.watch.transcriptOpenButton` matches the real "Show
+    transcript" button, and an untrusted click opens the engagement panel. The logged-out
+    automation profile gets YouTube's **new tabbed shell** ("In this video": Chapters /
+    Transcript chips, `chip-view-model`) which never hydrated segments — not even with
+    trusted clicks or shadow-DOM-piercing search — so `get_transcript` now also clicks the
+    Transcript chip (`SEL.watch.transcriptTabChip`) and the hydration step stays
+    best-effort, pending one interactive run on a real signed-in profile (where reading
+    open segments was verified 2026-06-04).
 - **Known caveat:** during a preroll **ad**, `<video>.duration`/`currentTime` are the ad's;
   `get_video_info` detects the player's `ad-showing` class and reports `adPlaying` instead
   of ad timing.
@@ -315,7 +367,7 @@ sequenceDiagram
   derivation + fetch via the headless harness, and the Nano describe step interactively
   (returns rich, accurate descriptions). Note: the on-device model can't be driven by
   automation (Chrome gates it to a real user profile), so vision is confirmed interactively.
-- **Open question (d):** multimodal contract when the consumer becomes the extension.
+- **Open question (d): RESOLVED** — see "Media contract" above.
 
 ## Production trajectory
 
@@ -323,14 +375,18 @@ Userscripts → **MV3 extension** — **scaffolded** in `extension/`:
 
 ```mermaid
 flowchart TB
-  pop[popup.html / popup.js<br/>visual fallback]
+  pop[popup.html / popup.js<br/>visual fallback + BYOK key entry]
+  gem[(Gemini API<br/>generativelanguage.googleapis.com)]
+  store[(chrome.storage.local<br/>user's API key)]
   subgraph ext[extension/ · MV3]
-    sw[service worker<br/>Alt+Shift+A → active tab<br/>future: persistent state]
+    sw[service worker<br/>Alt+Shift+A → active tab<br/>BYOK cloud fetch]
   end
+  sw <--> store
+  sw <-->|x-goog-api-key| gem
   subgraph page[youtube.com page]
     iso[bridge.js · ISOLATED<br/>chrome.* ↔ window.postMessage]
     subgraph main[MAIN world]
-      ctl[agent-control.js<br/>talk-first on 1st gesture<br/>Ctrl+Shift+Space talk-back]
+      ctl[agent-control.js<br/>talk-first on 1st gesture<br/>backtick tap-to-talk<br/>installs cloud transport]
       ag[agent.js]
       pv[provider.js]
     end
@@ -347,19 +403,31 @@ flowchart TB
 - Provider + agent run as **`world:"MAIN"` content scripts**, auto-injected on every YouTube
   page (so the agent survives navigation — no manual re-paste). They are the *same* `src/`
   files, synced by `npm run build:extension` (single source of truth).
-- `navigator.modelContext` + the Prompt API live in MAIN; `chrome.*` only works in ISOLATED
+- `document.modelContext` + the Prompt API live in MAIN; `chrome.*` only works in ISOLATED
   — so **`bridge.js`** (ISOLATED) relays popup commands to the MAIN-world agent via
   `window.postMessage`, and `agent-control.js` maps them onto `window.ytAgent`.
+- **BYOK cloud path:** the popup saves the user's Gemini key straight to
+  `chrome.storage.local` (never via the page); only the **service worker** reads it and
+  makes the `generateContent` fetch (page CSP irrelevant, key invisible to page JS).
+  `agent-control.js` installs `ytAgent.setCloudTransport()` so the MAIN-world agent's
+  cloud turns route page → bridge → SW and back by correlation id — request text crosses
+  the bridge, the key never does.
 - **Talk-first entry (accessibility).** A popup click is sighted-first, so `agent-control.js`
   instead **speaks on the user's first interaction** with the page (a valid audio gesture; a
-  screen-reader user generates one immediately) and enables `Ctrl+Shift+Space` talk-back
-  (each press is the fresh gesture the mic needs). `Alt+Shift+A` (a `commands` shortcut via
-  the service worker) triggers the full spoken overview. This is the closest legal
-  approximation of layer-1 "discovery/opt-in" — browsers forbid audio on bare page-load.
+  screen-reader user generates one immediately) and enables **backtick `` ` `` tap-to-talk**
+  via `enableTalk()` (each press is the fresh gesture the mic needs). `Ctrl+Shift+Space`
+  push-to-talk remains a dev-only opt-in (`ytAgent.enablePushToTalk()`), not wired in the
+  extension. `Alt+Shift+A` (a `commands` shortcut via the service worker) triggers the full
+  spoken overview. This is the closest legal approximation of layer-1 "discovery/opt-in" —
+  browsers forbid audio on bare page-load.
 - `popup.html` is a **visual fallback** UI — in the extension's own surface, out of the
   page's a11y tree (AT-safe).
-- **Not yet:** the service worker holds the hotkey dispatch but not **conversation state**;
-  persisting history across full navigations is the next step. Also: icons, Web Store packaging.
+- **Conversation state** persists across full navigations via the agent's `convo` store
+  (tab `sessionStorage`) — chosen over service-worker state because it works identically
+  in the userscript form and needs no extra messaging; the SW carries only what *must* be
+  extension-side (the key + fetch). Icons (`npm run build:icons`) and Web Store docs
+  (`docs/store/`) are in place; remaining for the store: host the privacy policy at a
+  public URL, screenshots, packed upload.
 
 ## Keeping this doc current
 
@@ -376,4 +444,4 @@ When changing `src/youtube-a11y-agent.user.js` or `src/agent/dev-agent.user.js`,
 generated — never edit them directly).
 
 The diagrams reference real symbols (`readVideoCards`, `detectSurface`, `ytAgent`,
-`navigator.modelContext`); if you rename them, update the diagrams too.
+`modelContext`); if you rename them, update the diagrams too.

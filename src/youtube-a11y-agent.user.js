@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent Tools (WebMCP)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.1.0
+// @version      0.9.5
 // @description  Registers WebMCP tools on YouTube so an in-browser AI agent can help users with accessibility needs navigate YouTube. Read-and-act only — never mutates the page or its accessibility tree.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -19,14 +19,15 @@
   "use strict";
 
   const LOG = "[yt-a11y]";
-  const PROVIDER_VERSION = "0.9.4"; // bump on provider changes; printed at boot so a stale
+  const PROVIDER_VERSION = "0.9.5"; // bump on provider changes; printed at boot so a stale
   // content script (old build still injected in an open tab) is obvious in the console.
 
   // ---------------------------------------------------------------------------
   // WebMCP API resolution.
-  // The spec draft and Chrome's docs disagree on the namespace: some builds expose
-  // document.modelContext, others navigator.modelContext. Support both. Resolve lazily
-  // (not once at load) because the object may attach slightly after document-idle.
+  // The spec moved the getter to Document (webmcp PR #184, 2026-05-27); Chrome 149 still
+  // exposes navigator.modelContext, Chrome 150 is expected to follow the spec. Probe
+  // document first, keep the navigator fallback. Resolve lazily (not once at load)
+  // because the object may attach slightly after document-idle.
   // ---------------------------------------------------------------------------
   function getModelContext() {
     return (
@@ -106,6 +107,11 @@
       transcriptText: ".segment-text, yt-formatted-string.segment-text",
       transcriptTime: ".segment-timestamp",
       transcriptOpenButton: "button[aria-label*='transcript' i]",
+      // New tabbed transcript shell (observed live 2026-06-07): the engagement panel opens
+      // as "In this video" with Chapters/Transcript chips; the Transcript chip must be
+      // clicked before segments render. Code filters these buttons by text "Transcript".
+      transcriptTabChip:
+        "ytd-engagement-panel-section-list-renderer[target-id*='transcript'] chip-view-model button, ytd-engagement-panel-section-list-renderer[target-id*='transcript'] button",
     },
 
     watchNext: {
@@ -598,6 +604,15 @@
           if (lines.length === 0) {
             const opened = actuate(SEL.watch.transcriptOpenButton);
             await sleep(1200);
+            // New tabbed shell (2026-06): the panel can open on "Chapters" — click the
+            // "Transcript" chip if present, then re-read.
+            const chip = Array.from(document.querySelectorAll(SEL.watch.transcriptTabChip)).find((b) =>
+              /^transcript$/i.test(txt(b))
+            );
+            if (chip) {
+              chip.click();
+              await sleep(1200);
+            }
             lines = readTranscript(limit);
             if (lines.length === 0) {
               return ok(
@@ -858,19 +873,27 @@
           const v = getVideo();
           if (!v) return ok("No video found on this page.");
           if (document.pictureInPictureElement) return ok("Already in Picture-in-Picture.");
-          // Open question (c): requestPictureInPicture needs transient user activation.
-          // Measure it, then fall back to actuating the native button if the API refuses.
+          // RESOLVED open question (c), measured live 2026-06-07 (scripts/verify-gestures.mjs):
+          // requestPictureInPicture needs TRANSIENT user activation (~5s window). It succeeds
+          // right after a real keypress and fails after voice latency (~6s) — and the native
+          // PiP button is equally gated, so the el.click() fallback is only a backstop. The
+          // consumer's gesture relay ("picture in picture" voice command) runs this tool
+          // inside a fresh trusted keydown, which is the path that actually works.
           const active = !!(navigator.userActivation && navigator.userActivation.isActive);
           try {
             await v.requestPictureInPicture();
-            return ok(`Entered Picture-in-Picture. (userActivation.isActive was ${active})`);
+            console.log(`${LOG} enter_pip: direct API ok (userActivation.isActive=${active})`);
+            return ok("The video is now in a floating window. Say exit picture in picture to bring it back.");
           } catch (e) {
             const clicked = actuate(SEL.watch.pipButton);
+            await sleep(500);
+            const inPip = !!document.pictureInPictureElement;
+            console.log(
+              `${LOG} enter_pip: direct API failed (userActivation.isActive=${active}: ${e.message}); button fallback clicked=${clicked} inPip=${inPip}`
+            );
+            if (inPip) return ok("The video is now in a floating window. Say exit picture in picture to bring it back.");
             return ok(
-              `Direct Picture-in-Picture failed (userActivation.isActive=${active}: ${e.message}). ` +
-                (clicked
-                  ? "I clicked the native PiP button instead — let me know if it worked."
-                  : "No native PiP button was found.")
+              "I couldn't pop the video out — the browser needs a fresh key press for that. Say picture in picture again, and press Enter when I ask."
             );
           }
         },
@@ -945,6 +968,22 @@
     const { signal } = currentController;
 
     const tools = toolsForSurface(surface);
+
+    // Spec-current metadata (WebMCP draft, 2026-06): `title` is a human-readable label for
+    // future browser UI, and `annotations.readOnlyHint` marks tools that only READ the page
+    // — cautious consumers can call them without confirmation. Unknown dictionary members
+    // are ignored by builds that predate them (WebIDL), so this is safe everywhere.
+    const READ_ONLY = new Set([
+      "where_am_i", "get_account", "list_home_feed", "describe_home", "list_categories",
+      "list_results", "get_video_info", "get_transcript", "summarize_video",
+      "plain_language_summary", "list_up_next", "get_comments", "summarize_comments",
+      "get_pinned_comment",
+    ]);
+    for (const tool of tools) {
+      if (!tool.title) tool.title = tool.name.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+      if (READ_ONLY.has(tool.name)) tool.annotations = { readOnlyHint: true, ...(tool.annotations || {}) };
+    }
+
     const registered = [];
     for (const tool of tools) {
       try {

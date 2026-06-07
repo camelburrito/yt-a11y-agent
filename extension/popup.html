@@ -81,6 +81,34 @@
       Use on-device Nano transcription (experimental, slower)
     </label>
 
+    <fieldset style="border: 1px solid rgba(127,127,127,0.4); border-radius: 8px; margin: 8px 0; padding: 8px">
+      <legend style="font-size: 12px">AI replies (optional, bring your own key)</legend>
+      <label>
+        <input type="checkbox" id="model" />
+        Enable AI replies
+      </label>
+      <div class="row" style="margin-top: 6px">
+        <input
+          type="password"
+          id="apikey"
+          placeholder="Gemini API key (AIza…)"
+          aria-label="Gemini API key"
+          style="flex: 1; padding: 6px; border-radius: 6px; border: 1px solid currentColor; background: transparent; color: inherit"
+        />
+        <button id="savekey" style="flex: 0 0 auto">Save</button>
+      </div>
+      <div class="row">
+        <button id="clearkey">Remove key</button>
+      </div>
+      <p class="sub" style="margin: 4px 0 0">
+        Your key is stored only in this browser (extension storage) and used only to send your
+        spoken requests — plus page text the tools read, like video titles — to Google's Gemini
+        API. It is never sent to the developer. Google may use free-tier prompts to improve its
+        products. Without a key, AI replies aren't available — but every direct command (play,
+        pause, search, browse, open a number…) always works with no AI at all.
+      </p>
+    </fieldset>
+
     <label for="vol">Feedback tone volume</label>
     <input type="range" id="vol" min="0" max="2" step="0.1" value="1" style="width:100%" aria-label="Feedback tone volume" />
 

@@ -20,8 +20,9 @@ drives it for you.
 ## Status
 
 All journeys are **implemented**, and their selectors are **verified against live YouTube**
-via a headless harness (`npm run verify:selectors`). Two paths remain partially verified
-(noted below) because they need flags or a user gesture.
+via a headless harness (`npm run verify:selectors`). Two paths have one residual check each
+(noted below): transcript content hydration on a real signed-in profile, and confirming the
+PiP gesture relay by voice.
 
 | Journey      | Tools | State |
 |--------------|-------|-------|
@@ -30,17 +31,25 @@ via a headless harness (`npm run verify:selectors`). Two paths remain partially 
 | Watch        | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` | ✅ verified live¹ |
 | Watch Next   | `list_up_next`, `play_next`, `set_autoplay` | ✅ verified live |
 | Comments     | `get_comments`, `summarize_comments`, `get_pinned_comment` | ✅ verified live |
-| Picture-in-Picture | `enter_pip`, `exit_pip` | ✅ button + fallback verified² |
+| Picture-in-Picture | `enter_pip`, `exit_pip` | ✅ gesture path measured live² |
 
 ¹ Info/playback/captions/native controls verified. `get_transcript` *reads* a transcript
-fine; programmatically *opening* a closed transcript panel is best-effort.
-² The PiP button and fallback are present; the direct-API vs. user-gesture path (open
-question c) needs a flagged interactive run. `get_video_info` now flags `adPlaying` so the
-agent doesn't read a preroll ad's timing as the video's.
+fine; *opening* a closed one clicks the "Show transcript" button (selector verified live
+2026-06-07) and handles YouTube's new tabbed transcript panel — content hydration could
+not be reproduced under automation (logged-out profiles get a non-hydrating variant), so
+that last step is best-effort.
+² Measured live (2026-06-07, `npm run verify:gestures`): `requestPictureInPicture` needs
+*transient user activation* (~5 s), which voice latency outlives — and the native PiP
+button is gated the same way. So the agent uses a **gesture relay**: say "picture in
+picture", then press Enter — the tool runs inside that fresh keypress and succeeds.
+`get_video_info` flags `adPlaying` so the agent doesn't read a preroll ad's timing as the
+video's.
 
-`where_am_i` works everywhere and tells the agent which surface you're on. The AI agent
-itself runs on **Chrome's on-device Gemini Nano** (no API key) — see
-[`src/agent/`](src/agent/).
+`where_am_i` works everywhere and tells the agent which surface you're on. Direct commands
+(play, pause, search, browse…) are **deterministic — no AI involved**. For conversational
+replies the agent can use **Chrome's on-device Gemini Nano** (no API key) or an optional
+**bring-your-own-key Gemini API fallback** (your key, stored only in your browser); both
+are **off by default** behind a kill switch — see [`src/agent/`](src/agent/).
 
 ## Getting started
 
@@ -75,8 +84,8 @@ The project runs two scripts on YouTube: the **provider** (registers the tools) 
 **agent** (the AI that uses them). Three ways to load them, easiest first:
 
 **Option 0 — Chrome extension (recommended).** Auto-injects on every YouTube page (no
-re-pasting) and is **hands-free**: it speaks when you first interact, welcomes you by name
-when signed in, and lets you **browse the feed with the arrow keys** (Down/Up to move + hear
+re-pasting) and is **hands-free**: it speaks when you first interact, welcomes you back
+warmly when signed in, and lets you **browse the feed with the arrow keys** (Down/Up to move + hear
 each video, Enter to play, Escape to exit — an arrow steps you back in). **Tap the `` ` ``
 (backtick) key once and speak** — it sends automatically when you pause (the mic is never
 held open), and tapping again interrupts; earcons + spoken cues tell you what's happening.
@@ -110,11 +119,14 @@ On <https://www.youtube.com>, open the DevTools **Console**. You should see line
 
 ```
 [yt-a11y] surface="home" path="/" registered 5 tool(s): where_am_i, list_home_feed, ...
-[yt-a11y-agent] ready. Gemini Nano: available. voice: tts=true stt=true
+[yt-a11y-agent] ready. Gemini Nano: available. model: OFF (kill switch — deterministic-only; ytAgent.setModel(true) to opt in). cloud: not configured. voice: tts=true stt=true
 ```
 
-If Gemini shows `downloadable`/`downloading`, the model is fetching — give it a few minutes
-(it only happens once).
+`model: OFF` is expected — the on-device/cloud model is **disabled by default** (it froze
+some machines; see the kill-switch note in `CLAUDE.md`). Direct commands work without it;
+opt in with `ytAgent.setModel(true)` or add a cloud key (extension popup). If Gemini shows
+`downloadable`/`downloading`, the on-device model is fetching — give it a few minutes (it
+only happens once).
 
 ### Step 4 — Use it
 
@@ -136,8 +148,12 @@ as the page navigates.
 
 **Vision** (describe what a thumbnail looks like, for a non-sighted user): ask
 `await ytAgent.ask("describe the thumbnail of the second video")`, or directly
-`await ytAgent.describeThumbnail(1)`. It uses on-device Nano image understanding and returns
-a concrete spoken description (subjects, setting, on-screen text, mood).
+`await ytAgent.describeThumbnail(1)`. Vision needs the model enabled
+(`ytAgent.setModel(true)` — it's off by default; otherwise it returns "Image descriptions
+are off while the model is disabled"). It uses on-device Nano image understanding by
+default, or your BYOK cloud Gemini key if one is configured (then the description runs
+off-device), and returns a concrete spoken description (subjects, setting, on-screen text,
+mood).
 
 ### Troubleshooting
 
@@ -164,7 +180,11 @@ To call tools by hand instead of through the agent, use a WebMCP inspector such 
 - **Read-and-act, AT-safe:** tools return plain text and perform navigation/native
   actions; nothing mutates the page or its accessibility tree.
 - **Media out-of-band:** speech and vision are handled in the script layer; tools
-  themselves pass text only (WebMCP has no standard multimodal tool I/O yet).
+  themselves pass text only (re-checked June 2026: WebMCP still defines no multimodal
+  tool I/O — see the settled media contract in the architecture doc).
+- **Deterministic first, AI last:** common commands are regex-matched and run instantly;
+  only conversational requests reach a model, and only when the kill switch is on
+  (`ytAgent.setModel(true)`), via on-device Nano or the opt-in BYOK cloud engine.
 
 See [`docs/architecture/yt-a11y-agent.md`](docs/architecture/yt-a11y-agent.md) for the
 full architecture (with diagrams), and [`CLAUDE.md`](CLAUDE.md) for conventions and open
@@ -178,12 +198,18 @@ headless selector verification:
 ```bash
 npm install            # installs puppeteer-core (drives your installed Chrome)
 npm run verify:selectors
+npm run verify:gestures   # headful: PiP user-activation + transcript-open paths
+npm run build:extension   # resync extension/provider.js + agent.js from src/
+npm run build:icons       # regenerate extension icons from the inline SVG
 ```
 
-This runs the provider's actual extraction logic against live YouTube (`/results` → a real
-`/watch`) and prints what each journey scrapes — the automated version of "open DevTools and
-check the selectors still work." Run it whenever YouTube's DOM might have drifted. It checks
-the DOM layer only (no WebMCP/Gemini flags needed).
+`verify:selectors` runs the provider's actual extraction logic against live YouTube
+(`/results` → a real `/watch`) and prints what each journey scrapes — the automated version
+of "open DevTools and check the selectors still work." Run it whenever YouTube's DOM might
+have drifted. It checks the DOM layer only (no WebMCP/Gemini flags needed).
+`verify:gestures` opens a visible Chrome window and measures the user-activation-gated
+paths (PiP, transcript-open) with trusted CDP input — it's how open question (c) was
+resolved.
 
 ## License
 

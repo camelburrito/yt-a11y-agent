@@ -12,11 +12,13 @@ user's existing assistive tech reports stays authoritative.
 
 - **Main-world injection.** WebMCP exposes `document.modelContext` /
   `navigator.modelContext` as page-context objects. They are invisible from an isolated
-  content-script world, so our code MUST run in the page's MAIN world.
-  - **Now:** a Tampermonkey userscript with `@grant none` (that grant is what keeps it
-    in MAIN — see header comment in the script).
-  - **Later:** an MV3 extension content script declared with `world: "MAIN"`. Same
-    runtime contract, just a real distributable. The tool code should port unchanged.
+  content-script world, so our code MUST run in the page's MAIN world. Two forms of the
+  SAME code (synced by `npm run build:extension`):
+  - **Userscript form (dev/spike):** a Tampermonkey userscript with `@grant none` (that
+    grant is what keeps it in MAIN — see header comment in the script).
+  - **Extension form (production):** an MV3 content script declared `world: "MAIN"`
+    (`extension/manifest.json`), packaged for the Web Store (icons, popup with BYOK key
+    entry, privacy/permission docs in `docs/store/`). Same runtime contract.
 - **Route-scoped registration via AbortController.** YouTube is an SPA. Each route
   (surface) gets a fresh `AbortController`; tools are registered with `{ signal }`. On
   navigation we `abort()` the old controller — which unregisters that route's tools for
@@ -37,10 +39,11 @@ user's existing assistive tech reports stays authoritative.
   text; the speaking happens elsewhere.
 - **Three layers.** (1) *Discovery/opt-in* — browser/AT surfaces the agent to a screen-
   reader user, who opts in (platform-owned; harness simulates via `ytAgent.activate()`).
-  (2) *Consumer agent* — the MCP client (on-device Gemini Nano via the Prompt API + Web
-  Speech) that lists/calls our tools; dev harness at `src/agent/dev-agent.user.js`,
-  production = MV3 extension (for persistence across navigations + out-of-page UI; the
-  model is on-device so CSP is a non-issue). Tools are driven by a **manual JSON loop** —
+  (2) *Consumer agent* — the MCP client (on-device Gemini Nano via the Prompt API, or the
+  opt-in BYOK cloud Gemini engine, + Web Speech) that lists/calls our tools; dev harness at
+  `src/agent/dev-agent.user.js`, production = MV3 extension (for persistence across
+  navigations + out-of-page UI; cloud fetches run in the service worker, so page CSP is a
+  non-issue either way). Tools are driven by a **manual JSON loop** —
   Nano's native tool-calling narrates instead of executing, so don't rely on it; TTS needs
   the voices/cancel/resume care in `speak()`. **Interaction model (v0.9.3):** primary input is
   **tap-to-talk** (`enableTalk`, default the backtick `` ` `` key) — press once and speak;
@@ -70,7 +73,7 @@ user's existing assistive tech reports stays authoritative.
 | watch   | `/watch` **or `/shorts`**    | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` ✅ verified live (transcript-open best-effort). Shorts resolves here so play/pause/seek (generic `video` selector) work; sidebar/transcript tools no-op on Shorts. |
 | watch-next | `/watch` (same surface)   | `list_up_next`, `play_next`, `set_autoplay` ✅ verified live |
 | comments | `/watch` (same surface)    | `get_comments`, `summarize_comments`, `get_pinned_comment` ✅ verified live |
-| pip     | `/watch` (same surface)      | `enter_pip`, `exit_pip` 🟡 button+fallback present; gesture path needs flagged run |
+| pip     | `/watch` (same surface)      | `enter_pip`, `exit_pip` ✅ gesture path measured live (2026-06-07): needs ≤5s-fresh activation, button fallback equally gated → agent's **gesture relay** ("picture in picture" → press Enter) is the working path |
 | channel | `/@*`, `/channel/*`, `/c/*`  | (cross-cutting only for now) |
 | other   | anything else                | (cross-cutting only) |
 
@@ -136,16 +139,27 @@ boundary text-only (provider passes a URL; the consumer does the vision).
   tool on `/watch`, actuates the page `<video>` elsewhere), because a "pause" on the home page was
   falling through to Nano. **Rule: never let a common command reach the model; the model is a
   last-resort, time-boxed fallback only.**
-- **⚠️ Model kill switch (v0.9.21) — Nano is OFF by default.** A repeat beachball took down the
-  whole machine (including the dev terminal) even after the 12 s abort cap shipped, and it is
-  **unproven** that `AbortController` stops the native inference (spec only mandates promise
-  rejection). So **all** Nano inference — text turns (`geminiEngine`) *and* vision
-  (`describeImage`) — is gated behind `state.modelEnabled` (persisted in
-  `localStorage.ytA11yModelEnabled`, default OFF). With the model off, an unrecognized utterance
-  gets a short deterministic coaching reply; greeting, commands, and arrow-browse all work
-  normally. Opt in with `ytAgent.setModel(true)` (only for instrumented measurement runs — watch
-  the `max main-thread freeze` log); `setModel(false)` also drops any live session. The startup
-  banner logs the switch state. Do not add any model call outside this gate.
+- **⚠️ Model kill switch (v0.9.21) — ALL model paths are OFF by default.** A repeat beachball took
+  down the whole machine (including the dev terminal) even after the 12 s abort cap shipped, and
+  it is **unproven** that `AbortController` stops native Nano inference (spec only mandates
+  promise rejection). So **every** model call — Nano text (`geminiEngine`), cloud text
+  (`cloudEngine`), and vision (`describeImage` / `cloudDescribeImage`) — is gated behind
+  `state.modelEnabled` (persisted in `localStorage.ytA11yModelEnabled`, default OFF). With the
+  model off, an unrecognized utterance gets a short deterministic coaching reply; greeting,
+  commands, and arrow-browse all work normally. Opt in with `ytAgent.setModel(true)`;
+  `setModel(false)` also drops any live session. The startup banner logs the switch state.
+  Do not add any model call outside this gate.
+- **Cloud engine (v0.10.0) — opt-in BYOK Gemini API fallback; the safe way to turn the model on.**
+  `cloudEngine` mirrors the Nano JSON tool loop but runs OFF-DEVICE (cannot freeze the machine;
+  fetch abort actually works) — `modelChoice()` "auto" prefers it whenever it's configured.
+  Model pinned to `gemini-3.1-flash-lite` (**never** the `gemini-flash-latest` alias — parked on
+  a preview since 2026-01-21). **The key is never in this public repo**: dev harness =
+  `ytAgent.setCloudKey()` → localStorage (page-visible, dev only); extension = popup →
+  `chrome.storage.local`, read ONLY by the service worker which does the fetch — the key never
+  enters MAIN-world/page context and never crosses the bridge (only request text + correlation
+  ids do). Free-tier prompts may be used by Google for product improvement (disclosed in popup +
+  privacy policy). Conversation history (`convo`, sessionStorage, last ~12 turns) survives full
+  navigations and feeds both engines.
 - **TTS voice (safeguard, not the freeze cause).** `pickVoice()` still prefers **LOCAL, COMPACT**
   voices and excludes `Enhanced/Premium/Siri/Eloquence` (`HEAVY_VOICE`) — a reasonable safeguard,
   though on the dev Mac no heavy voices were installed (compact "Samantha" was already used, so
@@ -229,22 +243,30 @@ boundary text-only (provider passes a URL; the consumer does the vision).
 ## Open questions — resolve empirically, not by reading specs
 
 1. ~~**API namespace: `document.modelContext` vs `navigator.modelContext`.**~~
-   **RESOLVED (2026-06-04, Chrome + `#enable-webmcp-testing`):** Chrome populates
-   **`navigator.modelContext`**; `document.modelContext` is `undefined`. The provider
-   object is a `ModelContext` whose only method is **`registerTool(tool, { signal })`** —
-   there is no `listTools`/`callTool` on the provider side; invocation is the MCP
-   consumer's job. We keep the `??` probe in case Chrome relocates it.
+   **RESOLVED (2026-06-04; updated 2026-06-07):** Chrome 149 populates
+   **`navigator.modelContext`**, but the SPEC moved the getter to **`document.modelContext`**
+   (webmcp PR #184, 2026-05-27) and Chrome 150 is expected to follow — both scripts now probe
+   document-first with the navigator fallback. The provider object is a `ModelContext` whose
+   only method is **`registerTool(tool, { signal })`** — invocation is the MCP consumer's job.
+   Re-probe each Chrome release.
 2. ~~**Permissions Policy for `tools` on youtube.com.**~~
    **RESOLVED (2026-06-04):** A main-world-injected script registers fine on youtube.com
    under the default `tools` policy — `registered 5 tool(s)` on home, no throw. The
    day-one spike passed.
-3. **PiP transient user activation.** `requestPictureInPicture()` needs a real gesture. A
-   tool call may not carry activation. Measure `navigator.userActivation.isActive` inside
-   an `enter_pip` tool; if false, fall back to actuating the real PiP button
-   (`SEL.watch.pipButton`). Same pattern likely applies to other gesture-gated APIs.
-4. **Multimodal media handling.** Until WebMCP standardizes multimodal tool I/O, settle
-   the in-script contract for Web Speech and vision (who speaks, who listens, how results
-   feed back to the agent as text).
+3. ~~**PiP transient user activation.**~~
+   **RESOLVED (2026-06-07, `npm run verify:gestures` — trusted CDP input, clean controls):**
+   `requestPictureInPicture()` needs transient activation (~5 s window): fails cold
+   (`NotAllowedError`), succeeds right after a trusted keypress, fails 6 s later, and the
+   native-button `el.click()` fallback is **equally gated** (no PiP without activation; Shift
+   grants none). The working path is the agent's **gesture relay** (`armGestureRelay`): the
+   deterministic "picture in picture" command runs `enter_pip` inside the user's next trusted
+   keydown. Reuse this relay pattern for any other gesture-gated API.
+4. ~~**Multimodal media handling.**~~
+   **RESOLVED (2026-06-07, by decision — documented in `docs/architecture/yt-a11y-agent.md`
+   "Media contract"):** consumer owns TTS/STT/vision; tools stay text-only. WebMCP defines no
+   tool-result content model (multimodal = open issues #41/#86/#81); MCP's content blocks are
+   the likely future and our shapes map onto them; Prompt API output is text-only anyway.
+   Revisit if webmcp#86/#41 merge.
 
 ## Run / test
 
@@ -260,6 +282,11 @@ boundary text-only (provider passes a URL; the consumer does the vision).
    against the installed Chrome) runs the provider's real extraction logic against live
    YouTube and prints what each journey scrapes. Run it after any `SEL`/`readVideoCards`
    change; no flags needed (it checks the DOM layer, not WebMCP/Gemini).
+   **Gesture verification:** `npm run verify:gestures` (headful) measures the
+   user-activation-gated paths (PiP, transcript-open) with trusted CDP input. ⚠️ When
+   measuring activation, never use `page.evaluate` (puppeteer passes `userGesture:true`,
+   silently granting activation) — use raw `Runtime.evaluate` with `userGesture:false`,
+   as the script does.
 5. **Freeze diagnosis (macOS).** The whole-machine-freeze root cause is still *inferred*, not
    captured — confirm it before trusting any one fix (we've misattributed this once). To get a
    real artifact, in a Terminal run `log stream --predicate 'process == "coreaudiod"' --info`
@@ -275,5 +302,7 @@ boundary text-only (provider passes a URL; the consumer does the vision).
 ## Status
 
 All journeys **implemented**; selectors **verified live** (home interactively, others via
-the headless harness). PiP gesture path + transcript-open are partial (need a flagged
-interactive run). Agent engine: on-device Gemini Nano. See `docs/HANDOFF.md` for details.
+the headless harness). PiP gesture path **resolved** (gesture relay); transcript-open
+verified to automation's limit (hydration needs one interactive check). Agent engines:
+on-device Gemini Nano + opt-in BYOK cloud Gemini, both behind the kill switch (default
+OFF; deterministic commands always work). See `docs/HANDOFF.md` for details.

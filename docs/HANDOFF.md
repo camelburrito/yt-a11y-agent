@@ -1,7 +1,7 @@
 # Handoff — YouTube A11y Agent
 
 > Context anchor for resuming work across sessions. Read this + `CLAUDE.md` first.
-> Last updated: 2026-06-04.
+> Last updated: 2026-06-07.
 
 ## What this project is
 
@@ -58,7 +58,8 @@ control (offer, don't autoplay).**
 | Provider backbone (route-scoped registration via AbortController) | ✅ done, pushed |
 | Home journey tools (`list_home_feed`, `describe_home`, `open_video`, `load_more_home`) | ✅ verified live |
 | Cross-cutting `where_am_i` | ✅ done |
-| Consumer agent (dev harness, on-device Gemini Nano) | ✅ `src/agent/dev-agent.user.js` **v0.9.21** — **manual JSON tool loop**; verified end-to-end (tool call → page navigation observed) |
+| Consumer agent (dev harness, on-device Gemini Nano) | ✅ `src/agent/dev-agent.user.js` **v0.10.0** — **manual JSON tool loop**; verified end-to-end (tool call → page navigation observed) |
+| v0.10.0 — BYOK cloud fallback + conversation persistence + PiP gesture relay (2026-06-07) | ✅ Cleared the open-items list except the freeze-measurement run. (1) **`cloudEngine`** — opt-in BYOK Gemini API fallback (pinned `gemini-3.1-flash-lite`; NEVER the `-latest` alias — parked on a preview since 2026-01-21), same JSON tool-loop protocol as Nano, JSON response mode, `CLOUD_TIMEOUT_MS` fetch abort (reliable, unlike Nano's), behind the SAME `state.modelEnabled` kill switch; `modelChoice()` "auto" prefers cloud (off-device = no freeze risk). Key paths: dev = `ytAgent.setCloudKey()` (localStorage, page-visible, dev only); extension = popup → `chrome.storage.local`, read ONLY by the service worker which does the fetch (page CSP irrelevant, key never in page context; relay = agent-control `setCloudTransport` → bridge → SW by correlation id — the key never crosses the bridge). Vision routes through cloud too (`cloudDescribeImage`, inlineData) when cloud is the engine. (2) **Conversation memory (`convo`)** — last 12 turns in tab `sessionStorage`, survives full navigations; Nano gets a compact per-turn block, cloud gets real history turns, `lastReply`/"repeat" restored cross-nav. (3) **PiP gesture relay** — "picture in picture" arms a one-shot keydown that runs `enter_pip` inside the trusted handler (see verified facts). (4) Provider 0.9.5: spec-current `title` + `annotations.readOnlyHint`, transcript Transcript-chip fallback (`SEL.watch.transcriptTabChip`), spoken-friendly `enter_pip` replies. (5) Extension 0.2.0: icons (`npm run build:icons`), `storage` permission, `generativelanguage.googleapis.com` host permission, popup key entry + "AI replies" toggle synced to the kill switch; Web Store docs in `docs/store/`. ⚠️ Needs interactive verification: cloud turn end-to-end with a real key (popup→SW→Gemini→spoken reply), conversation continuity after open/search, PiP relay by voice. |
 | v0.9.21 — MODEL KILL SWITCH (Nano off by default) | ✅ A repeat whole-machine beachball (took down the dev terminal too) happened even after v0.9.19/0.9.20 shipped — and whether the 12 s `AbortController` actually stops native Nano inference is still UNMEASURED (the crash ate the v0.9.20 instrumented run's logs). Decision: the model cannot be on any default path. ALL Nano inference — text (`geminiEngine`) and vision (`describeImage`) — is now gated behind `state.modelEnabled` (localStorage `ytA11yModelEnabled`, **default OFF**). Model-off UX: unrecognized utterances get a short deterministic coaching reply ("I only handle direct commands… play, pause, next, search, list, go home"); greeting/commands/browse are unaffected (already deterministic). `ytAgent.setModel(true)` opts in (persisted) for the instrumented measurement run — the `max main-thread freeze …ms` log will finally show whether abort frees the machine (~12000ms) or is cosmetic (~200000ms); `setModel(false)` also destroys any live session. Startup banner shows the switch state. Next: measure abort under opt-in, then pick rescue-Nano vs cloud-fallback vs stay-deterministic. |
 | v0.9.20 — model-free greeting + freeze instrumentation | 🟡 "Freezes even on home" root cause (workflow + adversarial review): the **greeting was a model call**. `activate()` ran `destroySession()` then `ask("[Session start…]")`; bracketed text bypasses `handleCommand`, so it always hit Nano — with a cold ~20-29s `LM.create` (outside the 12s budget) + a multi-hop turn. Fires from Alt+Shift+A / popup Activate / `start()`, so invoking the agent on home guaranteed a freeze. Fix: `activate()` now composes the greeting **deterministically** (direct `get_account`/`list_categories`/`feed`), no `destroySession`, no model; bracketed text returns "" (never reaches the model). ⚠️ **Open, must be MEASURED:** does the 12s `AbortController` actually end the beachball, or is it cosmetic (spec only mandates promise rejection; a Chromium thread shows aborted Nano inference keeps running)? v0.9.20 adds a **main-thread `requestAnimationFrame` liveness probe** in `geminiEngine` (`max main-thread freeze …ms`) + logs how long after `abort()` the promise settles — the next repro on the affected machine settles it. Durable answer regardless: **prevention** — never let the greeting or a command reach the model. Reliability tuning (warm-base+clone, output-language, pause-video) and an opt-in MV3-background cloud-Gemini fallback are scoped but not yet built (see `docs/research/voice-audio-anti-freeze.md`). |
 | v0.9.19 — FREEZE ROOT CAUSE CONFIRMED: unbounded Nano inference | ✅ Pinned by isolation: `ytAgent.ask("pause")` (no audio) did NOT freeze; saying "pause" with earcons OFF DID, with `session.prompt() hop 0 = 200828ms` (3+ min) == the beachball. NOT mic/audio/TTS/voice — those were disproven by reproduction (3 clean `coreaudiod` logs; a 12 s muted TTS run with **0** main-thread stalls; 64 GB/58% free RAM; Chrome exposes only compact voices). Two distinct bugs: (a) "pause" was gated behind `onWatch`, so on the home page it fell through to Nano; (b) `session.prompt()` had no time cap. Fixes: **`MODEL_TURN_BUDGET_MS` (12 s)** AbortController cap on every model turn (abort + `destroySession` + fallback) so Nano can't freeze the page for minutes; **playback verbs (pause/play/skip/captions/next) now deterministic on EVERY surface** (provider tool on `/watch`, raw `<video>` elsewhere). Earlier v0.9.16-0.9.18 (short replies, earcon ctx suspend, compact-voice) are harmless hardening but were **not** the cause. ⚠️ Caveat: even healthy Nano here was sometimes 200s — the on-device model is unreliable on this machine; deterministic-first must cover as much as possible. |
@@ -83,13 +84,39 @@ control (offer, don't autoplay).**
 | Search / Watch / Watch-Next / Comments / PiP journeys | ✅ **implemented + selectors verified live** (headless harness) |
 | Architecture doc with diagrams | ✅ `docs/architecture/yt-a11y-agent.md` |
 | Headless selector verification | ✅ `scripts/verify-selectors.mjs` (`npm run verify:selectors`) |
-| PiP gesture path (open q. c) + transcript-open path | 🟡 partial — need a flagged interactive run |
-| Production extension (MV3) | ✅ **scaffolded** — `extension/` (MAIN-world content scripts reuse `src/` via `npm run build:extension`; ISOLATED `bridge.js`; service worker for the global hotkey; popup as visual fallback). **Talk-first**: speaks on the user's first interaction + `Ctrl+Shift+Space` talk-back + `Alt+Shift+A` overview — no sighted click. Next: conversation **state** in the service worker (survive full-nav); icons; Web Store packaging |
+| PiP gesture path (open q. c) + transcript-open path | ✅ measured live 2026-06-07 (`npm run verify:gestures`) — PiP needs ≤5s-fresh activation → gesture relay shipped; transcript open verified to automation's limit (new tabbed shell handled; hydration needs one interactive check) |
+| Production extension (MV3) | ✅ **shipped & being packaged** — `extension/` v0.2.0 (MAIN-world content scripts reuse `src/` via `npm run build:extension`; ISOLATED `bridge.js`; service worker for the global hotkey + **BYOK key storage + the Gemini fetch**; popup as visual fallback + API-key entry). **Talk-first**: speaks on the user's first interaction + backtick `` ` `` tap-to-talk (`enableTalk`) + `Alt+Shift+A` overview — no sighted click. Done since scaffold: conversation **state** persists across full-nav (via the agent's `convo` sessionStorage store — deliberately NOT the service worker, so it works in the userscript form too); icons; privacy policy + permission justifications (`docs/store/`). Remaining for the Web Store: host the privacy policy at a public URL, screenshots, packed upload |
 
 ## Verified facts (don't re-litigate)
 
-- **API namespace:** Chrome populates `navigator.modelContext`. `document.modelContext` is
-  `undefined`. (We keep the `??` probe anyway.)
+- **API namespace:** Chrome 149 populates `navigator.modelContext`; the SPEC moved the
+  getter to `document.modelContext` (webmcp PR #184, 2026-05-27) and Chrome 150 is expected
+  to follow. Both scripts probe document-first with the navigator fallback — re-probe each
+  Chrome release.
+- **Abort-unregisters is an implementation gap, not spec.** The draft says a tool's
+  `AbortSignal` DOES unregister it (and fires `toolchange`); Chrome's flagged build doesn't
+  honor it yet — that's why re-registers throw `Duplicate tool name`. Keep the
+  duplicate-tolerant registration; re-test per release.
+- **PiP / user activation (2026-06-07, `npm run verify:gestures` — trusted CDP input with
+  clean no-gesture controls; beware: puppeteer's `page.evaluate` silently GRANTS activation,
+  use raw `Runtime.evaluate` with `userGesture:false` for measurements):**
+  - No gesture → `requestPictureInPicture` throws `NotAllowedError`.
+  - Immediately after a trusted keypress → succeeds. **6 s after → expired, fails** (the
+    transient-activation window is ~5 s; voice latency outlives it).
+  - Untrusted `el.click()` on the native PiP button with no activation → **no PiP** (the
+    button is gated exactly like the API).
+  - A bare **Shift** keydown grants **no** activation.
+  - ⇒ Working path = the agent's **gesture relay** ("picture in picture" → "Press Enter" →
+    tool runs inside the trusted keydown).
+- **Transcript panel (2026-06-07):** the open button + `SEL.watch.transcriptOpenButton`
+  are correct, and an untrusted click opens the panel. Logged-out/automation profiles get a
+  NEW tabbed shell ("In this video": Chapters/Transcript `chip-view-model` chips;
+  `ytd-transcript-segment-renderer` absent) that never hydrated content under automation —
+  trusted clicks and shadow-DOM-piercing search included. Provider now clicks the
+  Transcript chip as a fallback; hydration needs one interactive check on a real profile.
+- **YouTube CSP (checked live 2026-06-07):** no `connect-src`/`default-src` — a MAIN-world
+  fetch to the Gemini API *would* work today. We route via the service worker anyway (CSP
+  can change; MAIN-world keys are stealable; SW is the reviewable pattern).
 - **Provider API surface:** `ModelContext` has only `registerTool(tool, {signal})`. No
   `listTools`/`callTool` on the provider — invocation is the consumer's job. The consumer
   bridge captures tools by **wrapping `registerTool`** (and honoring the AbortSignal to
@@ -106,16 +133,17 @@ control (offer, don't autoplay).**
 
 ## Known limitations / gotchas
 
-- **Engine is on-device Gemini Nano (Prompt API) — by user decision, no external LLM.**
-  This removes the API key and the CSP problem entirely (the page never fetches a model
-  endpoint). Requires Chrome flags `#prompt-api-for-gemini-nano` and
-  `#optimization-guide-on-device-model`; the model downloads on first use. Check with
-  `await ytAgent.availability()`. **Nano's native tool-calling is confirmed unreliable** —
-  it narrates "I'm calling a tool…" instead of emitting a real call, so nothing executes.
-  The agent therefore uses a **manual JSON tool loop** (`geminiEngine`): the system prompt
-  asks for one strict-JSON action per turn, which we parse, run, and feed back. This is
-  what actually works on-device (verified interactively in the linked session). Engine is
-  pluggable: `ytAgent.useEngine(fn)`.
+- **Engines: on-device Gemini Nano + opt-in BYOK cloud fallback (decision updated
+  2026-06-07).** The original "no external LLM" stance was relaxed after the freeze saga
+  proved Nano unreliable on the dev machine: the cloud engine is **opt-in, BYOK** (the
+  user's own AI Studio key — never the repo's, never the developer's), runs off-device
+  (cannot freeze the machine), and sits behind the same kill switch. Nano still requires
+  `#prompt-api-for-gemini-nano` + `#optimization-guide-on-device-model`; check
+  `await ytAgent.availability()`. **Nano's native tool-calling is confirmed unreliable**
+  (narrates instead of calling — and Prompt API function calling is still only "Proposed"
+  upstream), so BOTH engines use the **manual JSON tool loop** (one strict-JSON action per
+  turn, parsed and run by us). Engine is pluggable: `ytAgent.useEngine(fn)`; selection via
+  `ytAgent.setEngine("auto"|"cloud"|"nano")`.
 - **TTS can be silent without care.** Chrome drops `speechSynthesis` utterances if you call
   `cancel()` right before `speak()`, if voices haven't loaded yet (async `voiceschanged`),
   or if the queue gets stuck paused. `speak()` handles all three (wait for voices, set one,
@@ -153,9 +181,11 @@ control (offer, don't autoplay).**
   **Mitigated (v0.8.0):** navigating tools stash a continuation message via `pend()`
   (sessionStorage) and the consumer speaks it on the next page (`consumePending`) — so
   "search for X" now announces "Here are the results for X…" after the load, and arrow-browse
-  is armed there. Full conversation *history* across navigation still isn't carried (would
-  need to serialize the transcript / move it to the service worker) — that's the remaining
-  piece, but the common search/open flows now feel continuous.
+  is armed there. **Closed (v0.10.0):** the conversation itself now persists too — the
+  `convo` store keeps the last ~12 turns in tab `sessionStorage` and re-feeds them to the
+  model on the next page (compact block for Nano, real turns for the cloud engine), and
+  "repeat" works across navigation. sessionStorage was chosen over service-worker state
+  because it behaves identically in the userscript form and needs no extra messaging.
 - **No DOM injection by design.** The harness is headless (console + voice); it does NOT
   add visible/AT-visible UI to YouTube, to honor the AT-safe principle. Real client UI
   lives in the extension popup/side panel, outside the page's a11y tree.
@@ -169,7 +199,7 @@ control (offer, don't autoplay).**
 | watch | `/watch` or `/shorts` | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` | ✅ verified live (transcript-open best-effort). Shorts resolves to this surface (generic `video` selector → play/pause/seek work; sidebar/transcript no-op). |
 | watch-next | `/watch` | `list_up_next`, `play_next`, `set_autoplay` | ✅ verified live |
 | comments | `/watch` | `get_comments`, `summarize_comments`, `get_pinned_comment` | ✅ verified live |
-| pip | `/watch` | `enter_pip`, `exit_pip` | 🟡 button+fallback present; gesture path (q. c) needs flagged run |
+| pip | `/watch` | `enter_pip`, `exit_pip` | ✅ gesture path measured (q. c resolved); voice flow = "picture in picture" → press Enter (gesture relay) |
 | (every route) | — | `where_am_i` ✅; `get_account` ✅ (`signedIn` reliable; `name` is null — only in the account menu, which we don't open) | ✅ |
 | (agent, list surfaces) | home + search | arrow-key browse mode (`startBrowse`): Down/Up move, Enter plays, Escape exits (an arrow re-arms — never a keyboard dead end); + personalized welcome (`get_account`) | new — verify interactively |
 | home (planned) | | `list_categories`, `open_category` (filter chip bar) | ⬜ |
@@ -181,8 +211,9 @@ controls (`set_captions`, `set_autoplay`, PiP fallback) rather than scraping whe
 ## NEXT STEPS
 
 All journeys are implemented and their **selectors are verified live** (headless harness,
-`scripts/verify-selectors.mjs`). What remains needs flags or a user gesture, or is the
-extension.
+`scripts/verify-selectors.mjs`); the gesture-gated paths are measured too
+(`scripts/verify-gestures.mjs`). What remains is one interactive transcript-hydration check
+on a real profile, a by-voice PiP confirmation, and Web Store packaging chores.
 
 ### Re-running selector verification
 `npm run verify:selectors` launches the installed Chrome headless, hits live YouTube
@@ -195,33 +226,42 @@ drifted — it's the automated version of the manual probe loop. Findings so far
 - Caveat: during a preroll **ad**, `<video>.duration` is the ad's — `get_video_info` now
   reports `adPlaying` and suppresses ad timing.
 
-### Still needs a flagged, interactive (gesture) run
-- **PiP — open question (c).** `enter_pip` measures `navigator.userActivation.isActive` and
-  falls back to clicking `SEL.watch.pipButton`. Run it from a real tool call and **record
-  here** whether the direct API succeeds or the button fallback is what fires.
-- **Transcript open.** `get_transcript` *reads* segments fine; opening a *closed* transcript
-  (expand description → "Show transcript") is best-effort. Verify `SEL.watch.transcriptOpenButton`
-  interactively (headless starts with it closed and 0 segments).
+### Resolved by measurement (2026-06-07) — `npm run verify:gestures`
+- **PiP — open question (c): RESOLVED.** See "Verified facts". The agent's gesture relay is
+  the shipping fix; the only remaining check is trying it by voice on the real profile.
+- **Transcript open: verified to automation's limit.** Selector + open-click verified;
+  the new tabbed shell's Transcript chip is now clicked as a fallback; content hydration
+  couldn't be reproduced logged-out — one interactive confirmation remains.
 
-### Production MV3 extension — scaffolded (`extension/`)
+### Production MV3 extension (`extension/`)
 Provider + agent run as `world:"MAIN"` content scripts (auto-injected on every YouTube page,
 reused from `src/` via `npm run build:extension`); an ISOLATED `bridge.js` relays popup
-commands (MAIN can't use `chrome.*`); `popup.html` is the Start/Stop UI (out of the page's
-a11y tree). See `extension/README.md`.
-Remaining for production: (a) move conversation state into a **service worker** so it
-survives the `open_video` full-nav reset (currently only auto-reinjection persists, not
-history); (b) icons; (c) Web Store packaging (privacy policy, permission justifications).
+commands and cloud requests (MAIN can't use `chrome.*`); `popup.html` is the Start/Stop +
+BYOK key UI (out of the page's a11y tree). See `extension/README.md`.
+Done since the scaffold: conversation persistence (sessionStorage `convo`), BYOK cloud
+fallback (key SW-side), icons, privacy policy + permission justifications (`docs/store/`).
+Remaining for the Web Store: host the privacy policy at a public URL, screenshots/promo
+images, packed `.zip` upload — and consider registering for the **WebMCP origin trial**
+(Chrome 149–156, anticipated ship 157) so users don't need the testing flag.
 
 ## Open questions still live
-- **(c) PiP transient user activation** — measure in `enter_pip` (item 4).
-- **(d) Multimodal media handling** — partly answered: on-device audio input works but is
-  too slow for real-time listening (Web Speech stays default; Nano ASR opt-in). Image input
-  also works → potential vision path. Still to settle: the speak/listen contract when the
-  consumer becomes the extension, and whether/when to use Nano vision for content the DOM
-  can't expose.
-- **Discovery/opt-in (layer 1)** — how the browser/AT actually surfaces and hands off to
-  our agent. Largely platform-owned; track what makes us discoverable (registered tools,
-  any agent manifest/labeling). Harness simulates with `activate()`.
+- **(c) PiP** — ✅ RESOLVED 2026-06-07 (see verified facts; gesture relay shipped).
+- **(d) Multimodal media handling** — ✅ RESOLVED 2026-06-07: contract settled and documented
+  in `docs/architecture/yt-a11y-agent.md` ("Media contract"). Consumer owns TTS/STT/vision;
+  tools stay text-only. Researched basis: WebMCP defines NO tool-result content model
+  (multimodal = open issues #41/#86/#81, no PRs); MCP 2025-11-25 content blocks are the
+  likely adoption target and our shapes map onto them; Prompt API output is text-only.
+  Revisit only if webmcp#86/#41 merge or the Prompt API gains output modalities.
+- **Discovery/opt-in (layer 1)** — still platform-owned and still unbuilt ANYWHERE
+  (researched 2026-06-07): the spec's Accessibility Considerations section is empty; no
+  manifest/meta/.well-known discovery exists (issue #166 unadopted); no browser surfaces
+  "this page has tools" to users; the only live consumer is Google's Model Context Tool
+  Inspector; Gemini-in-Chrome is announced but unshipped. What we do about it: register
+  spec-current `title` + `annotations.readOnlyHint` (done, provider 0.9.5) so future
+  browser UI can label us; keep `activate()` as the honest simulation; high-leverage
+  follow-up — contribute this project as a concrete use case to **webmcp issue #65**
+  (a11y opt-in UX; Léonie Watson active there). When a real consumer ships, our tool
+  descriptions must read as instructions for an arbitrary cloud model, not just Nano.
 
 ## Run / test (full stack)
 1. Chrome + `chrome://flags/#enable-webmcp-testing` (restart).

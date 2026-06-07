@@ -8,8 +8,8 @@
   const EXT = "yt-a11y-ext";
   const STATUS = "yt-a11y-agent-status";
 
-  const postStatus = (status, text) =>
-    window.postMessage({ source: STATUS, status, text }, "*");
+  const postStatus = (status, text, extra) =>
+    window.postMessage({ source: STATUS, status, text, ...(extra || {}) }, "*");
 
   window.addEventListener("message", async (e) => {
     const d = e.data;
@@ -47,9 +47,24 @@
           if (a.setEarconVolume) a.setEarconVolume(d.args);
           if (a.speak) a.speak("Volume."); // sample so they hear the new level (and an earcon plays)
           break;
-        case "ping":
-          postStatus("ready", `Ready (Gemini: ${await a.availability()}).`);
+        case "setModel": {
+          // The model kill switch (default OFF). In the extension, ON means off-device cloud
+          // replies via the service worker (the safe path); the on-device Nano engine is a
+          // console-only opt-in (ytAgent.setEngine("nano")).
+          if (a.setModel) a.setModel(!!d.args);
+          const on = a.cloudStatus ? !!a.cloudStatus().modelEnabled : !!d.args;
+          postStatus("idle", `AI replies: ${on ? "on" : "off"}.`, { model: on });
           break;
+        }
+        case "ping": {
+          const cloud = a.cloudStatus ? a.cloudStatus() : null;
+          postStatus(
+            "ready",
+            `Ready (Gemini Nano: ${await a.availability()}${cloud ? ` · AI replies ${cloud.modelEnabled ? "on" : "off"} · engine ${cloud.effectiveEngine}` : ""}).`,
+            cloud ? { model: !!cloud.modelEnabled } : null
+          );
+          break;
+        }
         default:
           break;
       }
@@ -60,6 +75,41 @@
   });
 
   postStatus("loaded", "Agent content script loaded.");
+
+  // ---------------------------------------------------------------------------
+  // Cloud transport: route the agent's Gemini calls through the service worker via
+  // bridge.js. The user's API key lives in chrome.storage.local and is read ONLY by the
+  // SW — it never enters this MAIN-world context, and YouTube's page CSP never applies to
+  // the request. Correlation ids pair each response with its request.
+  // ---------------------------------------------------------------------------
+  const CLOUD_REQ = "yt-a11y-cloud-req";
+  const CLOUD_RES = "yt-a11y-cloud-res";
+  const CLOUD_RELAY_TIMEOUT_MS = 25000; // SW fetch caps at 20s; allow relay overhead
+  const pendingCloud = new Map(); // id -> { resolve, timer }
+  let cloudSeq = 0;
+  window.addEventListener("message", (e) => {
+    const d = e.data;
+    if (e.source !== window || !d || d.source !== CLOUD_RES) return;
+    const p = pendingCloud.get(d.id);
+    if (p) {
+      pendingCloud.delete(d.id);
+      clearTimeout(p.timer); // don't leave the 25s fallback timer (and its closure) live
+      p.resolve(d.res || { ok: false, error: "empty relay response" });
+    }
+  });
+  function cloudViaWorker(payload) {
+    return new Promise((resolve) => {
+      const id = "c" + ++cloudSeq + "-" + Math.random().toString(36).slice(2, 8);
+      const timer = setTimeout(() => {
+        if (pendingCloud.delete(id)) resolve({ ok: false, error: "cloud relay timeout" });
+      }, CLOUD_RELAY_TIMEOUT_MS);
+      pendingCloud.set(id, { resolve, timer });
+      window.postMessage({ source: CLOUD_REQ, id, type: "generate", model: payload.model, body: payload.body }, "*");
+    });
+  }
+  if (window.ytAgent && window.ytAgent.setCloudTransport) {
+    window.ytAgent.setCloudTransport(cloudViaWorker);
+  }
 
   // ---------------------------------------------------------------------------
   // Talk-first entry. A popup click is sighted-first; instead the agent speaks on the user's
@@ -128,7 +178,7 @@
         );
       } catch (_) {}
     }
-    postStatus("ready", "Ready. Hold ` to talk · arrows browse · Alt+Shift+A overview.");
+    postStatus("ready", "Ready. Tap ` to talk · arrows browse · Alt+Shift+A overview.");
   };
   window.addEventListener("keydown", onFirstGesture, true);
   window.addEventListener("pointerdown", onFirstGesture, true);

@@ -2,8 +2,8 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.9.21
-// @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
+// @version      0.10.0
+// @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech, with an opt-in BYOK cloud-Gemini fallback. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
 // @run-at       document-idle
@@ -42,6 +42,10 @@
   // (confirmed: clean coreaudiod, no audio/voice involvement, freeze == the prompt duration).
   // We abort the turn past this budget so a stalled model can never freeze the page for minutes.
   const MODEL_TURN_BUDGET_MS = 12000;
+  // Per-request cap for the CLOUD engine. Unlike Nano's abort (unproven against native
+  // inference), aborting a fetch() reliably ends the request — a stalled network call can
+  // only ever cost this long, and it never touches the main thread.
+  const CLOUD_TIMEOUT_MS = 20000;
 
   // Crisp spoken cues so the user knows what we're doing during slow/navigating tools —
   // no endless silent waiting. One or two words; only for tools worth narrating.
@@ -62,6 +66,8 @@
     describe_image: "Looking at it.",
   };
 
+  // Probe order: document first — the spec moved the getter to Document (webmcp PR #184,
+  // 2026-05-27) and Chrome 150 follows; today's Chrome 149 still exposes navigator.modelContext.
   function getModelContext() {
     return (
       (typeof document !== "undefined" && document.modelContext) ||
@@ -109,6 +115,26 @@
     "",
     "You are an intermediary: you never alter the page. You read it and act on the user's behalf while their screen reader stays in charge.",
   ].join("\n");
+
+  // The manual tool-call protocol, shared by BOTH engines (on-device Nano and the cloud
+  // fallback): one strict-JSON action per turn, which we parse and run ourselves. Nano's
+  // native tool-calling narrates instead of executing; the cloud API has real function
+  // calling, but keeping ONE protocol means one parser, one loop, and engines that can be
+  // swapped mid-session.
+  const JSON_PROTOCOL =
+    "You control the page through tools. On EVERY turn reply with ONE line of strict JSON, nothing else, no markdown fences.\n" +
+    "Each turn begins by listing the tools available on the CURRENT page (they change as the user navigates).\n" +
+    'To use a tool, include ALL its required args. Example: {"action":"call","tool":"open_video","args":{"index":3}}\n' +
+    'When you can answer the user: {"action":"final","say":"<the reply to speak>"}\n' +
+    'Videos are numbered starting at 1; pass the exact number the user says (e.g. "open video 5" -> {"action":"call","tool":"open_video","args":{"index":5}}).';
+
+  // Model-facing catalog of the current surface's tools (passed per turn — they're
+  // route-scoped, so the set changes as the user navigates).
+  function toolCatalog(tools) {
+    return tools
+      .map((t) => `- ${t.name}: ${t.description || ""} | args: ${JSON.stringify(t.inputSchema || { type: "object", properties: {} })}`)
+      .join("\n");
+  }
 
   // ===========================================================================
   // CONSUMER BRIDGE (MCP client side).
@@ -665,9 +691,11 @@
   let imageBase = null;
   async function describeImage(url, question) {
     if (!url) throw new Error("describeImage needs a url");
-    // Vision is Nano inference too — same machine-freeze risk class as text. Gated by the same
-    // kill switch (state.modelEnabled, default OFF); ytAgent.setModel(true) opts in.
-    if (!state.modelEnabled) return "Image descriptions are off while the on-device model is disabled.";
+    // Vision is model inference too — gated by the same kill switch (state.modelEnabled,
+    // default OFF); ytAgent.setModel(true) opts in. With the cloud engine configured the
+    // description runs OFF-DEVICE (no freeze risk); otherwise it's on-device Nano image input.
+    if (!state.modelEnabled) return "Image descriptions are off while the model is disabled.";
+    if (modelChoice() === "cloud") return await cloudDescribeImage(url, question);
     const LM = getLanguageModel();
     if (!LM) throw new Error("Prompt API unavailable for vision.");
     const r = await fetch(url);
@@ -724,6 +752,76 @@
   ];
 
   // ===========================================================================
+  // CONVERSATION MEMORY — survives full-page navigations (sessionStorage, tab-scoped).
+  // open_video / run_search trigger cross-document loads that reset this whole script; the
+  // pend() continuation already carries ONE message across, but the conversation itself was
+  // lost ("search feels broken" in HANDOFF). Persisting the last few turns lets the next
+  // page's agent keep context ("repeat", follow-up questions) and gives the stateless cloud
+  // engine its history. Capped small on purpose — this is a context bridge, not a log.
+  // ===========================================================================
+  const lsGet = (k) => {
+    try {
+      return localStorage.getItem(k);
+    } catch (_) {
+      return null;
+    }
+  };
+  const lsSet = (k, v) => {
+    try {
+      if (v === null || v === undefined) localStorage.removeItem(k);
+      else localStorage.setItem(k, v);
+    } catch (_) {}
+  };
+  const CONVO_KEY = "ytA11yConvo";
+  const CONVO_MAX = 12; // entries (user+agent) — keeps prompts small and storage trivial
+  const convo = {
+    history: (() => {
+      try {
+        const v = JSON.parse(sessionStorage.getItem(CONVO_KEY) || "[]");
+        return Array.isArray(v) ? v.slice(-CONVO_MAX) : [];
+      } catch (_) {
+        return [];
+      }
+    })(),
+    push(role, text) {
+      if (!text) return;
+      this.history.push({ role, text: String(text).slice(0, 500) });
+      if (this.history.length > CONVO_MAX) this.history = this.history.slice(-CONVO_MAX);
+      try {
+        sessionStorage.setItem(CONVO_KEY, JSON.stringify(this.history));
+      } catch (_) {}
+    },
+    // Compact transcript block for the per-turn Nano prompt (must stay tiny — the on-device
+    // model is slow and small). The cloud engine gets the history as real turns instead.
+    // dropLast skips the most recent entry: ask() records the current user turn BEFORE the
+    // engine runs, and geminiEngine appends "User said: …" itself, so without this the
+    // current utterance would appear twice and waste Nano's tiny context.
+    block(maxChars = 700, dropLast = false) {
+      const out = [];
+      let used = 0;
+      const end = dropLast ? this.history.length - 1 : this.history.length;
+      for (let i = end - 1; i >= 0; i--) {
+        const line = `${this.history[i].role === "user" ? "User" : "You"}: ${this.history[i].text}`;
+        if (used + line.length > maxChars) break;
+        out.unshift(line);
+        used += line.length;
+      }
+      return out.join("\n");
+    },
+    clear() {
+      this.history = [];
+      try {
+        sessionStorage.removeItem(CONVO_KEY);
+      } catch (_) {}
+    },
+  };
+  // Record a turn (and keep "repeat" working across navigations via state.lastReply).
+  function remember(role, text) {
+    convo.push(role, text);
+    if (role === "agent" && text) state.lastReply = text;
+  }
+
+  // ===========================================================================
   // ENGINE — Chrome built-in Gemini Nano (Prompt API) with native tool calling.
   // The session is bound to the tools captured at creation time; tools are route-scoped,
   // so we rebuild the session when the captured tool set changes. Pluggable via
@@ -750,7 +848,26 @@
         return false;
       }
     })(),
+    // --- Cloud fallback (BYOK — bring your own Google AI Studio key). -----------------
+    // The repo is public: the key is NEVER in code. Dev harness: ytAgent.setCloudKey()
+    // stores it in localStorage (page-visible — dev convenience only). Extension: the key
+    // lives in chrome.storage.local and ONLY the service worker reads it; the SW does the
+    // fetch and agent-control.js installs `cloudTransport` so this MAIN-world code never
+    // sees the key (and YouTube's page CSP never applies to the request).
+    engineMode: lsGet("ytA11yEngine") || "auto", // "auto" | "nano" | "cloud"
+    cloudKey: lsGet("ytA11yCloudKey") || null,
+    // Pinned STABLE model (GA 2026-05-07; cheap, structured-output capable). Do NOT use the
+    // "gemini-flash-latest" alias — it has been parked on a PREVIEW model since 2026-01-21,
+    // and previews get preview-class rate limits + 2-week-notice repoints.
+    cloudModel: lsGet("ytA11yCloudModel") || "gemini-3.1-flash-lite",
+    cloudTransport: null, // installed by the extension (service-worker fetch relay)
   };
+  // Restore "repeat" across navigations from the persisted conversation.
+  state.lastReply = (() => {
+    for (let i = convo.history.length - 1; i >= 0; i--)
+      if (convo.history[i].role === "agent") return convo.history[i].text;
+    return null;
+  })();
 
   async function availability() {
     const LM = getLanguageModel();
@@ -805,14 +922,7 @@
       voice.speak("Setting up the on-device model, one moment."); // communicate the one-time fetch
     }
 
-    const sys =
-      SYSTEM +
-      "\n\n" +
-      "You control the page through tools. On EVERY turn reply with ONE line of strict JSON, nothing else, no markdown fences.\n" +
-      "Each turn begins by listing the tools available on the CURRENT page (they change as the user navigates).\n" +
-      'To use a tool, include ALL its required args. Example: {"action":"call","tool":"open_video","args":{"index":3}}\n' +
-      'When you can answer the user: {"action":"final","say":"<the reply to speak>"}\n' +
-      'Videos are numbered starting at 1; pass the exact number the user says (e.g. "open video 5" -> {"action":"call","tool":"open_video","args":{"index":5}}).';
+    const sys = SYSTEM + "\n\n" + JSON_PROTOCOL;
 
     const tCreate = nowms();
     state.session = await LM.create({
@@ -845,12 +955,16 @@
     const tools = consumer.asPromptApiTools().concat(localTools);
     // The session is surface-agnostic (created once), so tell the model the CURRENT page's tools
     // each turn. This is what lets one persistent session serve every route without a rebuild.
-    const catalog = consumer
-      .list()
-      .concat(localTools)
-      .map((t) => `- ${t.name}: ${t.description || ""} | args: ${JSON.stringify(t.inputSchema || { type: "object", properties: {} })}`)
-      .join("\n");
-    let turn = `Tools available on this page right now:\n${catalog}\n\nUser said: ${utterance}`;
+    const catalog = toolCatalog(consumer.list().concat(localTools));
+    // Recent turns (persisted across full-page navigations). The live session has its own
+    // context, but after open_video/run_search this is a FRESH page and a fresh session —
+    // the block is what carries the conversation over. Kept tiny: Nano is small and slow.
+    // dropLast=true: the current turn is already remembered and is appended below as
+    // "User said: …", so excluding it here avoids feeding Nano the utterance twice.
+    const recent = convo.block(700, true);
+    let turn =
+      (recent ? `Recent conversation:\n${recent}\n\n` : "") +
+      `Tools available on this page right now:\n${catalog}\n\nUser said: ${utterance}`;
     // Whole-turn deadline: abort the model if it blows the budget (see MODEL_TURN_BUDGET_MS) so a
     // stalled Nano inference can't beachball the machine. The signal is passed to every prompt.
     const ac = new AbortController();
@@ -930,6 +1044,189 @@
   state.engine = geminiEngine;
 
   // ===========================================================================
+  // CLOUD ENGINE — opt-in BYOK fallback (Gemini API, Google AI Studio key).
+  // Same manual JSON tool loop as geminiEngine, but inference runs OFF-DEVICE — it cannot
+  // freeze this machine (the Nano beachball class), and a fetch() abort reliably ends a
+  // stalled request. Still behind the SAME model kill switch (state.modelEnabled): the
+  // deterministic command layer always runs first, and no model — local or cloud — is on
+  // any default path. The key is never in this public repo:
+  //   * dev harness: ytAgent.setCloudKey("AIza…") -> localStorage (page-visible; dev only)
+  //   * extension:   key in chrome.storage.local, read ONLY by the service worker, which
+  //     does the fetch; agent-control.js installs `cloudTransport` so this MAIN-world code
+  //     never touches the key and YouTube's page CSP never applies to the request.
+  // ===========================================================================
+  const cloudAvailable = () => !!(state.cloudTransport || state.cloudKey);
+
+  // Which model path a turn would use (the kill switch is checked separately, in ask()).
+  // "auto" prefers cloud when it's configured — the off-device path can't freeze the machine.
+  function modelChoice() {
+    if (state.engineMode === "cloud") return "cloud";
+    if (state.engineMode === "nano") return "nano";
+    return cloudAvailable() ? "cloud" : "nano";
+  }
+
+  async function cloudFetchDirect(model, body) {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), CLOUD_TIMEOUT_MS);
+    try {
+      const r = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-goog-api-key": state.cloudKey },
+          body: JSON.stringify(body),
+          signal: ac.signal,
+        }
+      );
+      if (!r.ok) {
+        // 429 = free-tier quota exhausted — surface it as something speakable.
+        if (r.status === 429) return { ok: false, error: "rate-limited (free-tier quota reached for today?)" };
+        let msg = `HTTP ${r.status}`;
+        try {
+          msg += ": " + (((await r.json()).error || {}).message || "");
+        } catch (_) {}
+        return { ok: false, error: msg };
+      }
+      const data = await r.json();
+      const text = ((((data.candidates || [])[0] || {}).content || {}).parts || [])
+        .map((p) => p.text || "")
+        .join("");
+      return text ? { ok: true, text } : { ok: false, error: "empty response (safety block?)" };
+    } catch (e) {
+      return {
+        ok: false,
+        error: ac.signal.aborted ? `timeout after ${CLOUD_TIMEOUT_MS}ms` : String((e && e.message) || e),
+      };
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  // One generateContent round trip, via whichever path this context has. Returns
+  // { ok, text } or { ok:false, error } — never throws.
+  async function cloudGenerate(body) {
+    if (state.cloudTransport) {
+      try {
+        return await state.cloudTransport({ model: state.cloudModel, body });
+      } catch (e) {
+        return { ok: false, error: String((e && e.message) || e) };
+      }
+    }
+    if (state.cloudKey) return await cloudFetchDirect(state.cloudModel, body);
+    return { ok: false, error: "no cloud key (ytAgent.setCloudKey(…) or the extension popup)" };
+  }
+
+  async function cloudEngine(utterance) {
+    const tools = consumer.asPromptApiTools().concat(localTools);
+    const catalog = toolCatalog(consumer.list().concat(localTools));
+    // The cloud API is stateless — replay the persisted history as real turns. ask() has
+    // already remembered the current utterance, so drop the last entry to avoid doubling it.
+    // Gemini REQUIRES contents to start with a user role and strictly alternate; convo can
+    // violate both — after the CONVO_MAX rotation history[0] may be an agent turn, and a
+    // silently-handled command (cmd === "") records a user turn with no agent reply, leaving
+    // two consecutive user turns. Normalize: drop leading model turns, then coalesce any
+    // consecutive same-role turns into one. Otherwise the API 400s and the cloud path
+    // silently degrades to the "not reachable" message.
+    const prior = convo.history.slice(0, -1).map((m) => ({ role: m.role === "user" ? "user" : "model", text: m.text }));
+    while (prior.length && prior[0].role !== "user") prior.shift();
+    const merged = [];
+    for (const m of prior) {
+      const last = merged[merged.length - 1];
+      if (last && last.role === m.role) last.text += "\n" + m.text;
+      else merged.push({ role: m.role, text: m.text });
+    }
+    const contents = merged.map((m) => ({ role: m.role, parts: [{ text: m.text }] }));
+    // The current turn is always a user turn; if the normalized history ended on a user turn
+    // (a trailing unanswered command), fold this turn into it to preserve alternation.
+    const head = `Tools available on this page right now:\n${catalog}\n\nUser said: ${utterance}`;
+    if (contents.length && contents[contents.length - 1].role === "user")
+      contents[contents.length - 1].parts[0].text += "\n\n" + head;
+    else contents.push({ role: "user", parts: [{ text: head }] });
+    const body = {
+      systemInstruction: { parts: [{ text: SYSTEM + "\n\n" + JSON_PROTOCOL }] },
+      contents,
+      // JSON response mode makes the one-action-per-turn protocol near-deterministic.
+      generationConfig: { responseMimeType: "application/json", maxOutputTokens: 512, temperature: 0.2 },
+    };
+    for (let i = 0; i < MANUAL_LOOP_HOPS; i++) {
+      const tP = nowms();
+      const res = await cloudGenerate(body);
+      log(`cloud hop ${i} ${Math.round(nowms() - tP)}ms ok=${res.ok}${res.ok ? "" : " — " + res.error}`);
+      if (!res.ok) {
+        if (/no key/i.test(res.error || ""))
+          return "To use AI replies, add your Gemini API key in the extension popup. Direct commands like play, pause, and search always work without it.";
+        if (/rate-limited/i.test(res.error || ""))
+          return "Your Gemini key has hit its daily free limit. Direct commands still work.";
+        return "The cloud model isn't reachable right now. Try a direct command like play, pause, next, search, or list.";
+      }
+      const raw = res.text;
+      body.contents.push({ role: "model", parts: [{ text: raw }] });
+      const step = parseAction(raw);
+      if (!step) return raw.trim();
+      if (step.action === "final") return step.say || "";
+      if (step.action === "call") {
+        const tool = tools.find((t) => t.name === step.tool);
+        if (!tool) {
+          body.contents.push({
+            role: "user",
+            parts: [{ text: `No tool "${step.tool}". Available: ${tools.map((t) => t.name).join(", ")}. Reply with valid JSON.` }],
+          });
+          continue;
+        }
+        if (TOOL_CUE[step.tool]) voice.speak(TOOL_CUE[step.tool]);
+        let result;
+        const tExec = nowms();
+        try {
+          result = await tool.execute(step.args || {});
+        } catch (e) {
+          result = "tool error: " + ((e && e.message) || e);
+        }
+        log(`tool ${step.tool} ${Math.round(nowms() - tExec)}ms (cloud path)`);
+        body.contents.push({
+          role: "user",
+          parts: [{ text: `Result of ${step.tool}:\n${result}\n\nNow call another tool or give the final answer as JSON.` }],
+        });
+        continue;
+      }
+      return raw.trim();
+    }
+    return "Sorry, I couldn't complete that.";
+  }
+
+  // Vision via the cloud engine (inline base64 image). Lets describe_image work even where
+  // on-device Nano is disabled/unavailable — same kill switch, same BYOK opt-in.
+  async function cloudDescribeImage(url, question) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`couldn't fetch image (${r.status})`);
+    const blob = await toJpeg(await r.blob());
+    const b64 = await new Promise((res, rej) => {
+      const fr = new FileReader();
+      fr.onload = () => res(String(fr.result).split(",")[1]);
+      fr.onerror = () => rej(new Error("couldn't encode image"));
+      fr.readAsDataURL(blob);
+    });
+    const body = {
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              text:
+                question ||
+                "Describe this image for someone who cannot see it. Be concise and concrete in 1-2 sentences: main subject, setting, any visible text, and mood.",
+            },
+            { inlineData: { mimeType: blob.type || "image/jpeg", data: b64 } },
+          ],
+        },
+      ],
+      generationConfig: { maxOutputTokens: 256 },
+    };
+    const res = await cloudGenerate(body);
+    if (!res.ok) throw new Error(res.error);
+    return res.text.trim();
+  }
+
+  // ===========================================================================
   // AGENT entry points.
   // ===========================================================================
   // ===========================================================================
@@ -952,7 +1249,7 @@
   }
   function helpText() {
     if (location.pathname.startsWith("/watch") || location.pathname.startsWith("/shorts"))
-      return "On this video you can say: play, pause, skip forward, skip back, captions on, captions off, next video, or go home. Say repeat to hear something again, or slower and faster to change my speed.";
+      return "On this video you can say: play, pause, skip forward, skip back, captions on, captions off, next video, picture in picture, or go home. Say repeat to hear something again, or slower and faster to change my speed.";
     return "You can say: list videos, open and a number, next, previous, search for something, load more, or go home. Say a category name like Music to filter. Say repeat, slower, or faster anytime.";
   }
   // Strip emoji/symbols and trim over-long tails so spoken replies stay short and the local TTS
@@ -995,6 +1292,57 @@
       return `Sorry, I couldn't do that just now.`;
     }
   };
+
+  // One-shot GESTURE RELAY for activation-gated APIs (PiP). Measured live (2026-06-07,
+  // scripts/verify-gestures.mjs): requestPictureInPicture needs TRANSIENT user activation,
+  // which expires in ~5s — voice latency (talk-key -> STT -> tool) usually outlives it, and
+  // the native-button el.click() fallback is equally gated. So we run the tool INSIDE the
+  // next trusted keydown, where activation is fresh. The tool call starts synchronously in
+  // the handler (consumer.call enters execute() before its first await), so the API sees a
+  // live gesture. Escape cancels; the talk key passes through (it starts a new voice turn).
+  let gestureRelay = null;
+  let gestureRelayTimer = null;
+  const GESTURE_RELAY_TTL_MS = 12000; // don't leave a key trap armed forever
+  function disarmGestureRelay() {
+    if (gestureRelayTimer) {
+      clearTimeout(gestureRelayTimer);
+      gestureRelayTimer = null;
+    }
+    if (gestureRelay) {
+      window.removeEventListener("keydown", gestureRelay, true);
+      gestureRelay = null;
+    }
+  }
+  function armGestureRelay(toolName) {
+    disarmGestureRelay();
+    gestureRelayTimer = setTimeout(disarmGestureRelay, GESTURE_RELAY_TTL_MS); // silent expiry
+    const h = (e) => {
+      if (isTextTarget(e.target)) return; // never swallow typing (e.g. the search box)
+      if (e.code === talk.key) {
+        disarmGestureRelay(); // user chose to talk instead — let onTalkDown handle it
+        return;
+      }
+      if (e.key === "Escape") {
+        disarmGestureRelay();
+        voice.speak("Canceled.");
+        return;
+      }
+      // The tool may have unregistered if the user navigated away (e.g. left /watch within
+      // the window) — disarm silently rather than firing a no-op that talks over browse.
+      if (!consumer.has(toolName)) {
+        disarmGestureRelay();
+        return;
+      }
+      e.preventDefault();
+      e.stopImmediatePropagation(); // this keypress belongs to the relay, not browse/page
+      disarmGestureRelay();
+      callText(toolName).then((msg) => {
+        if (msg) voice.speak(msg);
+      });
+    };
+    gestureRelay = h;
+    window.addEventListener("keydown", h, true);
+  }
 
   async function handleCommand(rawText) {
     const t = (rawText || "").trim().toLowerCase().replace(/[.!?]+$/, "");
@@ -1085,6 +1433,16 @@
       if (m && (path === "/" || path.startsWith("/feed"))) return await callText("select_category", { name: m[1] });
     }
 
+    // Picture-in-picture (watch only). The API needs ~5s-fresh transient activation, which
+    // voice latency outlives (measured 2026-06-07, scripts/verify-gestures.mjs) — so we
+    // relay the gesture: the user's NEXT keypress runs enter_pip with live activation.
+    if (onWatch && /\bpicture.in.picture\b|\bpip\b|\bpop\b.*\bout\b/.test(t)) {
+      if (/\b(exit|leave|close|stop|off|back)\b/.test(t)) return await callText("exit_pip");
+      if (!consumer.has("enter_pip")) return "That isn't available on this page.";
+      armGestureRelay("enter_pip");
+      return "Press the Enter key and I'll pop the video out into a floating window.";
+    }
+
     // Playback controls — handled on EVERY surface, never gated behind onWatch. A missed media
     // verb (e.g. "pause" on the home page) used to fall through to the on-device model, which ran
     // for 200s and beachballed the machine. On /watch we use the provider tool (proper YouTube
@@ -1124,9 +1482,11 @@
 
   async function ask(utterance) {
     if (!utterance || !utterance.trim()) return "";
+    // Persist the turn (bracketed text is legacy plumbing, not conversation — skip it).
+    if (!utterance.trim().startsWith("[")) remember("user", utterance.trim());
     const cmd = await handleCommand(utterance);
     if (cmd !== null) {
-      if (cmd) state.lastReply = cmd;
+      if (cmd) remember("agent", cmd);
       log("reply (command):", cmd);
       return cmd; // "" = handled silently (already spoke / no reply needed)
     }
@@ -1134,13 +1494,22 @@
     // gets a short deterministic coaching reply instead of risking a machine-freezing inference.
     if (!state.modelEnabled) {
       log('model is OFF (kill switch) — utterance not handled deterministically:', utterance);
-      log("re-enable for a measurement run with ytAgent.setModel(true)");
+      log(
+        cloudAvailable()
+          ? "a cloud key is configured — ytAgent.setModel(true) turns on OFF-DEVICE replies (no freeze risk)"
+          : "re-enable for a measurement run with ytAgent.setModel(true), or set a cloud key (ytAgent.setCloudKey / extension popup)"
+      );
       const reply = "I only handle direct commands right now. Try play, pause, next, search, list, or go home.";
-      state.lastReply = reply;
+      remember("agent", reply);
       return reply;
     }
-    const reply = await state.engine(utterance);
-    state.lastReply = reply;
+    // Engine dispatch: a custom engine (useEngine mock) always wins; otherwise route by
+    // modelChoice() — cloud when configured ("auto"), else on-device Nano.
+    let reply;
+    if (state.engine !== geminiEngine) reply = await state.engine(utterance);
+    else if (modelChoice() === "cloud") reply = await cloudEngine(utterance);
+    else reply = await geminiEngine(utterance);
+    remember("agent", reply);
     log("reply:", reply);
     return reply;
   }
@@ -1183,7 +1552,7 @@
     } else {
       reply = `${hello} You're on YouTube. Say go home, search and a topic, play, pause, or next. What would you like to do?`;
     }
-    state.lastReply = reply;
+    remember("agent", reply);
     await voice.speak(reply);
     return reply;
   }
@@ -1712,6 +2081,9 @@
     try {
       audio.suspend(); // drop the earcon AudioContext's render thread on release
     } catch (_) {}
+    try {
+      disarmGestureRelay(); // never leave a one-shot key trap armed when we let go
+    } catch (_) {}
     talk.gen++; // invalidate any in-flight turn so its reply can't speak after release
     talk.state = "idle";
     state.running = false;
@@ -1741,7 +2113,7 @@
     converse, // listen -> ask -> speak (one turn)
     start, // hands-free loop: greet, then listen<->respond until "stop" / silence / stop()
     stop, // end the conversation loop
-    enableTalk, // (key?) hold-to-talk + barge-in (default hold Backquote `); the primary input
+    enableTalk, // (key?) tap-to-talk + barge-in (default tap Backquote `); the primary input
     disableTalk,
     setTalkKey: enableTalk, // alias: re-bind the talk key (KeyboardEvent.code, e.g. "Backquote")
     setEarconVolume: audio.setVolume, // 0 mute … 1 default … 2 louder
@@ -1791,9 +2163,68 @@
         localStorage.setItem("ytA11yModelEnabled", on ? "1" : "0");
       } catch (_) {}
       if (!on) destroySession(); // drop any live session; nothing should keep the model warm
-      log(`model: ${on ? "ON (opt-in — watch the max main-thread freeze log; ytAgent.setModel(false) to kill)" : "OFF (deterministic-only; commands, greeting, and browse all work)"}`);
+      log(
+        `model: ${
+          on
+            ? modelChoice() === "cloud"
+              ? "ON — cloud engine (off-device; no freeze risk; your key, your quota)"
+              : "ON — on-device Nano (opt-in; watch the max main-thread freeze log; ytAgent.setModel(false) to kill)"
+            : "OFF (deterministic-only; commands, greeting, and browse all work)"
+        }`
+      );
       return state.modelEnabled;
     },
+    // --- Cloud fallback (BYOK — bring your own Google AI Studio key) -------------------
+    // Dev-harness key entry. ⚠️ localStorage on youtube.com is page-readable — fine for a
+    // dev key you can revoke, wrong for production. The extension keeps the key in
+    // chrome.storage.local, read ONLY by its service worker (see extension/README.md).
+    // Free-tier note: Google may use free-tier API prompts for product improvement.
+    setCloudKey(key) {
+      state.cloudKey = key ? String(key).trim() : null;
+      lsSet("ytA11yCloudKey", state.cloudKey);
+      log(
+        state.cloudKey
+          ? `cloud key set (dev harness — localStorage; revoke it when done). Model: ${state.cloudModel}. Now run ytAgent.setModel(true).`
+          : "cloud key cleared."
+      );
+      return !!state.cloudKey;
+    },
+    setCloudModel(m) {
+      if (m) state.cloudModel = String(m).trim();
+      lsSet("ytA11yCloudModel", state.cloudModel);
+      log(`cloud model: ${state.cloudModel}`);
+      return state.cloudModel;
+    },
+    // "auto" (cloud when configured, else nano) | "cloud" | "nano".
+    setEngine(mode) {
+      state.engineMode = mode === "cloud" || mode === "nano" ? mode : "auto";
+      lsSet("ytA11yEngine", state.engineMode);
+      log(`engine mode: ${state.engineMode} (effective: ${modelChoice()})`);
+      return state.engineMode;
+    },
+    // Extension hook: route cloud calls through the MV3 service worker — the key never
+    // enters this MAIN-world context. fn({model, body}) -> Promise<{ok, text|error}>.
+    // When a transport is installed (extension), drop any dev key from MAIN-world state so
+    // the direct-fetch fallback is truly unreachable and no key sits in page memory — the
+    // extension's key lives only in the service worker (chrome.storage.local).
+    setCloudTransport(fn) {
+      state.cloudTransport = typeof fn === "function" ? fn : null;
+      if (state.cloudTransport && state.cloudKey) {
+        state.cloudKey = null;
+        log("dev cloud key in localStorage is ignored under the extension (service-worker key is used); clear it with ytAgent.setCloudKey(null) if you set it for the dev harness.");
+      }
+      log(`cloud transport: ${state.cloudTransport ? "extension service worker" : "none (direct fetch with dev key)"}`);
+      return !!state.cloudTransport;
+    },
+    cloudStatus: () => ({
+      modelEnabled: state.modelEnabled,
+      engineMode: state.engineMode,
+      effectiveEngine: modelChoice(),
+      cloudConfigured: cloudAvailable(),
+      cloudModel: state.cloudModel,
+      viaServiceWorker: !!state.cloudTransport,
+    }),
+    clearConversation: () => convo.clear(),
     speak: voice.speak,
     // respects listenMode; runs the freeze gate, and restores ducked media after a standalone listen.
     listen: async () => {
@@ -1827,7 +2258,8 @@
     listTools: () => consumer.list().concat(localTools).map((t) => ({ name: t.name, description: t.description })),
     reset() {
       destroySession();
-      log("session reset.");
+      convo.clear();
+      log("session + conversation reset.");
     },
     _state: state,
   };
@@ -1841,7 +2273,8 @@
     if (consumer.wrap()) {
       availability().then((a) =>
         log(
-          `ready. Gemini Nano: ${a}. model: ${state.modelEnabled ? "ON (opt-in)" : "OFF (kill switch — deterministic-only; ytAgent.setModel(true) to opt in)"}. ` +
+          `ready. Gemini Nano: ${a}. model: ${state.modelEnabled ? `ON (engine: ${modelChoice()})` : "OFF (kill switch — deterministic-only; ytAgent.setModel(true) to opt in)"}. ` +
+            `cloud: ${cloudAvailable() ? `configured (${state.cloudModel}${state.cloudTransport ? ", via service worker" : ", direct"})` : "not configured (ytAgent.setCloudKey or extension popup)"}. ` +
             `voice: tts=${voice.supported.tts} stt=${voice.supported.stt}. ` +
             `Try: ytAgent.start() for hands-free voice, ytAgent.ask("...") to type, ` +
             `or ytAgent.enablePushToTalk() for a hotkey.`

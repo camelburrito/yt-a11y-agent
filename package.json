@@ -7,7 +7,9 @@
   "license": "MIT",
   "scripts": {
     "verify:selectors": "node scripts/verify-selectors.mjs",
-    "build:extension": "node scripts/build-extension.mjs"
+    "verify:gestures": "node scripts/verify-gestures.mjs",
+    "build:extension": "node scripts/build-extension.mjs",
+    "build:icons": "node scripts/build-icons.mjs"
   },
   "repository": {
     "type": "git",
