@@ -4,6 +4,70 @@ Status: research/spec. Drives changes to `src/agent/dev-agent.user.js` (voice la
 generated `extension/agent.js`. Read alongside `docs/HANDOFF.md` and `CLAUDE.md` (the
 "NEVER hold the mic" / "prefer LOCAL voices" / on-device-only rules this doc must respect).
 
+## 🔬 MECHANISM CORRECTION (2026-06-07): out-of-process inference → GPU/compositor freeze, NOT a main-thread stall
+
+A 3-topic verified research pass (abort semantics, Worker availability, whole-machine mechanism)
+corrected the v0.9.19 framing below. **The 200s duration-correlation still holds, but the
+"main-thread" part of the mechanism is wrong:**
+
+- **Nano inference runs OUT-OF-PROCESS.** Chromium runs Gemini Nano in the `on_device_model`
+  utility service; `await session.prompt()` is an async **mojo round-trip**. A long inference
+  blocks only the awaiting JS continuation — **not** this renderer's event loop. A pure
+  main-thread block would freeze only the tab anyway, which can't explain a separate Terminal
+  beachballing. So the whole-machine freeze is **system-level resource contention**, not a JS stall.
+- **Most-likely mechanism: GPU/Metal → WindowServer compositor starvation (UNCERTAIN — not yet
+  captured).** Nano runs on LiteRT-LM's Metal GPU backend; macOS shares the GPU with WindowServer
+  (the single process that composites every window + routes input). A sustained ~200s Metal
+  workload starves WindowServer's GPU access → the whole display stops updating, a separate
+  Terminal beachballs too, and it recovers cleanly when generation ends. Near-exact public analog:
+  MLX issue #3267 (long Metal command buffers starve WindowServer with the display active; the
+  identical job finishes fine with the **lid closed** / display off). Ruled out: coreaudiod
+  (3 clean captures + repro with audio off) and memory/swap (64 GB / 58% free — that's a
+  ~16 GB-machine story).
+- **The 12s `AbortController` cap is REAL but best-effort, not a hard kill.** `controller.abort()`
+  is a genuinely wired cancel (blink → mojo pipe reset → native `CancelExecuteModel`), so it
+  reliably **frees the JS await at 12s** — but the cancel only lands at a **token boundary**, so
+  an in-flight prefill / first-call model load runs to completion first (GPU stays busy). So the
+  cap is a **secondary** guard (bounds runaway latency), NOT the freeze cure. Load-bearing guards:
+  kill switch (Nano off by default), deterministic-first routing, and the **off-device cloud
+  engine** (zero local GPU work → cannot whole-machine-freeze).
+- **Web Workers are a dead end and moot.** `LanguageModel` is `[Exposed=Window]` only; and since
+  inference is already off the renderer main thread, relocating the JS host wouldn't fix
+  system-wide GPU/compositor starvation anyway. The cloud fallback is the correct off-loading
+  strategy. (Extension-SW availability is UNCERTAIN-but-open; offscreen-document is the proven
+  host pattern *if* ever needed for persistence/UI — not as a freeze defense.)
+
+### What changed in code (2026-06-07)
+- `modelChoice()`: "auto" routes to the **off-device cloud engine or a coaching reply — never
+  on-device Nano**. On-device is reachable ONLY via explicit `ytAgent.setEngine("nano")`
+  (session-only, never persisted), for instrumented measurement runs.
+- **One-strike circuit breaker** (`state.nanoTripped`): a Nano turn that blows the budget trips
+  it off for the session, so a freeze can happen **at most once** (the abort can't stop in-flight
+  GPU dispatches).
+- **Dual liveness probe** in `geminiEngine`: rAF gap (compositor-gated → display/GPU liveness) vs
+  `setInterval` gap (main-thread liveness). Divergence (rAF stalls, timer fine) is the in-page
+  signature of the GPU/compositor freeze. The probe now also wraps `ensureSession()` so the
+  previously-unmeasured model **load** (`LM.create`, ~22-29s) is timed too.
+
+### Capture the artifact next repro (the corrected recipe — supersedes the coreaudiod recipe below)
+The trick: the local Terminal beachballs too, so capture from a sampler that survives the freeze.
+- **`sudo ./scripts/capture-freeze.sh`** pre-starts `powermetrics` (in-kernel; keeps writing
+  through the freeze) + a `log stream`, then summarizes after recovery.
+- **Or hold an SSH session from a second machine** (an ssh shell does no compositing):
+  `sudo powermetrics --samplers gpu_power,cpu_power,ane_power -i 500` + `sample WindowServer 5`.
+- **Mechanism proof =** GPU active residency ≈100% for the **whole** freeze window WHILE CPU is
+  not pegged across all cores AND `memory_pressure` is green; plus, after recovery,
+  `log show --last 5m --predicate 'eventMessage CONTAINS "Impacting Interactivity"'` shows
+  **`kIOGPUCommandBufferCallbackErrorImpactingInteractivity`**.
+  ⚠️ Do NOT grep for `GPURestartSignaled` / `signalHardwareError` / "5 continuous seconds of
+  unreadiness" — those are a different, stale, off-platform (2020 Intel/AMD) event.
+- **Future A/B (UNCERTAIN, needs the machine):** if Chrome ever exposes a LiteRT **CPU-backend**
+  control for Nano, test it — CPU saturation lets the scheduler keep WindowServer responsive,
+  trading a slower model for no whole-machine freeze.
+
+The dated sections below are retained as the historical record (the audio hypothesis, then the
+v0.9.19 model-but-"main-thread" framing) — both now superseded by the above.
+
 ## ✅ RESOLVED (2026-06-06): the freeze is UNBOUNDED on-device Nano inference
 
 Final isolation settled it. `ytAgent.ask("pause")` typed in the console (no mic, no earcon, no

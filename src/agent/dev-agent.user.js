@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.10.0
+// @version      0.10.1
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech, with an opt-in BYOK cloud-Gemini fallback. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -36,10 +36,21 @@
   const stamp = () => `+${((nowms() - T0) / 1000).toFixed(2)}s`;
   const log = (...a) => console.log(LOG, stamp(), ...a);
   const MANUAL_LOOP_HOPS = 4; // max tool-call round-trips per ask() in the manual JSON loop
-  // ⚠️ Hard cap on a whole on-device-model turn. Nano `session.prompt()` is UNBOUNDED and was
-  // measured running 200829ms (3+ min) on a trivial input — that is THE whole-machine beachball
-  // (confirmed: clean coreaudiod, no audio/voice involvement, freeze == the prompt duration).
-  // We abort the turn past this budget so a stalled model can never freeze the page for minutes.
+  // ⚠️ Time cap on a whole on-device-model turn. A single Nano `session.prompt()` was measured
+  // at 200829ms (3+ min) and the whole machine (incl. a separate Terminal) beachballed for that
+  // duration. IMPORTANT mechanism correction (2026-06-07 research): Nano inference runs
+  // OUT-OF-PROCESS (the `on_device_model` utility service) over an async mojo round-trip, so it
+  // does NOT block this renderer's main thread — a long prompt only blocks the awaiting JS
+  // continuation. The whole-machine freeze is therefore system-level resource contention, most
+  // likely GPU/Metal → WindowServer **compositor starvation** (the GPU is shared with the macOS
+  // window server; a sustained ~200s Metal workload starves it → the display stops updating
+  // everywhere). UNPROVEN until captured — see docs/research/voice-audio-anti-freeze.md.
+  // What this cap does: `controller.abort()` is a REAL wired cancel (blink → mojo pipe reset →
+  // native CancelExecuteModel), so the cap reliably FREES THE JS AWAIT at 12s — but it is
+  // best-effort, NOT a hard kill: the cancel only lands at a token boundary, so an in-flight
+  // prefill / first-call model load runs to completion first (the GPU stays busy meanwhile).
+  // So this is a SECONDARY guard (bounds runaway latency); the load-bearing guards are the kill
+  // switch (Nano off by default), deterministic-first routing, and the off-device cloud engine.
   const MODEL_TURN_BUDGET_MS = 12000;
   // Per-request cap for the CLOUD engine. Unlike Nano's abort (unproven against native
   // inference), aborting a fetch() reliably ends the request — a stalled network call can
@@ -690,11 +701,16 @@
   let imageBase = null;
   async function describeImage(url, question) {
     if (!url) throw new Error("describeImage needs a url");
-    // Vision is model inference too — gated by the same kill switch (state.modelEnabled,
-    // default OFF); ytAgent.setModel(true) opts in. With the cloud engine configured the
-    // description runs OFF-DEVICE (no freeze risk); otherwise it's on-device Nano image input.
+    // Vision is model inference too — same freeze-safety rules as text. Gated by the kill
+    // switch (state.modelEnabled, default OFF), and routed through modelChoice() so on-device
+    // Nano image input — which carries the same whole-machine-freeze risk as a text turn — is
+    // ONLY used under an explicit setEngine("nano") opt-in, never by "auto". Cloud vision runs
+    // off-device (no freeze risk); "none" returns coaching rather than silently invoking Nano.
     if (!state.modelEnabled) return "Image descriptions are off while the model is disabled.";
-    if (modelChoice() === "cloud") return await cloudDescribeImage(url, question);
+    const choice = modelChoice();
+    if (choice === "cloud") return await cloudDescribeImage(url, question);
+    if (choice !== "nano")
+      return "Image descriptions need a cloud key (add one in the extension popup), or on-device vision turned on explicitly.";
     const LM = getLanguageModel();
     if (!LM) throw new Error("Prompt API unavailable for vision.");
     const r = await fetch(url);
@@ -853,7 +869,11 @@
     // lives in chrome.storage.local and ONLY the service worker reads it; the SW does the
     // fetch and agent-control.js installs `cloudTransport` so this MAIN-world code never
     // sees the key (and YouTube's page CSP never applies to the request).
-    engineMode: lsGet("ytA11yEngine") || "auto", // "auto" | "nano" | "cloud"
+    // "auto" | "cloud" | "nano". Only "cloud"/"auto" are honored from storage — a persisted
+    // "nano" (e.g. from an older build) is coerced to "auto" so the freeze-prone on-device
+    // path never auto-arms on load; it must be chosen fresh each session via setEngine("nano").
+    engineMode: lsGet("ytA11yEngine") === "cloud" ? "cloud" : "auto",
+    nanoTripped: false, // circuit breaker: a budget-blowing Nano turn trips this for the session
     cloudKey: lsGet("ytA11yCloudKey") || null,
     // Pinned STABLE model (GA 2026-05-07; cheap, structured-output capable). Do NOT use the
     // "gemini-flash-latest" alias — it has been parked on a PREVIEW model since 2026-01-21,
@@ -948,46 +968,63 @@
   // Manual tool-call loop: prompt -> parse JSON action -> run tool -> feed result back,
   // up to MANUAL_LOOP_HOPS round-trips, then expect a {"action":"final"}.
   async function geminiEngine(utterance) {
-    const tSess = nowms();
-    const session = await ensureSession();
-    log(`ensureSession() ${Math.round(nowms() - tSess)}ms`);
-    const tools = consumer.asPromptApiTools().concat(localTools);
-    // The session is surface-agnostic (created once), so tell the model the CURRENT page's tools
-    // each turn. This is what lets one persistent session serve every route without a rebuild.
-    const catalog = toolCatalog(consumer.list().concat(localTools));
-    // Recent turns (persisted across full-page navigations). The live session has its own
-    // context, but after open_video/run_search this is a FRESH page and a fresh session —
-    // the block is what carries the conversation over. Kept tiny: Nano is small and slow.
-    // dropLast=true: the current turn is already remembered and is appended below as
-    // "User said: …", so excluding it here avoids feeding Nano the utterance twice.
-    const recent = convo.block(700, true);
-    let turn =
-      (recent ? `Recent conversation:\n${recent}\n\n` : "") +
-      `Tools available on this page right now:\n${catalog}\n\nUser said: ${utterance}`;
-    // Whole-turn deadline: abort the model if it blows the budget (see MODEL_TURN_BUDGET_MS) so a
-    // stalled Nano inference can't beachball the machine. The signal is passed to every prompt.
+    // Whole-turn deadline + DUAL liveness probe set up BEFORE the model loads — because the
+    // first-call model load (LM.create in ensureSession) is itself a long, non-preemptible GPU
+    // op that can saturate the machine (v0.9.15: LM.create was ~22-29s), and it was previously
+    // unmeasured/unguarded.
     const ac = new AbortController();
     const tAbort = { at: 0 };
     const deadline = setTimeout(() => {
       tAbort.at = nowms();
       ac.abort();
     }, MODEL_TURN_BUDGET_MS);
-    // CRUX INSTRUMENTATION (do NOT assume — measure): a main-thread liveness probe. If the renderer
-    // is wedged by the inference, requestAnimationFrame stops firing; the largest gap ≈ how long the
-    // thread was frozen. After the turn we log it next to whether/when abort fired. This is how we
-    // settle empirically whether the 12s abort actually frees the machine at 12s, or whether the
-    // beachball runs the full inference regardless (the open question the research couldn't prove).
-    let lastFrame = nowms(), maxFrameGap = 0, hbOn = true;
+    // CRUX INSTRUMENTATION — a DUAL probe, because the research showed Nano inference is
+    // out-of-process and the whole-machine freeze is most likely GPU→WindowServer compositor
+    // starvation, NOT a renderer main-thread block:
+    //   • rAF gap  = display/compositor liveness. requestAnimationFrame is gated on the
+    //     compositor producing a frame; if the GPU/WindowServer is starved, BeginFrame stops
+    //     and rAF stalls — so a LARGE rAF gap is the in-page signature of the GPU/compositor
+    //     freeze (the thing that actually beachballs the whole machine).
+    //   • timer gap = renderer main-thread liveness. setInterval is serviced by the renderer's
+    //     own task scheduler, independent of the compositor; it keeps firing even while the
+    //     display is frozen. A SMALL timer gap confirms the renderer's JS loop is NOT blocked.
+    // Divergence (rAF stalls, timer fine) ⇒ GPU/compositor starvation, not a JS stall — exactly
+    // the hypothesis the SSH/powermetrics capture (see the research doc) would then confirm.
+    let lastFrame = nowms(), maxFrameGap = 0;
+    let lastTick = nowms(), maxTickGap = 0, probeOn = true;
     const hasRAF = typeof requestAnimationFrame !== "undefined";
     const beat = () => {
       const n = nowms();
-      const g = n - lastFrame;
+      maxFrameGap = Math.max(maxFrameGap, n - lastFrame);
       lastFrame = n;
-      if (g > maxFrameGap) maxFrameGap = g;
-      if (hbOn && hasRAF) requestAnimationFrame(beat);
+      if (probeOn && hasRAF) requestAnimationFrame(beat);
     };
     if (hasRAF) requestAnimationFrame(beat);
+    const TICK_MS = 250;
+    const ticker = setInterval(() => {
+      const n = nowms();
+      maxTickGap = Math.max(maxTickGap, n - lastTick - TICK_MS); // subtract the expected interval
+      lastTick = n;
+    }, TICK_MS);
+
+    let session;
     try {
+      const tSess = nowms();
+      session = await ensureSession();
+      log(`ensureSession() ${Math.round(nowms() - tSess)}ms (display-stall ${Math.round(maxFrameGap)}ms / main-thread-stall ${Math.round(maxTickGap)}ms)`);
+      const tools = consumer.asPromptApiTools().concat(localTools);
+      // The session is surface-agnostic (created once), so tell the model the CURRENT page's tools
+      // each turn. This is what lets one persistent session serve every route without a rebuild.
+      const catalog = toolCatalog(consumer.list().concat(localTools));
+      // Recent turns (persisted across full-page navigations). The live session has its own
+      // context, but after open_video/run_search this is a FRESH page and a fresh session —
+      // the block is what carries the conversation over. Kept tiny: Nano is small and slow.
+      // dropLast=true: the current turn is already remembered and is appended below as
+      // "User said: …", so excluding it here avoids feeding Nano the utterance twice.
+      const recent = convo.block(700, true);
+      let turn =
+        (recent ? `Recent conversation:\n${recent}\n\n` : "") +
+        `Tools available on this page right now:\n${catalog}\n\nUser said: ${utterance}`;
       for (let i = 0; i < MANUAL_LOOP_HOPS; i++) {
         const tP = nowms();
         let raw;
@@ -998,15 +1035,22 @@
             const sinceAbort = Math.round(nowms() - tAbort.at);
             log(
               `session.prompt ABORTED (hop ${i}): promise settled ${sinceAbort}ms AFTER abort() — ` +
-                `if this is ~0ms the model honored abort; if it's seconds, the inference kept running. ` +
-                `max main-thread freeze so far ${Math.round(maxFrameGap)}ms`
+                `~0ms = blink honored the cancel; seconds = an in-flight prefill/decode ran past it. ` +
+                `display-stall ${Math.round(maxFrameGap)}ms / main-thread-stall ${Math.round(maxTickGap)}ms`
             );
-            destroySession(); // a wedged session won't recover; rebuild on the next turn
-            return "That took too long on the on-device model, so I stopped it. Try a direct command like play, pause, next, search, or list.";
+            destroySession(); // close the pipe (native cancel) + unload the model; rebuild next turn
+            // CIRCUIT BREAKER: a Nano turn that blew the budget means this machine's on-device
+            // model is stalling. Trip it off for the rest of the session so a freeze (the abort
+            // can't stop in-flight GPU/Metal dispatches) can happen AT MOST ONCE — every later
+            // turn routes to cloud/coaching via modelChoice(). Re-arm only by an explicit
+            // ytAgent.setEngine("nano") (which clears the trip).
+            state.nanoTripped = true;
+            log("on-device model TRIPPED OFF for this session (blew the turn budget). Re-arm with ytAgent.setEngine('nano').");
+            return "The on-device model stalled, so I've switched it off for now. Direct commands like play, pause, and search still work. You can add a cloud key for conversational answers.";
           }
           throw e;
         }
-        log(`session.prompt() hop ${i} ${Math.round(nowms() - tP)}ms (main-thread freeze so far ${Math.round(maxFrameGap)}ms)`);
+        log(`session.prompt() hop ${i} ${Math.round(nowms() - tP)}ms (display-stall ${Math.round(maxFrameGap)}ms / main-thread-stall ${Math.round(maxTickGap)}ms)`);
         const step = parseAction(raw);
         if (!step) return raw.trim(); // model returned plain prose; just use it
         if (step.action === "final") return step.say || "";
@@ -1036,8 +1080,19 @@
       return "Sorry, I couldn't complete that.";
     } finally {
       clearTimeout(deadline);
-      hbOn = false;
-      log(`model turn done — max main-thread freeze ${Math.round(maxFrameGap)}ms (≈ how long the page was beachballed)`);
+      clearInterval(ticker);
+      probeOn = false;
+      // Interpretation: a large display-stall with a small main-thread-stall is the signature
+      // of a GPU/compositor freeze (the whole-machine beachball) — capture it with the
+      // SSH/powermetrics recipe in docs/research/voice-audio-anti-freeze.md to confirm. If BOTH
+      // are large, the renderer's JS loop was blocked too (a different problem).
+      const verdict =
+        maxFrameGap > 1000 && maxTickGap < 500
+          ? " — display froze while JS kept running: GPU/compositor starvation (the whole-machine freeze); capture powermetrics to confirm"
+          : maxFrameGap > 1000 && maxTickGap >= 500
+          ? " — both stalled: the renderer JS loop was blocked too"
+          : "";
+      log(`model turn done — display-stall ${Math.round(maxFrameGap)}ms / main-thread-stall ${Math.round(maxTickGap)}ms${verdict}`);
     }
   }
   state.engine = geminiEngine;
@@ -1056,12 +1111,18 @@
   // ===========================================================================
   const cloudAvailable = () => !!(state.cloudTransport || state.cloudKey);
 
-  // Which model path a turn would use (the kill switch is checked separately, in ask()).
-  // "auto" prefers cloud when it's configured — the off-device path can't freeze the machine.
+  // Which model path a turn would use: "cloud" | "nano" | "none" (the kill switch is checked
+  // separately, in ask()). KEY FREEZE-SAFETY RULE: the on-device Nano path — the one that ran
+  // 200s and beachballed the whole machine — is NEVER reached by "auto". Turning the model on
+  // routes to the off-device cloud engine (can't freeze) or, with no cloud configured, to
+  // "none" (a coaching reply). On-device Nano is only ever chosen by an EXPLICIT, deliberate
+  // opt-in (ytAgent.setEngine("nano") — for instrumented measurement runs), and even then a
+  // single budget-blowing turn trips the breaker (state.nanoTripped) and drops it to "none"
+  // for the rest of the session, so a freeze can happen at most once.
   function modelChoice() {
-    if (state.engineMode === "cloud") return "cloud";
-    if (state.engineMode === "nano") return "nano";
-    return cloudAvailable() ? "cloud" : "nano";
+    if (state.engineMode === "nano") return state.nanoTripped ? "none" : "nano";
+    // "auto" and explicit "cloud" both prefer the off-device path; neither falls back to Nano.
+    return cloudAvailable() ? "cloud" : "none";
   }
 
   async function cloudFetchDirect(model, body) {
@@ -1503,11 +1564,23 @@
       return reply;
     }
     // Engine dispatch: a custom engine (useEngine mock) always wins; otherwise route by
-    // modelChoice() — cloud when configured ("auto"), else on-device Nano.
+    // modelChoice(). "none" = model on but no freeze-safe engine available — coach instead of
+    // silently running the on-device model (which is reachable only via explicit setEngine).
     let reply;
-    if (state.engine !== geminiEngine) reply = await state.engine(utterance);
-    else if (modelChoice() === "cloud") reply = await cloudEngine(utterance);
-    else reply = await geminiEngine(utterance);
+    if (state.engine !== geminiEngine) {
+      reply = await state.engine(utterance);
+    } else {
+      const choice = modelChoice();
+      if (choice === "cloud") reply = await cloudEngine(utterance);
+      else if (choice === "nano") reply = await geminiEngine(utterance);
+      else {
+        reply =
+          "I can only handle direct commands right now — try play, pause, next, search, or list. " +
+          "For conversational answers, add a Gemini API key in the extension popup.";
+        log("modelChoice=none (model on, no cloud key, on-device not explicitly enabled) — coaching reply.");
+        log("for an on-device measurement run only: ytAgent.setEngine('nano') (⚠️ can freeze the machine).");
+      }
+    }
     remember("agent", reply);
     log("reply:", reply);
     return reply;
@@ -2152,22 +2225,25 @@
       destroySession();
       log("engine:", state.engine === geminiEngine ? "Gemini Nano (default)" : "custom");
     },
-    // Model kill switch. OFF by default — on-device Nano inference has beachballed this whole
-    // machine (200s `session.prompt()`), and abort() stopping the native inference is UNPROVEN.
-    // `ytAgent.setModel(true)` opts in (persisted) — use it for the instrumented measurement run,
-    // watch the `max main-thread freeze` log, and turn it back off if the machine wedges.
+    // Model kill switch. OFF by default. Turning it ON enables the OFF-DEVICE cloud engine if
+    // a key is configured (no freeze risk); it does NOT route to on-device Nano — that path,
+    // the one that beachballed the machine (200s `session.prompt()`, abort effectiveness
+    // UNPROVEN), is reached only by the explicit, deliberate ytAgent.setEngine("nano").
     setModel(on) {
       state.modelEnabled = !!on;
       try {
         localStorage.setItem("ytA11yModelEnabled", on ? "1" : "0");
       } catch (_) {}
       if (!on) destroySession(); // drop any live session; nothing should keep the model warm
+      const choice = on ? modelChoice() : "off";
       log(
         `model: ${
-          on
-            ? modelChoice() === "cloud"
-              ? "ON — cloud engine (off-device; no freeze risk; your key, your quota)"
-              : "ON — on-device Nano (opt-in; watch the max main-thread freeze log; ytAgent.setModel(false) to kill)"
+          choice === "cloud"
+            ? "ON — cloud engine (off-device; no freeze risk; your key, your quota)"
+            : choice === "nano"
+            ? "ON — on-device Nano (explicit opt-in; watch the max main-thread freeze log; can freeze the machine)"
+            : on
+            ? "ON, but no freeze-safe engine — add a cloud key (ytAgent.setCloudKey / popup). On-device stays off unless you run ytAgent.setEngine('nano')."
             : "OFF (deterministic-only; commands, greeting, and browse all work)"
         }`
       );
@@ -2194,10 +2270,22 @@
       log(`cloud model: ${state.cloudModel}`);
       return state.cloudModel;
     },
-    // "auto" (cloud when configured, else nano) | "cloud" | "nano".
+    // Engine selection. "auto" (off-device cloud when configured, else a coaching reply —
+    // never on-device) | "cloud" | "nano". Choosing "nano" is the ONLY way to reach the
+    // on-device model; it is a deliberate, freeze-risky opt-in for instrumented measurement
+    // runs, and it clears the circuit breaker so a previously-tripped session can be re-armed.
     setEngine(mode) {
       state.engineMode = mode === "cloud" || mode === "nano" ? mode : "auto";
-      lsSet("ytA11yEngine", state.engineMode);
+      // Persist only the freeze-SAFE modes. "nano" is deliberately session-only: a
+      // machine-freezing path must never silently carry across a restart — you re-opt-in
+      // with setEngine("nano") each session.
+      if (state.engineMode === "nano") {
+        state.nanoTripped = false; // explicit re-arm
+        lsSet("ytA11yEngine", null); // don't persist nano; restart returns to "auto"
+        log("⚠️ engine: on-device Nano (this session only) — the path that can freeze the whole machine. Watch the 'max main-thread freeze' log; ytAgent.setEngine('auto') to leave.");
+      } else {
+        lsSet("ytA11yEngine", state.engineMode);
+      }
       log(`engine mode: ${state.engineMode} (effective: ${modelChoice()})`);
       return state.engineMode;
     },

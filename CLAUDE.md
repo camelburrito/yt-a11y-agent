@@ -125,41 +125,55 @@ boundary text-only (provider passes a URL; the consumer does the vision).
   the 5th). Tools read args **leniently** (`argIndex`/`argName`) because the small on-device
   model often mislabels them (e.g. omits `index`); the system prompt also gives a concrete
   `{"args":{"index":5}}` example.
-- **⚠️ THE whole-machine-freeze cause = unbounded on-device Nano inference (v0.9.19, EVIDENCE-CONFIRMED).**
-  The beachball was finally pinned by a clean isolation test: typing `ytAgent.ask("pause")` (no
-  mic/earcon/TTS) did **not** freeze, but saying "pause" with **earcons off** DID — and the log
-  showed **`session.prompt() hop 0 200828ms`** (3+ minutes of Gemini Nano inference) == the freeze
-  duration. It was **never** the mic, audio device, TTS, or voice (all ruled out by reproduction:
-  3 clean `coreaudiod` captures, a 12 s muted TTS run with 0 main-thread stalls, 64 GB/58%-free
-  memory, and Chrome exposing only compact voices). Two fixes: (1) **`MODEL_TURN_BUDGET_MS`
-  (12 s) hard cap** — `geminiEngine` runs every `session.prompt()` under an `AbortController` and
-  aborts + `destroySession()` + returns a fallback if Nano stalls, so inference can never freeze
-  the page for minutes; (2) **deterministic-first must cover the common verbs** — playback
-  (`pause`/`play`/`skip`/`captions`/`next`) is now handled on **every** surface (uses the provider
-  tool on `/watch`, actuates the page `<video>` elsewhere), because a "pause" on the home page was
-  falling through to Nano. **Rule: never let a common command reach the model; the model is a
-  last-resort, time-boxed fallback only.**
-- **⚠️ Model kill switch (v0.9.21) — ALL model paths are OFF by default.** A repeat beachball took
-  down the whole machine (including the dev terminal) even after the 12 s abort cap shipped, and
-  it is **unproven** that `AbortController` stops native Nano inference (spec only mandates
-  promise rejection). So **every** model call — Nano text (`geminiEngine`), cloud text
-  (`cloudEngine`), and vision (`describeImage` / `cloudDescribeImage`) — is gated behind
-  `state.modelEnabled` (persisted in `localStorage.ytA11yModelEnabled`, default OFF). With the
-  model off, an unrecognized utterance gets a short deterministic coaching reply; greeting,
-  commands, and arrow-browse all work normally. Opt in with `ytAgent.setModel(true)`;
-  `setModel(false)` also drops any live session. The startup banner logs the switch state.
+- **⚠️ THE whole-machine-freeze: on-device Nano inference saturates the GPU → compositor freeze
+  (mechanism corrected 2026-06-07; the 200s correlation holds, the "main-thread" framing did not).**
+  A single `session.prompt()` ran 200829ms and the whole machine (incl. the dev terminal)
+  beachballed for that duration — pinned to the model, not audio (typing `ytAgent.ask("pause")`
+  didn't freeze; the same words by voice, hitting Nano because "pause" was mis-gated behind
+  `onWatch` at the time, DID; 3 clean `coreaudiod` captures; 64 GB/58%-free RAM). **BUT** verified
+  research corrected the mechanism: Nano inference runs **out-of-process** (the `on_device_model`
+  utility service; `session.prompt()` is an async mojo round-trip), so it does **not** block this
+  renderer's main thread — a main-thread block would freeze only the tab, not a separate Terminal.
+  The whole-machine freeze is **GPU/Metal → WindowServer compositor starvation** (Nano's Metal
+  backend saturates the GPU the window server shares) — **most-likely but UNCERTAIN until captured**
+  (`scripts/capture-freeze.sh`; mechanism proof = GPU ≈100% / CPU-not-pegged / memory-green +
+  `kIOGPUCommandBufferCallbackErrorImpactingInteractivity` in the log). Defenses, in order of
+  load-bearing-ness: (1) **deterministic-first** — common verbs (`pause`/`play`/`skip`/`captions`/
+  `next`/search) never reach any model, handled on **every** surface; (2) **kill switch + cloud
+  default** — `modelChoice()` "auto" routes to the **off-device cloud engine** (zero local GPU →
+  cannot freeze) or a coaching reply, **never** on-device Nano; (3) **`MODEL_TURN_BUDGET_MS` (12s)
+  `AbortController`** — a REAL wired cancel that frees the JS await, but **best-effort, not a hard
+  kill** (the native cancel lands only at a token boundary; an in-flight prefill/load runs on), so
+  it's a *secondary* guard; (4) **one-strike circuit breaker** (`state.nanoTripped`) — a
+  budget-blowing Nano turn trips it off for the session so a freeze happens **at most once**.
+  **Rule: never let a common command reach the model; never let "auto" reach on-device Nano; the
+  on-device model is an explicit `setEngine("nano")` measurement-only opt-in.**
+- **⚠️ Model kill switch (v0.9.21) — ALL model paths are OFF by default.** Every model call — Nano
+  text (`geminiEngine`), cloud text (`cloudEngine`), and vision (`describeImage` /
+  `cloudDescribeImage`) — is gated behind `state.modelEnabled` (persisted in
+  `localStorage.ytA11yModelEnabled`, default OFF). With the model off, an unrecognized utterance
+  gets a short deterministic coaching reply; greeting, commands, and arrow-browse all work
+  normally. Opt in with `ytAgent.setModel(true)`; `setModel(false)` also drops any live session.
   Do not add any model call outside this gate.
+- **Engine routing (v0.10.1) — "auto" never reaches on-device Nano.** `modelChoice()` returns
+  `cloud` | `nano` | `none`: turning the model on uses the **off-device cloud engine** when a key
+  is configured, else returns a coaching reply (`none`). On-device Nano is reachable **only** via
+  an explicit, session-only `ytAgent.setEngine("nano")` (never persisted; a stale persisted
+  `"nano"` is coerced to `auto` on load) — it's a deliberate, freeze-risky **measurement-only**
+  opt-in. A budget-blowing Nano turn trips the **circuit breaker** (`state.nanoTripped`) so the
+  on-device path is dropped for the rest of the session (a freeze can occur at most once);
+  `setEngine("nano")` re-arms it. Vision follows the same routing.
 - **Cloud engine (v0.10.0) — opt-in BYOK Gemini API fallback; the safe way to turn the model on.**
-  `cloudEngine` mirrors the Nano JSON tool loop but runs OFF-DEVICE (cannot freeze the machine;
-  fetch abort actually works) — `modelChoice()` "auto" prefers it whenever it's configured.
-  Model pinned to `gemini-3.1-flash-lite` (**never** the `gemini-flash-latest` alias — parked on
-  a preview since 2026-01-21). **The key is never in this public repo**: dev harness =
-  `ytAgent.setCloudKey()` → localStorage (page-visible, dev only); extension = popup →
-  `chrome.storage.local`, read ONLY by the service worker which does the fetch — the key never
-  enters MAIN-world/page context and never crosses the bridge (only request text + correlation
-  ids do). Free-tier prompts may be used by Google for product improvement (disclosed in popup +
-  privacy policy). Conversation history (`convo`, sessionStorage, last ~12 turns) survives full
-  navigations and feeds both engines.
+  `cloudEngine` mirrors the Nano JSON tool loop but runs OFF-DEVICE (zero local GPU → cannot
+  whole-machine-freeze; fetch abort actually ends the request). Model pinned to
+  `gemini-3.1-flash-lite` (**never** the `gemini-flash-latest` alias — parked on a preview since
+  2026-01-21). **The key is never in this public repo**: dev harness = `ytAgent.setCloudKey()` →
+  localStorage (page-visible, dev only); extension = popup → `chrome.storage.local`, read ONLY by
+  the service worker which does the fetch — the key never enters MAIN-world/page context and never
+  crosses the bridge (only request text + correlation ids do), and the SW refuses inference when
+  the kill switch is off. Free-tier prompts may be used by Google for product improvement
+  (disclosed in popup + privacy policy). Conversation history (`convo`, sessionStorage, last ~12
+  turns) survives full navigations and feeds both engines.
 - **TTS voice (safeguard, not the freeze cause).** `pickVoice()` still prefers **LOCAL, COMPACT**
   voices and excludes `Enhanced/Premium/Siri/Eloquence` (`HEAVY_VOICE`) — a reasonable safeguard,
   though on the dev Mac no heavy voices were installed (compact "Samantha" was already used, so
@@ -287,17 +301,23 @@ boundary text-only (provider passes a URL; the consumer does the vision).
    measuring activation, never use `page.evaluate` (puppeteer passes `userGesture:true`,
    silently granting activation) — use raw `Runtime.evaluate` with `userGesture:false`,
    as the script does.
-5. **Freeze diagnosis (macOS).** The whole-machine-freeze root cause is still *inferred*, not
-   captured — confirm it before trusting any one fix (we've misattributed this once). To get a
-   real artifact, in a Terminal run `log stream --predicate 'process == "coreaudiod"' --info`
-   (or `log show --last 5m --predicate 'process == "coreaudiod"'` *after* recovery), reproduce
-   on the **unpatched** build with a `<video>` playing, and look for `default output device's
-   sample rate was changed`, `Start: Mach message timeout. Apparently deadlocked`, or
-   `HALS_OverloadMessage` at the instant the mic opens. Then A/B: webspeech+gate (default),
-   `setConstrainedSTT(true)`, and `setListenMode("nano")` — the `[yt-a11y-agent] beginListen:
-   gate open …` log line should show `unpausedMedia=0 synth.speaking=false` every time. Test the
-   worst case (**AirPods/Bluetooth** as output forces the 48→16 kHz aggregate path) and barge-in
-   (rapid taps). Full plan: `docs/research/voice-audio-anti-freeze.md`.
+5. **Freeze diagnosis (macOS).** The whole-machine-freeze mechanism is *most-likely* GPU/Metal →
+   WindowServer **compositor starvation** from on-device Nano, but still **UNCERTAIN until
+   captured** — confirm before trusting any fix (we've misattributed this ~5× by inference).
+   The local Terminal beachballs too, so capture from a sampler that survives the freeze:
+   **`sudo ./scripts/capture-freeze.sh`** (pre-starts in-kernel `powermetrics` + `log stream`,
+   summarizes after recovery), or hold an SSH session from a second machine running
+   `sudo powermetrics --samplers gpu_power,cpu_power,ane_power -i 500`. Repro: `setModel(true)` →
+   `setEngine("nano")` → a conversational (non-command) utterance so a real `session.prompt()`
+   runs. **Mechanism proof =** GPU active residency ≈100% for the whole freeze window WHILE CPU is
+   not pegged on all cores AND `memory_pressure` green, plus `log show --last 5m --predicate
+   'eventMessage CONTAINS "Impacting Interactivity"'` showing
+   `kIOGPUCommandBufferCallbackErrorImpactingInteractivity`. ⚠️ Do NOT grep for
+   `GPURestartSignaled`/`HALS_OverloadMessage` (stale/off-platform). In-page corroboration: the
+   `geminiEngine` dual probe logs `display-stall …ms / main-thread-stall …ms` — a large
+   display-stall with a small main-thread-stall is the GPU/compositor signature. The earlier
+   coreaudiod recipe (ruled out — 3 clean captures) and the mic A/B for the **separate** audio
+   class live in `docs/research/voice-audio-anti-freeze.md`.
 
 ## Status
 
