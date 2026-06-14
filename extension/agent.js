@@ -2,8 +2,8 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.9.1
-// @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech. On-device: no API key, no network, no CSP issues. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
+// @version      0.10.2
+// @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech, with an opt-in BYOK cloud-Gemini fallback. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
 // @run-at       document-idle
@@ -30,8 +30,33 @@
   "use strict";
 
   const LOG = "[yt-a11y-agent]";
-  const log = (...a) => console.log(LOG, ...a);
+  // High-res clock for timing. Every log line is stamped with seconds-since-load so the
+  // console shows where the time goes (e.g. which session.prompt() hop stalls the machine).
+  const nowms = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
+  const T0 = nowms();
+  const stamp = () => `+${((nowms() - T0) / 1000).toFixed(2)}s`;
+  const log = (...a) => console.log(LOG, stamp(), ...a);
   const MANUAL_LOOP_HOPS = 4; // max tool-call round-trips per ask() in the manual JSON loop
+  // ⚠️ Time cap on a whole on-device-model turn. A single Nano `session.prompt()` was measured
+  // at 200829ms (3+ min) and the whole machine (incl. a separate Terminal) beachballed for that
+  // duration. IMPORTANT mechanism correction (2026-06-07 research): Nano inference runs
+  // OUT-OF-PROCESS (the `on_device_model` utility service) over an async mojo round-trip, so it
+  // does NOT block this renderer's main thread — a long prompt only blocks the awaiting JS
+  // continuation. The whole-machine freeze is therefore system-level resource contention, most
+  // likely GPU/Metal → WindowServer **compositor starvation** (the GPU is shared with the macOS
+  // window server; a sustained ~200s Metal workload starves it → the display stops updating
+  // everywhere). UNPROVEN until captured — see docs/research/voice-audio-anti-freeze.md.
+  // What this cap does: `controller.abort()` is a REAL wired cancel (blink → mojo pipe reset →
+  // native CancelExecuteModel), so the cap reliably FREES THE JS AWAIT at 12s — but it is
+  // best-effort, NOT a hard kill: the cancel only lands at a token boundary, so an in-flight
+  // prefill / first-call model load runs to completion first (the GPU stays busy meanwhile).
+  // So this is a SECONDARY guard (bounds runaway latency); the load-bearing guards are the kill
+  // switch (Nano off by default), deterministic-first routing, and the off-device cloud engine.
+  const MODEL_TURN_BUDGET_MS = 12000;
+  // Per-request cap for the CLOUD engine. Unlike Nano's abort (unproven against native
+  // inference), aborting a fetch() reliably ends the request — a stalled network call can
+  // only ever cost this long, and it never touches the main thread.
+  const CLOUD_TIMEOUT_MS = 20000;
 
   // Crisp spoken cues so the user knows what we're doing during slow/navigating tools —
   // no endless silent waiting. One or two words; only for tools worth narrating.
@@ -52,6 +77,8 @@
     describe_image: "Looking at it.",
   };
 
+  // Probe order: document first — the spec moved the getter to Document (webmcp PR #184,
+  // 2026-05-27) and Chrome 150 follows; today's Chrome 149 still exposes navigator.modelContext.
   function getModelContext() {
     return (
       (typeof document !== "undefined" && document.modelContext) ||
@@ -100,6 +127,26 @@
     "You are an intermediary: you never alter the page. You read it and act on the user's behalf while their screen reader stays in charge.",
   ].join("\n");
 
+  // The manual tool-call protocol, shared by BOTH engines (on-device Nano and the cloud
+  // fallback): one strict-JSON action per turn, which we parse and run ourselves. Nano's
+  // native tool-calling narrates instead of executing; the cloud API has real function
+  // calling, but keeping ONE protocol means one parser, one loop, and engines that can be
+  // swapped mid-session.
+  const JSON_PROTOCOL =
+    "You control the page through tools. On EVERY turn reply with ONE line of strict JSON, nothing else, no markdown fences.\n" +
+    "Each turn begins by listing the tools available on the CURRENT page (they change as the user navigates).\n" +
+    'To use a tool, include ALL its required args. Example: {"action":"call","tool":"open_video","args":{"index":3}}\n' +
+    'When you can answer the user: {"action":"final","say":"<the reply to speak>"}\n' +
+    'Videos are numbered starting at 1; pass the exact number the user says (e.g. "open video 5" -> {"action":"call","tool":"open_video","args":{"index":5}}).';
+
+  // Model-facing catalog of the current surface's tools (passed per turn — they're
+  // route-scoped, so the set changes as the user navigates).
+  function toolCatalog(tools) {
+    return tools
+      .map((t) => `- ${t.name}: ${t.description || ""} | args: ${JSON.stringify(t.inputSchema || { type: "object", properties: {} })}`)
+      .join("\n");
+  }
+
   // ===========================================================================
   // CONSUMER BRIDGE (MCP client side).
   // The provider's ModelContext only exposes registerTool — no list/call. So we wrap
@@ -133,6 +180,16 @@
       isReady: () => wrapped,
       list: () => [...tools.values()],
       signature: () => [...tools.keys()].sort().join(","),
+      has: (name) => tools.has(name),
+      // Invoke a captured provider tool by name and return its raw WebMCP envelope
+      // ({ content: [{ type:"text", text }] }) — callers read res.content[0].text. The
+      // provider's ModelContext has no callTool, so we drive the captured tool directly.
+      // Throws if the tool isn't registered on the current surface, so callers should guard.
+      async call(name, args) {
+        const t = tools.get(name);
+        if (!t) throw new Error(`tool not registered on this surface: ${name}`);
+        return await t.execute(args || {});
+      },
       // Wrap captured WebMCP tools into Prompt-API tools. The shapes nearly match; we only
       // flatten the WebMCP { content:[{text}] } envelope down to a string for the model.
       asPromptApiTools: () =>
@@ -161,23 +218,39 @@
       (typeof window !== "undefined" && (window.SpeechRecognition || window.webkitSpeechRecognition)) ||
       null;
 
-    // Voice selection. The first English voice is often a low-quality/robotic system voice;
-    // prefer natural ones (Chrome's Google voices, or Mac's good voices), with a user override.
+    // Voice selection. CRITICAL: prefer LOCAL voices (localService === true). The "Google"
+    // / online voices (localService === false) fetch audio from a server PER utterance — when
+    // that network call stalls, speechSynthesis.speak() takes ~25s to say one word and freezes
+    // the turn (measured: speak() 25510ms for "Paused."). Local macOS voices (Samantha/Alex/…)
+    // are instant and never touch the network. We only fall back to an online voice if there is
+    // no local English voice at all. A user override (setVoice) still wins if it's local.
     let preferredVoiceName = null;
+    // ⚠️ AVOID macOS "Enhanced"/"Premium" and Siri/Eloquence voices. They synthesize with a large
+    // neural model that can STALL — even beachball — the whole machine for the duration of the
+    // utterance (longer text → longer freeze; this was the "machine hangs during speak()" report,
+    // confirmed by a CLEAN coreaudiod log: the freeze is in speechsynthesisd, not the audio
+    // device). The old regex matched "Samantha (Enhanced)" / "Aaron" (Siri) — i.e. we were
+    // picking the heavy voice. Prefer the lightweight COMPACT local voices instead.
+    const HEAVY_VOICE = /\b(enhanced|premium|eloquence|siri)\b|\((enhanced|premium)\)/i;
     function pickVoice() {
       const vs = synth ? synth.getVoices() : [];
       if (!vs.length) return null;
       const en = vs.filter((v) => v.lang && v.lang.toLowerCase().startsWith("en"));
       const pool = en.length ? en : vs;
+      const local = pool.filter((v) => v.localService); // no per-utterance network fetch
+      const light = local.filter((v) => !HEAVY_VOICE.test(v.name)); // drop Enhanced/Premium/Siri
+      const safe = light.length ? light : local.length ? local : pool;
       if (preferredVoiceName) {
-        const m = pool.find((v) => v.name.toLowerCase().includes(preferredVoiceName.toLowerCase()));
+        const m = safe.find((v) => v.name.toLowerCase().includes(preferredVoiceName.toLowerCase()));
         if (m) return m;
       }
       return (
-        pool.find((v) => /google/i.test(v.name)) || // Chrome's natural network voices
-        pool.find((v) => /(samantha|alex|karen|daniel|natural|neural|siri|aria|jenny|libby)/i.test(v.name)) ||
-        pool.find((v) => v.localService === false) || // online voices tend to sound better
-        pool[0]
+        // Classic, lightweight COMPACT macOS/Windows voices (anchored so we match the plain
+        // "Samantha", not "Samantha (Enhanced)" — which is already excluded from `safe` anyway).
+        safe.find((v) => /^(samantha|alex|daniel|karen|moira|tessa|fiona|victoria|allison|ava|susan|zoe|fred)\b/i.test(v.name)) ||
+        safe.find((v) => v.default && !HEAVY_VOICE.test(v.name)) ||
+        safe[0] || // any light local voice beats forcing the browser default (which may BE the heavy one)
+        null
       );
     }
     function setVoice(name) {
@@ -201,49 +274,173 @@
       return volume;
     }
 
+    // Single speech channel. Every speak() INTERRUPTS the previous line instead of queueing
+    // behind it — otherwise rapid arrow presses read every old item in order, and a reply
+    // keeps talking after the user has barged in. Tricky part: calling synth.speak()
+    // immediately after synth.cancel() races on Chrome and silently drops the utterance, so
+    // we cancel, then start on the next tick. And when a new line supersedes one that hasn't
+    // started speaking yet, we must still resolve the old promise (else `await speak()` hangs).
+    let pendingResolve = null;
+    let speakTimer = null;
+    let resumeTimer = null;
+    let loggedVoice = false; // one-time log of the selected TTS voice (diagnosing the speak() freeze)
+    function flushSpeak() {
+      if (speakTimer) {
+        clearTimeout(speakTimer);
+        speakTimer = null;
+      }
+      if (pendingResolve) {
+        const r = pendingResolve;
+        pendingResolve = null;
+        r();
+      }
+    }
     function speak(text) {
       return new Promise((resolve) => {
         if (!synth || !text) return resolve();
-        // Do NOT call synth.cancel() right before speak() — on Chrome it races and can
-        // swallow the utterance (silent TTS). Also wait for voices to load (they arrive
-        // async via voiceschanged; getVoices() is often empty on the first call), pick one
-        // explicitly, and resume() to unstick Chrome's long-standing paused-queue bug.
-        const fire = () => {
+        flushSpeak(); // resolve + cancel whatever was speaking/queued
+        try {
+          synth.cancel();
+        } catch (_) {}
+        pendingResolve = resolve;
+        const start = () => {
+          speakTimer = null;
           const u = new SpeechSynthesisUtterance(text);
           u.rate = rate;
           u.volume = volume;
           const v = pickVoice();
           if (v) u.voice = v;
-          u.onend = () => resolve();
-          u.onerror = () => resolve();
+          if (!loggedVoice) {
+            loggedVoice = true;
+            log(`TTS voice: ${v ? `${v.name} (local=${v.localService})` : "browser default"}`);
+          }
+          // Watchdog: if the utterance neither ends nor errors in a reasonable window (a
+          // stalled/online voice can take ~25s for one word), cancel and move on so a turn is
+          // never blocked. Budget scales with text length but caps generously for long greetings.
+          let watchdog = setTimeout(() => {
+            // Do NOT synth.cancel() here — local macOS voices often speak fine but fire onend
+            // late or never, and cancelling would CUT the audio (the "not reading responses"
+            // bug). Just resolve so the turn isn't blocked; the audio keeps playing and the
+            // next speak()'s cancel clears anything still going.
+            finish();
+          }, Math.min(30000, Math.max(8000, text.length * 140)));
+          const finish = () => {
+            if (watchdog) {
+              clearTimeout(watchdog);
+              watchdog = null;
+            }
+            if (pendingResolve === resolve) pendingResolve = null;
+            resolve();
+          };
+          u.onend = finish;
+          u.onerror = finish;
           synth.speak(u);
-          setTimeout(() => synth.resume(), 100);
+          if (resumeTimer) clearTimeout(resumeTimer);
+          resumeTimer = setTimeout(() => {
+            try {
+              synth.resume(); // unstick Chrome's long-standing paused-queue bug
+            } catch (_) {}
+          }, 100);
         };
-        if (synth.getVoices().length) fire();
-        else synth.addEventListener("voiceschanged", fire, { once: true });
+        // Wait for voices on the very first call (getVoices() is async via voiceschanged),
+        // then start a tick later to dodge the cancel→speak race.
+        const launch = () => {
+          speakTimer = setTimeout(start, 70);
+        };
+        if (synth.getVoices().length) launch();
+        else synth.addEventListener("voiceschanged", launch, { once: true });
       });
     }
 
     let activeRec = null;
-    function listenOnce() {
+    const LISTEN_WATCHDOG_MS = 10000; // a single listen can NEVER hold the mic longer than this
+    // When true, capture through a constrained getUserMedia track (echo-cancellation OFF) handed
+    // to rec.start(track). EC-off capture does NOT engage macOS Voice Processing I/O, which is
+    // what hooks/reconfigures the OUTPUT device and triggers the coreaudiod freeze (see
+    // docs/research/voice-audio-anti-freeze.md). OFF by default: SpeechRecognition.start(track)
+    // is flag-gated (~M135 dev-trial) and not reliably feature-detectable, so if it were silently
+    // ignored we'd open a SECOND capture (worse). Opt in via ytAgent.setConstrainedSTT(true) to
+    // A/B it against the instrumentation; the guaranteed freeze-proof path is nano listen mode.
+    let useConstrained = false;
+    async function listenOnce() {
+      // Acquire the constrained track BEFORE the Promise so getUserMedia rejection is awaitable.
+      let micTrack = null;
+      if (useConstrained && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        try {
+          const s = await navigator.mediaDevices.getUserMedia({
+            audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 },
+          });
+          micTrack = s.getAudioTracks()[0] || null;
+        } catch (_) {
+          micTrack = null; // fall back to the bare path (still behind the quiesce gate)
+        }
+      }
       return new Promise((resolve, reject) => {
-        if (!SR) return reject(new Error("SpeechRecognition not supported in this browser."));
+        if (!SR) {
+          if (micTrack) try { micTrack.stop(); } catch (_) {}
+          return reject(new Error("SpeechRecognition not supported in this browser."));
+        }
         const rec = new SR();
         activeRec = rec;
         rec.lang = "en-US";
         rec.interimResults = false;
         rec.maxAlternatives = 1;
-        let done = false;
-        rec.onresult = (e) => {
-          done = true;
-          resolve(e.results[0][0].transcript);
-        };
-        rec.onerror = (e) => reject(new Error("speech recognition error: " + e.error));
-        rec.onend = () => {
+        let result = null;
+        let settled = false;
+        // Backstop: if onend/onresult never fire, force-abort so the mic is freed no matter what.
+        const watchdog = setTimeout(() => {
+          try {
+            rec.abort();
+          } catch (_) {}
+        }, LISTEN_WATCHDOG_MS);
+        // Resolve/reject EXACTLY once, and only here — after onend, i.e. once the mic is released.
+        const settle = (err) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(watchdog);
           activeRec = null;
-          if (!done) reject(new Error("no speech detected"));
+          if (micTrack) {
+            try { micTrack.stop(); } catch (_) {} // always free our own getUserMedia track
+            micTrack = null;
+          }
+          if (err) reject(err);
+          else if (result && result.trim()) resolve(result);
+          else reject(new Error("no speech detected"));
         };
-        rec.start();
+        rec.onresult = (e) => {
+          result = e.results[0][0].transcript;
+          // We have the words — stop capturing. CRITICAL: do NOT resolve here. We resolve in
+          // onend, i.e. only once Chrome has actually RELEASED the microphone, so the caller's
+          // TTS reply never plays while the mic is still open. That mic-input + speaker-output
+          // overlap is the macOS coreaudiod collision that froze the whole machine.
+          try {
+            rec.stop();
+          } catch (_) {}
+        };
+        rec.onerror = (e) => settle(new Error("speech recognition error: " + e.error));
+        rec.onend = () => settle(); // mic fully released at this point
+        try {
+          if (micTrack) {
+            rec.start(micTrack); // EC-off track — skips Voice Processing I/O (no output-device reconfigure)
+            log("listen: constrained EC-off track");
+          } else {
+            rec.start();
+          }
+        } catch (e) {
+          // rec.start(track) unsupported on this build → drop the track and use the bare path.
+          if (micTrack) {
+            try { micTrack.stop(); } catch (_) {}
+            micTrack = null;
+            try {
+              rec.start();
+              log("listen: bare (start(track) unsupported)");
+            } catch (e2) {
+              return settle(e2);
+            }
+          } else {
+            return settle(e);
+          }
+        }
       });
     }
     // Abort an in-progress listen (used by stop()).
@@ -256,6 +453,7 @@
       }
     }
     function cancelSpeech() {
+      flushSpeak(); // resolve any awaited speak() so callers don't hang
       if (synth) {
         try {
           synth.cancel();
@@ -263,88 +461,21 @@
       }
     }
 
-    // Hold-to-talk: holdStart() begins continuous recognition and resolves with the full
-    // transcript when holdStop() is called (on key release). Continuous so a natural pause
-    // mid-sentence doesn't cut the user off.
-    let holdRec = null;
-    const MAX_HOLD_MS = 12000; // hard cap: a stuck hold can NEVER hold the mic longer than this
-    function holdStart() {
-      return new Promise((resolve, reject) => {
-        if (!SR) return reject(new Error("SpeechRecognition not supported."));
-        const rec = new SR();
-        holdRec = rec;
-        rec.lang = "en-US";
-        rec.continuous = true;
-        rec.interimResults = true;
-        let finalText = "";
-        let started = false;
-        let stopRequested = false;
-        // Safety: if key-up is somehow missed (app switch while holding, lost keyup, etc.),
-        // force-stop so the microphone is never held open indefinitely — which would block
-        // video-call apps and run continuous recognition forever.
-        const safety = setTimeout(() => {
-          try {
-            rec.stop();
-          } catch (_) {}
-        }, MAX_HOLD_MS);
-        // End + force-release. stop() finalizes the transcript, but on a CONTINUOUS recognizer
-        // Chrome often keeps the mic after stop() — so abort() shortly after to guarantee the
-        // mic is freed. (We've been accumulating interim text, so we keep the transcript.)
-        const endNow = () => {
-          try {
-            rec.stop();
-          } catch (_) {}
-          setTimeout(() => {
-            try {
-              rec.abort();
-            } catch (_) {}
-          }, 600);
-        };
-        // Race fix: a quick tap can fire key-up (holdStop) BEFORE recognition has started, so
-        // act as soon as it has actually started.
-        rec._requestStop = () => {
-          stopRequested = true;
-          if (started) endNow();
-        };
-        rec.onstart = () => {
-          started = true;
-          if (stopRequested) endNow();
-        };
-        rec.onresult = (e) => {
-          finalText = "";
-          for (let i = 0; i < e.results.length; i++) finalText += e.results[i][0].transcript;
-        };
-        rec.onerror = (e) => {
-          clearTimeout(safety);
-          holdRec = null;
-          reject(new Error("speech recognition error: " + e.error));
-        };
-        rec.onend = () => {
-          clearTimeout(safety);
-          holdRec = null;
-          resolve(finalText.trim());
-        };
-        rec.start();
-      });
-    }
-    function holdStop() {
-      if (holdRec && holdRec._requestStop) holdRec._requestStop();
-    }
+    // NOTE: there is deliberately NO continuous-recognition / hold-to-talk path here. A
+    // continuous SpeechRecognition (rec.continuous = true) is what previously held the mic
+    // open, blocked video-call apps, and hung the machine — Chrome often keeps the mic after
+    // stop() on a continuous recognizer. All listening goes through the non-continuous
+    // listenOnce() above (with its 10s watchdog). Do NOT reintroduce a continuous recognizer.
+
     // Hard release: immediately abort any active recognition and drop the mic. Used on tab
     // hide / window blur / unload so we never hold the microphone away from other apps.
     function releaseMic() {
-      try {
-        if (holdRec) holdRec.abort();
-      } catch (_) {}
-      holdRec = null;
       abortListen();
     }
 
     return {
       speak,
       listenOnce,
-      holdStart,
-      holdStop,
       releaseMic,
       abortListen,
       cancelSpeech,
@@ -352,6 +483,11 @@
       listVoices,
       setRate,
       setSpeechVolume,
+      setConstrained: (b) => {
+        useConstrained = !!b;
+        return useConstrained;
+      },
+      isConstrained: () => useConstrained,
       supported: { tts: !!synth, stt: !!SR },
     };
   })();
@@ -376,6 +512,14 @@
         o.connect(g);
         g.connect(ctx.destination);
         const t = ctx.currentTime;
+        // Suspend the context the instant the tone ends so it never holds an open output stream
+        // on coreaudiod alongside a following speechSynthesis utterance — a second live output
+        // client during TTS is a prime suspect for the macOS whole-machine freeze during speak().
+        o.onended = () => {
+          try {
+            if (ctx && ctx.state === "running") ctx.suspend();
+          } catch (_) {}
+        };
         o.start(t);
         o.stop(t + (dur || 0.1));
       } catch (_) {}
@@ -385,6 +529,14 @@
       captured: () => tone(900, 0.08, "sine", 0.05), // got your voice
       ready: () => tone(520, 0.1, "sine", 0.04), // done / your turn
       error: () => tone(200, 0.2, "triangle", 0.05), // didn't catch it
+      // Suspend the earcon AudioContext so it holds NO live CoreAudio render thread while the
+      // mic is open — an always-on output context is one of the things contending with capture
+      // at the freeze instant. tone() resumes it automatically the next time an earcon plays.
+      suspend: () => {
+        try {
+          if (ctx && ctx.state === "running") ctx.suspend();
+        } catch (_) {}
+      },
       setVolume: (v) => {
         vol = Math.max(0, Math.min(2, Number(v)));
         return vol;
@@ -406,7 +558,12 @@
     // Record one utterance: wait for speech, stop after `silenceMs` of trailing quiet, or
     // `maxMs` hard cap. Returns a Blob, or null if nobody spoke. Energy-based VAD.
     async recordUtterance({ maxMs = 12000, silenceMs = 1200, startTimeoutMs = 6000 } = {}) {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // echoCancellation OFF: EC engages macOS Voice Processing I/O, which hooks/reconfigures the
+      // OUTPUT device — the coreaudiod freeze trigger. Plain getUserMedia (the WebRTC path that
+      // Meet/FaceTime use and that never freezes) records fine without it.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 },
+      });
       this._stream = stream;
       const rec = new MediaRecorder(stream);
       this._rec = rec;
@@ -545,6 +702,16 @@
   let imageBase = null;
   async function describeImage(url, question) {
     if (!url) throw new Error("describeImage needs a url");
+    // Vision is model inference too — same freeze-safety rules as text. Gated by the kill
+    // switch (state.modelEnabled, default OFF), and routed through modelChoice() so on-device
+    // Nano image input — which carries the same whole-machine-freeze risk as a text turn — is
+    // ONLY used under an explicit setEngine("nano") opt-in, never by "auto". Cloud vision runs
+    // off-device (no freeze risk); "none" returns coaching rather than silently invoking Nano.
+    if (!state.modelEnabled) return "Image descriptions are off while the model is disabled.";
+    const choice = modelChoice();
+    if (choice === "cloud") return await cloudDescribeImage(url, question);
+    if (choice !== "nano")
+      return "Image descriptions need a cloud key (add one in the extension popup), or on-device vision turned on explicitly.";
     const LM = getLanguageModel();
     if (!LM) throw new Error("Prompt API unavailable for vision.");
     const r = await fetch(url);
@@ -601,6 +768,76 @@
   ];
 
   // ===========================================================================
+  // CONVERSATION MEMORY — survives full-page navigations (sessionStorage, tab-scoped).
+  // open_video / run_search trigger cross-document loads that reset this whole script; the
+  // pend() continuation already carries ONE message across, but the conversation itself was
+  // lost ("search feels broken" in HANDOFF). Persisting the last few turns lets the next
+  // page's agent keep context ("repeat", follow-up questions) and gives the stateless cloud
+  // engine its history. Capped small on purpose — this is a context bridge, not a log.
+  // ===========================================================================
+  const lsGet = (k) => {
+    try {
+      return localStorage.getItem(k);
+    } catch (_) {
+      return null;
+    }
+  };
+  const lsSet = (k, v) => {
+    try {
+      if (v === null || v === undefined) localStorage.removeItem(k);
+      else localStorage.setItem(k, v);
+    } catch (_) {}
+  };
+  const CONVO_KEY = "ytA11yConvo";
+  const CONVO_MAX = 12; // entries (user+agent) — keeps prompts small and storage trivial
+  const convo = {
+    history: (() => {
+      try {
+        const v = JSON.parse(sessionStorage.getItem(CONVO_KEY) || "[]");
+        return Array.isArray(v) ? v.slice(-CONVO_MAX) : [];
+      } catch (_) {
+        return [];
+      }
+    })(),
+    push(role, text) {
+      if (!text) return;
+      this.history.push({ role, text: String(text).slice(0, 500) });
+      if (this.history.length > CONVO_MAX) this.history = this.history.slice(-CONVO_MAX);
+      try {
+        sessionStorage.setItem(CONVO_KEY, JSON.stringify(this.history));
+      } catch (_) {}
+    },
+    // Compact transcript block for the per-turn Nano prompt (must stay tiny — the on-device
+    // model is slow and small). The cloud engine gets the history as real turns instead.
+    // dropLast skips the most recent entry: ask() records the current user turn BEFORE the
+    // engine runs, and geminiEngine appends "User said: …" itself, so without this the
+    // current utterance would appear twice and waste Nano's tiny context.
+    block(maxChars = 700, dropLast = false) {
+      const out = [];
+      let used = 0;
+      const end = dropLast ? this.history.length - 1 : this.history.length;
+      for (let i = end - 1; i >= 0; i--) {
+        const line = `${this.history[i].role === "user" ? "User" : "You"}: ${this.history[i].text}`;
+        if (used + line.length > maxChars) break;
+        out.unshift(line);
+        used += line.length;
+      }
+      return out.join("\n");
+    },
+    clear() {
+      this.history = [];
+      try {
+        sessionStorage.removeItem(CONVO_KEY);
+      } catch (_) {}
+    },
+  };
+  // Record a turn (and keep "repeat" working across navigations via state.lastReply).
+  function remember(role, text) {
+    convo.push(role, text);
+    if (role === "agent" && text) state.lastReply = text;
+  }
+
+  // ===========================================================================
   // ENGINE — Chrome built-in Gemini Nano (Prompt API) with native tool calling.
   // The session is bound to the tools captured at creation time; tools are route-scoped,
   // so we rebuild the session when the captured tool set changes. Pluggable via
@@ -614,7 +851,43 @@
     // "webspeech" (default, fast, streaming) or "nano" (on-device audio transcription —
     // EXPERIMENTAL: slower and can briefly jank the page during inference).
     listenMode: "webspeech",
+    // ⚠️  Model kill switch — OFF by default. On this machine a single Nano `session.prompt()` has
+    // run 200s and beachballed the ENTIRE machine (took down other apps, incl. the dev terminal),
+    // and it is unproven that AbortController actually stops the native inference. Until that's
+    // measured (or a cloud path exists), the model must be explicit opt-in: `ytAgent.setModel(true)`
+    // (persisted in localStorage). Everything operational — greeting, commands, browse — is
+    // deterministic and works with the model off.
+    modelEnabled: (() => {
+      try {
+        return localStorage.getItem("ytA11yModelEnabled") === "1";
+      } catch (_) {
+        return false;
+      }
+    })(),
+    // --- Cloud fallback (BYOK — bring your own Google AI Studio key). -----------------
+    // The repo is public: the key is NEVER in code. Dev harness: ytAgent.setCloudKey()
+    // stores it in localStorage (page-visible — dev convenience only). Extension: the key
+    // lives in chrome.storage.local and ONLY the service worker reads it; the SW does the
+    // fetch and agent-control.js installs `cloudTransport` so this MAIN-world code never
+    // sees the key (and YouTube's page CSP never applies to the request).
+    // "auto" | "cloud" | "nano". Only "cloud"/"auto" are honored from storage — a persisted
+    // "nano" (e.g. from an older build) is coerced to "auto" so the freeze-prone on-device
+    // path never auto-arms on load; it must be chosen fresh each session via setEngine("nano").
+    engineMode: lsGet("ytA11yEngine") === "cloud" ? "cloud" : "auto",
+    nanoTripped: false, // circuit breaker: a budget-blowing Nano turn trips this for the session
+    cloudKey: lsGet("ytA11yCloudKey") || null,
+    // Pinned STABLE model (GA 2026-05-07; cheap, structured-output capable). Do NOT use the
+    // "gemini-flash-latest" alias — it has been parked on a PREVIEW model since 2026-01-21,
+    // and previews get preview-class rate limits + 2-week-notice repoints.
+    cloudModel: lsGet("ytA11yCloudModel") || "gemini-3.1-flash-lite",
+    cloudTransport: null, // installed by the extension (service-worker fetch relay)
   };
+  // Restore "repeat" across navigations from the persisted conversation.
+  state.lastReply = (() => {
+    for (let i = convo.history.length - 1; i >= 0; i--)
+      if (convo.history[i].role === "agent") return convo.history[i].text;
+    return null;
+  })();
 
   async function availability() {
     const LM = getLanguageModel();
@@ -644,9 +917,15 @@
   // executes. Instead we drive tools manually (see geminiEngine): the system prompt
   // instructs the model to emit ONE line of strict JSON per turn, which we parse and run.
   async function ensureSession() {
-    const sig = consumer.signature();
-    if (state.session && state.sessionSig === sig) return state.session;
-    destroySession(); // toolset changed (route change) or first run -> rebuild
+    // ONE persistent session for the whole browser tab. We deliberately do NOT key the session
+    // on the toolset. Embedding the per-surface tool catalog in initialPrompts meant every
+    // YouTube route change (home<->watch<->search) changed the signature and rebuilt the
+    // session — and each LM.create() is a ~20s on-device model load that pegs the machine
+    // (THE "whole machine freezes when the mic is used" report — confirmed by a clean coreaudiod
+    // log + LM.create()=22s/ensureSession=29s in the timing logs; it was the model, not audio).
+    // The catalog is passed per-turn in geminiEngine instead, so the model still sees the
+    // current surface's tools while the session is created once and reused everywhere.
+    if (state.session) return state.session;
 
     const LM = getLanguageModel();
     if (!LM) {
@@ -663,32 +942,15 @@
       voice.speak("Setting up the on-device model, one moment."); // communicate the one-time fetch
     }
 
-    const catalog = consumer
-      .list()
-      .concat(localTools) // provider WebMCP tools + consumer-local tools (e.g. describe_image)
-      .map(
-        (t) =>
-          `- ${t.name}: ${t.description || ""} | args: ${JSON.stringify(
-            t.inputSchema || { type: "object", properties: {} }
-          )}`
-      )
-      .join("\n");
-    const sys =
-      SYSTEM +
-      "\n\n" +
-      "You control the page through tools. On EVERY turn reply with ONE line of strict JSON, nothing else, no markdown fences.\n" +
-      'To use a tool, include ALL its required args. Example: {"action":"call","tool":"open_video","args":{"index":3}}\n' +
-      'When you can answer the user: {"action":"final","say":"<the reply to speak>"}\n' +
-      'Videos are numbered starting at 1; pass the exact number the user says (e.g. "open video 5" -> {"action":"call","tool":"open_video","args":{"index":5}}).\n' +
-      "Available tools:\n" +
-      catalog;
+    const sys = SYSTEM + "\n\n" + JSON_PROTOCOL;
 
+    const tCreate = nowms();
     state.session = await LM.create({
       initialPrompts: [{ role: "system", content: sys }],
       monitor: dlMonitor,
     });
-    state.sessionSig = sig;
-    log(`Gemini session ready (availability="${avail}"); tools: ${sig || "(none)"}`);
+    state.sessionSig = "persistent";
+    log(`LM.create() took ${Math.round(nowms() - tCreate)}ms (availability="${avail}") — one-time; session now persists across routes`);
     return state.session;
   }
 
@@ -707,39 +969,323 @@
   // Manual tool-call loop: prompt -> parse JSON action -> run tool -> feed result back,
   // up to MANUAL_LOOP_HOPS round-trips, then expect a {"action":"final"}.
   async function geminiEngine(utterance) {
-    const session = await ensureSession();
+    // Whole-turn deadline + DUAL liveness probe set up BEFORE the model loads — because the
+    // first-call model load (LM.create in ensureSession) is itself a long, non-preemptible GPU
+    // op that can saturate the machine (v0.9.15: LM.create was ~22-29s), and it was previously
+    // unmeasured/unguarded.
+    const ac = new AbortController();
+    const tAbort = { at: 0 };
+    const deadline = setTimeout(() => {
+      tAbort.at = nowms();
+      ac.abort();
+    }, MODEL_TURN_BUDGET_MS);
+    // CRUX INSTRUMENTATION — a DUAL probe, because the research showed Nano inference is
+    // out-of-process and the whole-machine freeze is most likely GPU→WindowServer compositor
+    // starvation, NOT a renderer main-thread block:
+    //   • rAF gap  = display/compositor liveness. requestAnimationFrame is gated on the
+    //     compositor producing a frame; if the GPU/WindowServer is starved, BeginFrame stops
+    //     and rAF stalls — so a LARGE rAF gap is the in-page signature of the GPU/compositor
+    //     freeze (the thing that actually beachballs the whole machine).
+    //   • timer gap = renderer main-thread liveness. setInterval is serviced by the renderer's
+    //     own task scheduler, independent of the compositor; it keeps firing even while the
+    //     display is frozen. A SMALL timer gap confirms the renderer's JS loop is NOT blocked.
+    // Divergence (rAF stalls, timer fine) ⇒ GPU/compositor starvation, not a JS stall — exactly
+    // the hypothesis the SSH/powermetrics capture (see the research doc) would then confirm.
+    let lastFrame = nowms(), maxFrameGap = 0;
+    let lastTick = nowms(), maxTickGap = 0, probeOn = true;
+    const hasRAF = typeof requestAnimationFrame !== "undefined";
+    const beat = () => {
+      const n = nowms();
+      maxFrameGap = Math.max(maxFrameGap, n - lastFrame);
+      lastFrame = n;
+      if (probeOn && hasRAF) requestAnimationFrame(beat);
+    };
+    if (hasRAF) requestAnimationFrame(beat);
+    const TICK_MS = 250;
+    const ticker = setInterval(() => {
+      const n = nowms();
+      maxTickGap = Math.max(maxTickGap, n - lastTick - TICK_MS); // subtract the expected interval
+      lastTick = n;
+    }, TICK_MS);
+
+    let session;
+    try {
+      const tSess = nowms();
+      session = await ensureSession();
+      log(`ensureSession() ${Math.round(nowms() - tSess)}ms (display-stall ${Math.round(maxFrameGap)}ms / main-thread-stall ${Math.round(maxTickGap)}ms)`);
+      const tools = consumer.asPromptApiTools().concat(localTools);
+      // The session is surface-agnostic (created once), so tell the model the CURRENT page's tools
+      // each turn. This is what lets one persistent session serve every route without a rebuild.
+      const catalog = toolCatalog(consumer.list().concat(localTools));
+      // Recent turns (persisted across full-page navigations). The live session has its own
+      // context, but after open_video/run_search this is a FRESH page and a fresh session —
+      // the block is what carries the conversation over. Kept tiny: Nano is small and slow.
+      // dropLast=true: the current turn is already remembered and is appended below as
+      // "User said: …", so excluding it here avoids feeding Nano the utterance twice.
+      const recent = convo.block(700, true);
+      let turn =
+        (recent ? `Recent conversation:\n${recent}\n\n` : "") +
+        `Tools available on this page right now:\n${catalog}\n\nUser said: ${utterance}`;
+      for (let i = 0; i < MANUAL_LOOP_HOPS; i++) {
+        const tP = nowms();
+        let raw;
+        try {
+          raw = await session.prompt(turn, { signal: ac.signal });
+        } catch (e) {
+          if (ac.signal.aborted) {
+            const sinceAbort = Math.round(nowms() - tAbort.at);
+            log(
+              `session.prompt ABORTED (hop ${i}): promise settled ${sinceAbort}ms AFTER abort() — ` +
+                `~0ms = blink honored the cancel; seconds = an in-flight prefill/decode ran past it. ` +
+                `display-stall ${Math.round(maxFrameGap)}ms / main-thread-stall ${Math.round(maxTickGap)}ms`
+            );
+            destroySession(); // close the pipe (native cancel) + unload the model; rebuild next turn
+            // CIRCUIT BREAKER: a Nano turn that blew the budget means this machine's on-device
+            // model is stalling. Trip it off for the rest of the session so a freeze (the abort
+            // can't stop in-flight GPU/Metal dispatches) can happen AT MOST ONCE — every later
+            // turn routes to cloud/coaching via modelChoice(). Re-arm only by an explicit
+            // ytAgent.setEngine("nano") (which clears the trip).
+            state.nanoTripped = true;
+            log("on-device model TRIPPED OFF for this session (blew the turn budget). Re-arm with ytAgent.setEngine('nano').");
+            return "The on-device model stalled, so I've switched it off for now. Direct commands like play, pause, and search still work. You can add a cloud key for conversational answers.";
+          }
+          throw e;
+        }
+        log(`session.prompt() hop ${i} ${Math.round(nowms() - tP)}ms (display-stall ${Math.round(maxFrameGap)}ms / main-thread-stall ${Math.round(maxTickGap)}ms)`);
+        const step = parseAction(raw);
+        if (!step) return raw.trim(); // model returned plain prose; just use it
+        if (step.action === "final") return step.say || "";
+        if (step.action === "call") {
+          const tool = tools.find((t) => t.name === step.tool);
+          if (!tool) {
+            turn = `No tool "${step.tool}". Available: ${tools
+              .map((t) => t.name)
+              .join(", ")}. Reply with valid JSON.`;
+            continue;
+          }
+          // Crisp progress cue (fire-and-forget) so the user hears we're working.
+          if (TOOL_CUE[step.tool]) voice.speak(TOOL_CUE[step.tool]);
+          let result;
+          const tExec = nowms();
+          try {
+            result = await tool.execute(step.args || {});
+          } catch (e) {
+            result = "tool error: " + ((e && e.message) || e);
+          }
+          log(`tool ${step.tool} ${Math.round(nowms() - tExec)}ms ->`, result);
+          turn = `Result of ${step.tool}:\n${result}\n\nNow call another tool or give the final answer as JSON.`;
+          continue;
+        }
+        return raw.trim();
+      }
+      return "Sorry, I couldn't complete that.";
+    } finally {
+      clearTimeout(deadline);
+      clearInterval(ticker);
+      probeOn = false;
+      // Interpretation: a large display-stall with a small main-thread-stall is the signature
+      // of a GPU/compositor freeze (the whole-machine beachball) — capture it with the
+      // SSH/powermetrics recipe in docs/research/voice-audio-anti-freeze.md to confirm. If BOTH
+      // are large, the renderer's JS loop was blocked too (a different problem).
+      const verdict =
+        maxFrameGap > 1000 && maxTickGap < 500
+          ? " — display froze while JS kept running: GPU/compositor starvation (the whole-machine freeze); capture powermetrics to confirm"
+          : maxFrameGap > 1000 && maxTickGap >= 500
+          ? " — both stalled: the renderer JS loop was blocked too"
+          : "";
+      log(`model turn done — display-stall ${Math.round(maxFrameGap)}ms / main-thread-stall ${Math.round(maxTickGap)}ms${verdict}`);
+    }
+  }
+  state.engine = geminiEngine;
+
+  // ===========================================================================
+  // CLOUD ENGINE — opt-in BYOK fallback (Gemini API, Google AI Studio key).
+  // Same manual JSON tool loop as geminiEngine, but inference runs OFF-DEVICE — it cannot
+  // freeze this machine (the Nano beachball class), and a fetch() abort reliably ends a
+  // stalled request. Still behind the SAME model kill switch (state.modelEnabled): the
+  // deterministic command layer always runs first, and no model — local or cloud — is on
+  // any default path. The key is never in this public repo:
+  //   * dev harness: ytAgent.setCloudKey("AIza…") -> localStorage (page-visible; dev only)
+  //   * extension:   key in chrome.storage.local, read ONLY by the service worker, which
+  //     does the fetch; agent-control.js installs `cloudTransport` so this MAIN-world code
+  //     never touches the key and YouTube's page CSP never applies to the request.
+  // ===========================================================================
+  const cloudAvailable = () => !!(state.cloudTransport || state.cloudKey);
+
+  // Which model path a turn would use: "cloud" | "nano" | "none" (the kill switch is checked
+  // separately, in ask()). KEY FREEZE-SAFETY RULE: the on-device Nano path — the one that ran
+  // 200s and beachballed the whole machine — is NEVER reached by "auto". Turning the model on
+  // routes to the off-device cloud engine (can't freeze) or, with no cloud configured, to
+  // "none" (a coaching reply). On-device Nano is only ever chosen by an EXPLICIT, deliberate
+  // opt-in (ytAgent.setEngine("nano") — for instrumented measurement runs), and even then a
+  // single budget-blowing turn trips the breaker (state.nanoTripped) and drops it to "none"
+  // for the rest of the session, so a freeze can happen at most once.
+  function modelChoice() {
+    if (state.engineMode === "nano") return state.nanoTripped ? "none" : "nano";
+    // "auto" and explicit "cloud" both prefer the off-device path; neither falls back to Nano.
+    return cloudAvailable() ? "cloud" : "none";
+  }
+
+  async function cloudFetchDirect(model, body) {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), CLOUD_TIMEOUT_MS);
+    try {
+      const r = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-goog-api-key": state.cloudKey },
+          body: JSON.stringify(body),
+          signal: ac.signal,
+        }
+      );
+      if (!r.ok) {
+        // 429 = free-tier quota exhausted — surface it as something speakable.
+        if (r.status === 429) return { ok: false, error: "rate-limited (free-tier quota reached for today?)" };
+        let msg = `HTTP ${r.status}`;
+        try {
+          msg += ": " + (((await r.json()).error || {}).message || "");
+        } catch (_) {}
+        return { ok: false, error: msg };
+      }
+      const data = await r.json();
+      const text = ((((data.candidates || [])[0] || {}).content || {}).parts || [])
+        .map((p) => p.text || "")
+        .join("");
+      return text ? { ok: true, text } : { ok: false, error: "empty response (safety block?)" };
+    } catch (e) {
+      return {
+        ok: false,
+        error: ac.signal.aborted ? `timeout after ${CLOUD_TIMEOUT_MS}ms` : String((e && e.message) || e),
+      };
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  // One generateContent round trip, via whichever path this context has. Returns
+  // { ok, text } or { ok:false, error } — never throws.
+  async function cloudGenerate(body) {
+    if (state.cloudTransport) {
+      try {
+        return await state.cloudTransport({ model: state.cloudModel, body });
+      } catch (e) {
+        return { ok: false, error: String((e && e.message) || e) };
+      }
+    }
+    if (state.cloudKey) return await cloudFetchDirect(state.cloudModel, body);
+    return { ok: false, error: "no cloud key (ytAgent.setCloudKey(…) or the extension popup)" };
+  }
+
+  async function cloudEngine(utterance) {
     const tools = consumer.asPromptApiTools().concat(localTools);
-    let turn = `User said: ${utterance}`;
+    const catalog = toolCatalog(consumer.list().concat(localTools));
+    // The cloud API is stateless — replay the persisted history as real turns. ask() has
+    // already remembered the current utterance, so drop the last entry to avoid doubling it.
+    // Gemini REQUIRES contents to start with a user role and strictly alternate; convo can
+    // violate both — after the CONVO_MAX rotation history[0] may be an agent turn, and a
+    // silently-handled command (cmd === "") records a user turn with no agent reply, leaving
+    // two consecutive user turns. Normalize: drop leading model turns, then coalesce any
+    // consecutive same-role turns into one. Otherwise the API 400s and the cloud path
+    // silently degrades to the "not reachable" message.
+    const prior = convo.history.slice(0, -1).map((m) => ({ role: m.role === "user" ? "user" : "model", text: m.text }));
+    while (prior.length && prior[0].role !== "user") prior.shift();
+    const merged = [];
+    for (const m of prior) {
+      const last = merged[merged.length - 1];
+      if (last && last.role === m.role) last.text += "\n" + m.text;
+      else merged.push({ role: m.role, text: m.text });
+    }
+    const contents = merged.map((m) => ({ role: m.role, parts: [{ text: m.text }] }));
+    // The current turn is always a user turn; if the normalized history ended on a user turn
+    // (a trailing unanswered command), fold this turn into it to preserve alternation.
+    const head = `Tools available on this page right now:\n${catalog}\n\nUser said: ${utterance}`;
+    if (contents.length && contents[contents.length - 1].role === "user")
+      contents[contents.length - 1].parts[0].text += "\n\n" + head;
+    else contents.push({ role: "user", parts: [{ text: head }] });
+    const body = {
+      systemInstruction: { parts: [{ text: SYSTEM + "\n\n" + JSON_PROTOCOL }] },
+      contents,
+      // JSON response mode makes the one-action-per-turn protocol near-deterministic.
+      generationConfig: { responseMimeType: "application/json", maxOutputTokens: 512, temperature: 0.2 },
+    };
     for (let i = 0; i < MANUAL_LOOP_HOPS; i++) {
-      const raw = await session.prompt(turn);
+      const tP = nowms();
+      const res = await cloudGenerate(body);
+      log(`cloud hop ${i} ${Math.round(nowms() - tP)}ms ok=${res.ok}${res.ok ? "" : " — " + res.error}`);
+      if (!res.ok) {
+        if (/no key/i.test(res.error || ""))
+          return "To use AI replies, add your Gemini API key in the extension popup. Direct commands like play, pause, and search always work without it.";
+        if (/rate-limited/i.test(res.error || ""))
+          return "Your Gemini key has hit its daily free limit. Direct commands still work.";
+        return "The cloud model isn't reachable right now. Try a direct command like play, pause, next, search, or list.";
+      }
+      const raw = res.text;
+      body.contents.push({ role: "model", parts: [{ text: raw }] });
       const step = parseAction(raw);
-      if (!step) return raw.trim(); // model returned plain prose; just use it
+      if (!step) return raw.trim();
       if (step.action === "final") return step.say || "";
       if (step.action === "call") {
         const tool = tools.find((t) => t.name === step.tool);
         if (!tool) {
-          turn = `No tool "${step.tool}". Available: ${tools
-            .map((t) => t.name)
-            .join(", ")}. Reply with valid JSON.`;
+          body.contents.push({
+            role: "user",
+            parts: [{ text: `No tool "${step.tool}". Available: ${tools.map((t) => t.name).join(", ")}. Reply with valid JSON.` }],
+          });
           continue;
         }
-        // Crisp progress cue (fire-and-forget) so the user hears we're working.
         if (TOOL_CUE[step.tool]) voice.speak(TOOL_CUE[step.tool]);
         let result;
+        const tExec = nowms();
         try {
           result = await tool.execute(step.args || {});
         } catch (e) {
           result = "tool error: " + ((e && e.message) || e);
         }
-        log(`tool ${step.tool} ->`, result);
-        turn = `Result of ${step.tool}:\n${result}\n\nNow call another tool or give the final answer as JSON.`;
+        log(`tool ${step.tool} ${Math.round(nowms() - tExec)}ms (cloud path)`);
+        body.contents.push({
+          role: "user",
+          parts: [{ text: `Result of ${step.tool}:\n${result}\n\nNow call another tool or give the final answer as JSON.` }],
+        });
         continue;
       }
       return raw.trim();
     }
     return "Sorry, I couldn't complete that.";
   }
-  state.engine = geminiEngine;
+
+  // Vision via the cloud engine (inline base64 image). Lets describe_image work even where
+  // on-device Nano is disabled/unavailable — same kill switch, same BYOK opt-in.
+  async function cloudDescribeImage(url, question) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`couldn't fetch image (${r.status})`);
+    const blob = await toJpeg(await r.blob());
+    const b64 = await new Promise((res, rej) => {
+      const fr = new FileReader();
+      fr.onload = () => res(String(fr.result).split(",")[1]);
+      fr.onerror = () => rej(new Error("couldn't encode image"));
+      fr.readAsDataURL(blob);
+    });
+    const body = {
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              text:
+                question ||
+                "Describe this image for someone who cannot see it. Be concise and concrete in 1-2 sentences: main subject, setting, any visible text, and mood.",
+            },
+            { inlineData: { mimeType: blob.type || "image/jpeg", data: b64 } },
+          ],
+        },
+      ],
+      generationConfig: { maxOutputTokens: 256 },
+    };
+    const res = await cloudGenerate(body);
+    if (!res.ok) throw new Error(res.error);
+    return res.text.trim();
+  }
 
   // ===========================================================================
   // AGENT entry points.
@@ -763,15 +1309,28 @@
     return null;
   }
   function helpText() {
+    if (location.pathname.startsWith("/shorts"))
+      return "On Shorts you can say: next or previous to move between shorts, play, pause, skip forward, skip back, captions on or off, or go home. Say repeat to hear something again, or slower and faster to change my speed.";
     if (location.pathname.startsWith("/watch"))
-      return "On this video you can say: play, pause, skip forward, skip back, captions on, captions off, next video, or go home. Say repeat to hear something again, or slower and faster to change my speed.";
-    return "You can say: list videos, open and a number, next, previous, search for something, load more, or go home. Say a category name like Music to filter. Say repeat, slower, or faster anytime.";
+      return "On this video you can say: play, pause, skip forward, skip back, captions on, captions off, next video, picture in picture, or go home. Say repeat to hear something again, or slower and faster to change my speed.";
+    return "You can say: list videos, open and a number, next, previous, search for something, watch shorts, load more, or go home. Say a category name like Music to filter. Say repeat, slower, or faster anytime.";
+  }
+  // Strip emoji/symbols and trim over-long tails so spoken replies stay short and the local TTS
+  // engine doesn't grind (a wall of long, mixed-script + emoji titles was a ~6s utterance).
+  function speakableTitle(s, max = 70) {
+    let t = (s || "")
+      .replace(/[\u{1F000}-\u{1FAFF}\u{2190}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{1F1E6}-\u{1F1FF}]/gu, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (t.length > max) t = t.slice(0, max).replace(/\s+\S*$/, "") + "…";
+    return t || "untitled";
   }
   async function listHere() {
     const items = await feed(20);
     if (!items.length) return "There's nothing to list here.";
-    const top = items.slice(0, 5).map((v) => `${v.index}, ${v.title}`).join(". ");
-    return `${items.length} videos. ${top}. Say open and a number, or next.`;
+    // Read only the first 3, cleaned + truncated — keeps the utterance short (≈2s, not 6s).
+    const top = items.slice(0, 3).map((v) => `${v.index}, ${speakableTitle(v.title)}`).join(". ");
+    return `${items.length} videos. ${top}. Say open and a number, next, or more.`;
   }
   async function openByNumber(n) {
     const items = await feed(60);
@@ -786,15 +1345,78 @@
     return "";
   }
   const callText = async (tool, args) => {
-    const r = await consumer.call(tool, args || {});
-    return r && r.content && r.content[0] ? r.content[0].text : "";
+    if (!consumer.has(tool)) return `That isn't available on this page.`;
+    const tExec = nowms();
+    try {
+      const r = await consumer.call(tool, args || {});
+      log(`tool ${tool} ${Math.round(nowms() - tExec)}ms (command path)`);
+      return r && r.content && r.content[0] ? r.content[0].text : "";
+    } catch (_) {
+      return `Sorry, I couldn't do that just now.`;
+    }
   };
+
+  // One-shot GESTURE RELAY for activation-gated APIs (PiP). Measured live (2026-06-07,
+  // scripts/verify-gestures.mjs): requestPictureInPicture needs TRANSIENT user activation,
+  // which expires in ~5s — voice latency (talk-key -> STT -> tool) usually outlives it, and
+  // the native-button el.click() fallback is equally gated. So we run the tool INSIDE the
+  // next trusted keydown, where activation is fresh. The tool call starts synchronously in
+  // the handler (consumer.call enters execute() before its first await), so the API sees a
+  // live gesture. Escape cancels; the talk key passes through (it starts a new voice turn).
+  let gestureRelay = null;
+  let gestureRelayTimer = null;
+  const GESTURE_RELAY_TTL_MS = 12000; // don't leave a key trap armed forever
+  function disarmGestureRelay() {
+    if (gestureRelayTimer) {
+      clearTimeout(gestureRelayTimer);
+      gestureRelayTimer = null;
+    }
+    if (gestureRelay) {
+      window.removeEventListener("keydown", gestureRelay, true);
+      gestureRelay = null;
+    }
+  }
+  function armGestureRelay(toolName) {
+    disarmGestureRelay();
+    gestureRelayTimer = setTimeout(disarmGestureRelay, GESTURE_RELAY_TTL_MS); // silent expiry
+    const h = (e) => {
+      if (isTextTarget(e.target)) return; // never swallow typing (e.g. the search box)
+      if (e.code === talk.key) {
+        disarmGestureRelay(); // user chose to talk instead — let onTalkDown handle it
+        return;
+      }
+      if (e.key === "Escape") {
+        disarmGestureRelay();
+        voice.speak("Canceled.");
+        return;
+      }
+      // The tool may have unregistered if the user navigated away (e.g. left /watch within
+      // the window) — disarm silently rather than firing a no-op that talks over browse.
+      if (!consumer.has(toolName)) {
+        disarmGestureRelay();
+        return;
+      }
+      e.preventDefault();
+      e.stopImmediatePropagation(); // this keypress belongs to the relay, not browse/page
+      disarmGestureRelay();
+      callText(toolName).then((msg) => {
+        if (msg) voice.speak(msg);
+      });
+    };
+    gestureRelay = h;
+    window.addEventListener("keydown", h, true);
+  }
 
   async function handleCommand(rawText) {
     const t = (rawText || "").trim().toLowerCase().replace(/[.!?]+$/, "");
-    if (!t || t.startsWith("[")) return null; // ignore the bracketed greeting trigger
+    if (!t) return null;
+    // Bracketed text was the old greeting prompt. Return "" (handled, silent) — NOT null — so a
+    // stray bracketed string can never fall through to the unbounded on-device model. The greeting
+    // is now composed deterministically in activate(); nothing should send bracketed text anymore.
+    if (t.startsWith("[")) return "";
     const path = location.pathname;
-    const onWatch = path.startsWith("/watch");
+    const onWatch = path.startsWith("/watch") || path.startsWith("/shorts");
+    const onShorts = path.startsWith("/shorts");
     const onList = path === "/" || path.startsWith("/feed") || path.startsWith("/results");
 
     // Ergonomics (any surface)
@@ -809,9 +1431,40 @@
     // Navigation
     if (/^(go )?home$|take me home/.test(t)) { try { sessionStorage.setItem("ytA11yPending", "You're on the home page."); } catch (_) {} await voice.speak("Going home."); location.href = "https://www.youtube.com/"; return ""; }
     if (/^(go back|previous page)$/.test(t)) { await voice.speak("Going back."); history.back(); return ""; }
+    // Open the Shorts feed from any surface. /shorts/ redirects to the first short; the pending
+    // message coaches the next/previous gesture on arrival (sessionStorage survives the load).
+    if (/^(open |go to |watch |show |play )?shorts( feed)?$/.test(t)) {
+      try { sessionStorage.setItem("ytA11yPending", "You're on Shorts. Say next or previous to move between videos, play or pause to control this one, or go home to leave."); } catch (_) {}
+      await voice.speak("Opening Shorts.");
+      location.href = "https://www.youtube.com/shorts/";
+      return "";
+    }
     {
       const m = t.match(/^(?:search(?: for)?|find|look up|search up) (.+)$/);
-      if (m) { await voice.speak(`Searching for ${m[1]}.`); await callText("run_search", { query: m[1] }); return ""; }
+      if (m) {
+        // Navigate to results DIRECTLY — works from ANY surface. (run_search is only
+        // registered on /results, so calling it from home/watch was a no-op: the original
+        // bug where "search for X" did nothing.) Stash a continuation for the results page.
+        const q = m[1].trim();
+        const url = "https://www.youtube.com/results?search_query=" + encodeURIComponent(q);
+        try {
+          sessionStorage.setItem("ytA11yPending", `Here are the results for ${q}.`);
+        } catch (_) {}
+        await voice.speak(`Searching for ${q}.`);
+        location.href = url;
+        return "";
+      }
+    }
+
+    // Sidebar / guide menu. MUST be matched before "open by number" below, or "open
+    // subscriptions" gets swallowed by the open-N handler ("open" + onList → "which number?").
+    if (/^(open |show |read |what'?s in )?(the )?(side ?bar|side menu|main menu|guide menu|nav(igation)? menu|menu)$/.test(t))
+      return await callText("list_sidebar");
+    {
+      const m = t.match(
+        /^(?:go to|open|show|take me to)\s+(?:my\s+)?(subscriptions?|history|library|watch later|liked(?: videos)?|playlists?|your videos|trending|explore|music|movies?(?: & tv| and tv)?|premium)$/
+      );
+      if (m) return await callText("open_sidebar_item", { name: m[1] });
     }
 
     // Open by number (home / search / up-next)
@@ -824,8 +1477,38 @@
     // Browse next / previous on list surfaces
     if (onList && /^(next|next one|down|forward)$/.test(t)) { if (!browseState.armed) await startBrowse(false); await browseMove(1); return ""; }
     if (onList && /^(previous|prev|back one|up|go up)$/.test(t)) { if (!browseState.armed) await startBrowse(false); await browseMove(-1); return ""; }
-    if (onList && /^(more|load more|show more)$/.test(t)) return await callText("load_more_home");
-    if (/^(list|what'?s here|read( the)? titles|list (videos|results))$/.test(t)) return await listHere();
+    if (onList && /^(more|load more|show more)$/.test(t)) {
+      const msg = await callText("load_more_home");
+      // Keep arrow-browse in sync with the newly loaded cards.
+      if (browseState.armed) {
+        const fresh = await feed(BROWSE_LIMIT);
+        if (fresh.length) browseState.items = fresh;
+      }
+      return msg;
+    }
+    // "list" / "what's on my feed" / "what's here" → read the current surface's videos INSTANTLY,
+    // no model round-trip. (Before, "what's on my home feed" fell through to the ~29s on-device
+    // model, which then misrouted to select_category Music and errored — measured in the wild.)
+    if (/^(list|read)( (it|them|the))?( (videos|results|titles|feed|list|home ?feed))?$/.test(t)) return await listHere();
+    if (
+      onList &&
+      (/^what'?s (here|playing|recommended|on (this page|youtube|screen)|(on |in )?(my )?(home ?)?(feed|page))$/.test(t) ||
+        /^(show|tell|read|give)( me)?( my| the)? ?(home ?)?(feed|videos|results|recommendations|list)$/.test(t) ||
+        /^what (videos|results|else)( do you have| are (there|here)| can i (watch|see))?$/.test(t))
+    )
+      return await listHere();
+
+    // List categories (home) — deterministic so it never hits the slow on-device model.
+    if ((path === "/" || path.startsWith("/feed")) && /\bcategor(y|ies)\b/.test(t) && /^(list|read|what|which|show|tell|name)\b/.test(t)) {
+      const raw = await callText("list_categories");
+      let names = [];
+      try {
+        names = JSON.parse(raw);
+      } catch (_) {}
+      if (Array.isArray(names) && names.length)
+        return "Categories you can pick: " + names.slice(0, 12).join(", ") + ". Say, for example, filter by Music.";
+      return "I couldn't read the categories here.";
+    }
 
     // Filter by category (home)
     {
@@ -833,12 +1516,53 @@
       if (m && (path === "/" || path.startsWith("/feed"))) return await callText("select_category", { name: m[1] });
     }
 
-    // Playback (watch)
-    if (onWatch) {
-      if (/^(pause|pause( the)? video)$/.test(t)) return await callText("playback_control", { action: "pause" });
-      if (/^(play|resume|continue|unpause|play( the)? video)$/.test(t)) return await callText("playback_control", { action: "play" });
-      if (/(skip|jump|go)\b.*(ahead|forward)|fast ?forward/.test(t)) return await callText("playback_control", { action: "forward", value: parseNum(t) || 10 });
-      if (/(skip back|rewind|go back)/.test(t)) return await callText("playback_control", { action: "back", value: parseNum(t) || 10 });
+    // Picture-in-picture (watch only). The API needs ~5s-fresh transient activation, which
+    // voice latency outlives (measured 2026-06-07, scripts/verify-gestures.mjs) — so we
+    // relay the gesture: the user's NEXT keypress runs enter_pip with live activation.
+    if (onWatch && /\bpicture.in.picture\b|\bpip\b|\bpop\b.*\bout\b/.test(t)) {
+      if (/\b(exit|leave|close|stop|off|back)\b/.test(t)) return await callText("exit_pip");
+      if (!consumer.has("enter_pip")) return "That isn't available on this page.";
+      armGestureRelay("enter_pip");
+      return "Press the Enter key and I'll pop the video out into a floating window.";
+    }
+
+    // Shorts vertical feed: next/previous move BETWEEN shorts (not the up-next sidebar, which is
+    // empty here). Matched before the generic `next`→play_next handler below so Shorts wins on
+    // /shorts. play/pause/seek still fall through to the playback block and control the short.
+    if (onShorts) {
+      if (/^(next|next short|next one|next video|skip|down|forward)$/.test(t)) return await callText("next_short");
+      if (/^(previous|previous short|prev|back|back one|up|go up|last( one)?)$/.test(t)) return await callText("prev_short");
+    }
+
+    // Playback controls — handled on EVERY surface, never gated behind onWatch. A missed media
+    // verb (e.g. "pause" on the home page) used to fall through to the on-device model, which ran
+    // for 200s and beachballed the machine. On /watch we use the provider tool (proper YouTube
+    // controls); elsewhere we actuate the page's <video> directly (read-and-act safe). Either way
+    // this returns instantly and Nano is never involved.
+    {
+      const vid = () => document.querySelector("video");
+      if (/^(pause|pause( the)? video|stop( the)? video)$/.test(t)) {
+        if (consumer.has("playback_control")) return await callText("playback_control", { action: "pause" });
+        const v = vid(); if (v && !v.paused) { try { v.pause(); } catch (_) {} return "Paused."; }
+        return "Nothing is playing right now.";
+      }
+      if (/^(resume|continue|unpause|play( the)? video)$/.test(t) || (onWatch && /^play$/.test(t))) {
+        if (consumer.has("playback_control")) return await callText("playback_control", { action: "play" });
+        const v = vid(); if (v) { try { const p = v.play(); if (p && p.catch) p.catch(() => {}); } catch (_) {} return "Playing."; }
+        return "There's no video here to play.";
+      }
+      if (/(skip|jump|go)\b.*(ahead|forward)|fast ?forward/.test(t)) {
+        const n = parseNum(t) || 10;
+        if (consumer.has("playback_control")) return await callText("playback_control", { action: "forward", value: n });
+        const v = vid(); if (v) { try { v.currentTime += n; } catch (_) {} return `Skipped ahead ${n} seconds.`; }
+        return "There's no video here to skip.";
+      }
+      if (/(skip back|rewind)\b/.test(t)) {
+        const n = parseNum(t) || 10;
+        if (consumer.has("playback_control")) return await callText("playback_control", { action: "back", value: n });
+        const v = vid(); if (v) { try { v.currentTime -= n; } catch (_) {} return `Skipped back ${n} seconds.`; }
+        return "There's no video here to skip.";
+      }
       if (/captions?\b.*\bon\b|subtitles?\b.*\bon\b/.test(t)) return await callText("set_captions", { on: true });
       if (/captions?\b.*\boff\b|subtitles?\b.*\boff\b/.test(t)) return await callText("set_captions", { on: false });
       if (/^(next( video| up)?|play next)$/.test(t)) return await callText("play_next");
@@ -849,24 +1573,91 @@
 
   async function ask(utterance) {
     if (!utterance || !utterance.trim()) return "";
+    // Persist the turn (bracketed text is legacy plumbing, not conversation — skip it).
+    if (!utterance.trim().startsWith("[")) remember("user", utterance.trim());
     const cmd = await handleCommand(utterance);
     if (cmd !== null) {
-      if (cmd) state.lastReply = cmd;
+      if (cmd) remember("agent", cmd);
       log("reply (command):", cmd);
       return cmd; // "" = handled silently (already spoke / no reply needed)
     }
-    const reply = await state.engine(utterance);
-    state.lastReply = reply;
+    // Model kill switch (see state.modelEnabled): with the model off, an unrecognized utterance
+    // gets a short deterministic coaching reply instead of risking a machine-freezing inference.
+    if (!state.modelEnabled) {
+      log('model is OFF (kill switch) — utterance not handled deterministically:', utterance);
+      log(
+        cloudAvailable()
+          ? "a cloud key is configured — ytAgent.setModel(true) turns on OFF-DEVICE replies (no freeze risk)"
+          : "re-enable for a measurement run with ytAgent.setModel(true), or set a cloud key (ytAgent.setCloudKey / extension popup)"
+      );
+      const reply = "I only handle direct commands right now. Try play, pause, next, search, list, or go home.";
+      remember("agent", reply);
+      return reply;
+    }
+    // Engine dispatch: a custom engine (useEngine mock) always wins; otherwise route by
+    // modelChoice(). "none" = model on but no freeze-safe engine available — coach instead of
+    // silently running the on-device model (which is reachable only via explicit setEngine).
+    let reply;
+    if (state.engine !== geminiEngine) {
+      reply = await state.engine(utterance);
+    } else {
+      const choice = modelChoice();
+      if (choice === "cloud") reply = await cloudEngine(utterance);
+      else if (choice === "nano") reply = await geminiEngine(utterance);
+      else {
+        reply =
+          "I can only handle direct commands right now — try play, pause, next, search, or list. " +
+          "For conversational answers, add a Gemini API key in the extension popup.";
+        log("modelChoice=none (model on, no cloud key, on-device not explicitly enabled) — coaching reply.");
+        log("for an on-device measurement run only: ytAgent.setEngine('nano') (⚠️ can freeze the machine).");
+      }
+    }
+    remember("agent", reply);
     log("reply:", reply);
     return reply;
   }
 
-  // Simulates the browser/AT opt-in handoff: greet + orient proactively (fresh session).
+  // Greet + orient proactively. Composed DETERMINISTICALLY — it must NEVER call the model. The
+  // old version sent a bracketed prompt to Nano (bracketed text bypasses handleCommand) AND first
+  // ran destroySession(), forcing a cold ~20-29s LM.create + a multi-hop unbounded inference on
+  // the home page. That greeting is the confirmed "freezes even on home" trigger (it fires from
+  // Alt+Shift+A, the popup Activate button, and the top of start()). We read the same tools
+  // directly — instant, freeze-proof.
   async function activate() {
-    destroySession();
-    const reply = await ask(
-      "[Session start. First call get_account, then greet the user (by name if signed in). Say what page they're on. If on the HOME page, also call list_categories and list_home_feed: name the available categories, read the first few video titles, and tell them they can use the up/down arrow keys to browse videos one at a time or name a category. End with a question.]"
-    );
+    const path = location.pathname;
+    const onHome = path === "/" || path.startsWith("/feed");
+    let signedIn = false, name = null;
+    try {
+      const acct = JSON.parse(await callText("get_account"));
+      signedIn = !!acct.signedIn;
+      name = acct.name || null;
+    } catch (_) {}
+    // signedIn is reliable; name is usually null (we won't open the account menu) — greet warmly.
+    const hello = signedIn ? (name ? `Welcome back, ${name}.` : "Welcome back.") : "Hi there.";
+    let reply;
+    if (onHome) {
+      let cats = [];
+      try {
+        const c = JSON.parse(await callText("list_categories"));
+        if (Array.isArray(c)) cats = c;
+      } catch (_) {}
+      let items = [];
+      try {
+        items = await feed(20);
+      } catch (_) {}
+      const feedLine = items.length ? ` Top videos: ${items.slice(0, 3).map((v) => speakableTitle(v.title)).join("; ")}.` : "";
+      const catLine = cats.length ? ` Categories you can pick: ${cats.slice(0, 6).join(", ")}.` : "";
+      reply = `${hello} You're on the YouTube home page.${feedLine}${catLine} Use the up and down arrow keys to browse videos one at a time, name a category to filter, or say "search" and what you're looking for. What would you like to do?`;
+    } else if (path.startsWith("/shorts")) {
+      reply = `${hello} You're on Shorts. Say next or previous to move between shorts, play or pause to control this one, captions on or off, or go home. What would you like to do?`;
+    } else if (path.startsWith("/watch")) {
+      reply = `${hello} You're on a video. Say play, pause, skip forward, skip back, captions on or off, next video, or go home. What would you like to do?`;
+    } else if (path.startsWith("/results")) {
+      reply = `${hello} You're on the search results. Use the up and down arrow keys to browse results, say "open" with a number, or search for something else. What would you like to do?`;
+    } else {
+      reply = `${hello} You're on YouTube. Say go home, search and a topic, play, pause, or next. What would you like to do?`;
+    }
+    remember("agent", reply);
     await voice.speak(reply);
     return reply;
   }
@@ -874,6 +1665,7 @@
   // Capture one spoken utterance using the selected listen mode. Nano ASR is experimental
   // (slow / can jank the page); on any non-silence error it falls back to Web Speech.
   async function captureUtterance() {
+    await beginListen(); // quiesce ALL output before any mic path opens (the freeze gate)
     if (state.listenMode === "nano") {
       try {
         return await nanoAsr.listenOnce();
@@ -888,11 +1680,15 @@
   }
 
   async function converse() {
-    const heard = await captureUtterance();
-    log(`heard: ${heard}`);
-    const reply = await ask(heard);
-    await voice.speak(reply);
-    return { heard, reply };
+    try {
+      const heard = await captureUtterance();
+      log(`heard: ${heard}`);
+      const reply = await ask(heard);
+      await voice.speak(reply);
+      return { heard, reply };
+    } finally {
+      restoreMedia(); // captureUtterance ducked the page media via beginListen — resume it
+    }
   }
 
   // Continuous hands-free conversation: greet, then listen → respond → listen … until the
@@ -932,6 +1728,7 @@
       if (!state.running) break;
       await voice.speak(reply);
     }
+    restoreMedia(); // beginListen ducked the page media each turn — resume on the way out
     state.running = false;
     return "conversation ended";
   }
@@ -1028,7 +1825,7 @@
   // ONLY while armed and when focus isn't in a text field (so it never fights the search
   // box). While armed it takes over arrow keys (intended guided nav); Escape/stopBrowse hand
   // them back to the page / screen reader.
-  const browseState = { armed: false, index: -1, items: [] };
+  const browseState = { armed: false, index: -1, items: [], everArmed: false };
 
   function describeBrowseItem() {
     const it = browseState.items[browseState.index];
@@ -1039,11 +1836,72 @@
     voice.speak(bits.join(", ") + ". Press Enter to play.");
   }
 
+  // Arrow browsing is only meaningful on the list surfaces (home / search). On /watch and
+  // /shorts the arrow keys belong to the player, and replaying a stale home feed here is the
+  // "it thinks I'm on home" bug — so disarm cleanly instead.
+  function onBrowsableSurface() {
+    const p = location.pathname;
+    return p === "/" || p.startsWith("/feed") || p.startsWith("/results");
+  }
+
+  let browseFetching = false;
+  // Read as many of the currently-loaded cards as the provider allows (not just 20), so
+  // browsing covers everything on the page. load_more_home / scrolling adds more, which
+  // growFeed() picks up when the user reaches the end.
+  const BROWSE_LIMIT = 100;
+
+  // At the end of the list, pull in more: ask the provider to load the next batch onto the
+  // page (home only — search has no load-more tool), then re-read. Returns true if the list
+  // actually grew. Guarded by browseFetching so rapid presses don't stack fetches.
+  async function growFeed() {
+    if (browseFetching) return false;
+    browseFetching = true;
+    try {
+      const before = browseState.items.length;
+      if (consumer.has("load_more_home")) {
+        try {
+          await callText("load_more_home");
+        } catch (_) {}
+      }
+      const fresh = await feed(BROWSE_LIMIT);
+      if (fresh.length > before) {
+        browseState.items = fresh;
+        return true;
+      }
+      return false;
+    } finally {
+      browseFetching = false;
+    }
+  }
+
   async function browseMove(delta) {
-    if (!browseState.items.length) browseState.items = await feed(20);
+    voice.cancelSpeech(); // stop the previous item immediately — never read a backlog
+    if (!onBrowsableSurface()) {
+      stopBrowse();
+      voice.speak("Arrow browsing isn't available on this page. The arrow keys control the video here.");
+      return;
+    }
+    if (!browseState.items.length) {
+      if (browseFetching) return; // a fetch is already in flight; ignore the extra press
+      browseFetching = true;
+      try {
+        browseState.items = await feed(BROWSE_LIMIT);
+      } finally {
+        browseFetching = false;
+      }
+    }
     if (!browseState.items.length) {
       voice.speak("There are no videos to browse here.");
       return;
+    }
+    // Moving forward past the last item → try to load more before giving up.
+    if (delta > 0 && browseState.index >= browseState.items.length - 1) {
+      voice.speak("Loading more videos.");
+      const grew = await growFeed();
+      if (!grew) {
+        voice.speak("That's the end of the feed for now.");
+        return;
+      }
     }
     const n = browseState.items.length;
     browseState.index = Math.max(0, Math.min(browseState.index + delta, n - 1));
@@ -1051,47 +1909,56 @@
   }
 
   function onBrowseKey(e) {
-    if (!browseState.armed) return;
     const t = e.target;
     const tag = (t && t.tagName) || "";
     if (/^(INPUT|TEXTAREA|SELECT)$/.test(tag) || (t && t.isContentEditable)) return;
-    switch (e.key) {
-      case "ArrowDown":
-      case "ArrowRight":
+    const dir = e.key === "ArrowDown" || e.key === "ArrowRight" ? 1 : e.key === "ArrowUp" || e.key === "ArrowLeft" ? -1 : 0;
+    // Not browsing right now. The listener stays attached after Escape so the user is never
+    // stranded: once they've browsed at least once this session, pressing an arrow on a list
+    // surface re-arms browsing and steps. Every other key — and any arrow on /watch, /shorts,
+    // or off a list surface — falls straight through to the page / AT / player untouched.
+    if (!browseState.armed) {
+      if (dir && browseState.everArmed && onBrowsableSurface()) {
         e.preventDefault();
         e.stopPropagation();
-        browseMove(1);
-        break;
-      case "ArrowUp":
-      case "ArrowLeft":
-        e.preventDefault();
-        e.stopPropagation();
-        browseMove(-1);
-        break;
-      case "Enter": {
-        const it = browseState.index >= 0 ? browseState.items[browseState.index] : null;
-        if (it) {
-          e.preventDefault();
-          e.stopPropagation();
-          openIndex(it.index); // 1-based index the provider expects
-        }
-        break;
+        startBrowse(false).then(() => browseMove(dir));
       }
-      case "Escape":
-        stopBrowse();
-        voice.speak("Exited browsing.");
-        break;
-      default:
-        break;
+      return;
+    }
+    if (dir) {
+      e.preventDefault();
+      e.stopPropagation();
+      browseMove(dir);
+      return;
+    }
+    if (e.key === "Enter") {
+      const it = browseState.index >= 0 ? browseState.items[browseState.index] : null;
+      if (it) {
+        e.preventDefault();
+        e.stopPropagation();
+        openIndex(it.index); // 1-based index the provider expects
+      }
+      return;
+    }
+    if (e.key === "Escape") {
+      stopBrowse();
+      voice.speak("Exited browsing. Press an arrow key to resume.");
     }
   }
 
   async function startBrowse(announce = true) {
-    if (browseState.armed) return browseState.items.length;
+    // Re-arming on a new surface (e.g. home -> search via SPA nav) must refresh the list —
+    // otherwise the stale previous-surface feed lingers. Refresh items, keep the listener.
+    if (browseState.armed) {
+      browseState.index = -1;
+      browseState.items = onBrowsableSurface() ? await feed(20) : [];
+      return browseState.items.length;
+    }
     browseState.armed = true;
+    browseState.everArmed = true;
     browseState.index = -1;
     browseState.items = await feed(20);
-    window.addEventListener("keydown", onBrowseKey, true);
+    window.addEventListener("keydown", onBrowseKey, true); // idempotent; stays attached so Escape can re-arm
     log(`browse mode armed (${browseState.items.length} items)`);
     if (announce && browseState.items.length) {
       voice.speak(
@@ -1103,40 +1970,129 @@
 
   function stopBrowse() {
     browseState.armed = false;
-    window.removeEventListener("keydown", onBrowseKey, true);
+    browseState.index = -1;
+    browseState.items = []; // drop the surface's list so we never replay it after navigating
+    // Keep the keydown listener attached: while disarmed it's inert (passes keys through), but
+    // it lets a single arrow press re-arm browsing so Escape is never a keyboard dead end.
   }
 
   // ===========================================================================
-  // HOLD-TO-TALK + BARGE-IN. Hold the talk key to speak, release to send; press again while
-  // the agent is replying to interrupt and speak. Earcons give instant feedback (listening /
-  // captured / ready / error) so there's never silent waiting after the user speaks.
+  // TAP-TO-TALK + UNIVERSAL BARGE-IN. Press the talk key once and speak; non-continuous
+  // recognition auto-ends on a pause (and a 10s watchdog force-frees the mic regardless), so
+  // the microphone is never held open. EVERY press interrupts whatever we're doing — it stops
+  // speaking, aborts any in-flight listen, and bumps talk.gen so a pending LLM reply can't
+  // speak over the new turn. Speech is a single channel (voice.speak interrupts, never
+  // queues), so the agent goes quiet the instant you press the key. Earcons give instant
+  // feedback (listening / captured / ready / error) so there's never silent waiting.
   // ===========================================================================
-  const talk = { key: "Backquote", state: "idle", hold: null };
+  const talk = { key: "Backquote", state: "idle", hold: null, gen: 0 };
 
   function isTextTarget(t) {
     const tag = (t && t.tagName) || "";
     return /^(INPUT|TEXTAREA|SELECT)$/.test(tag) || (t && t.isContentEditable);
   }
 
-  async function handleHeard(text) {
+  // Pause the page's own media (the YouTube <video>, any <audio>) WHILE the mic is open.
+  // Opening the mic (Web Speech) at the same time loud audio is playing out the speakers is
+  // the classic macOS coreaudiod-contention trigger that can beachball the whole machine —
+  // and it also makes the mic hear the video/our TTS. We pause for the capture+reply window,
+  // then resume. Acting on the player's native pause is read-and-act safe (no DOM/a11y edits).
+  let duckedMedia = [];
+  // Pause page media and AWAIT it actually pausing. m.pause() returns immediately while the
+  // underlying CoreAudio output stream tears down asynchronously; opening the mic before that
+  // teardown is the non-atomic race that left audio still rendering at capture-open. We resolve
+  // on each element's "pause" event (or a 300ms cap so a missing event can't hang the turn).
+  function duckMedia() {
+    const waits = [];
+    try {
+      document.querySelectorAll("video, audio").forEach((m) => {
+        if (!m.paused) {
+          const done = new Promise((res) => {
+            let t = setTimeout(res, 300);
+            m.addEventListener(
+              "pause",
+              () => {
+                clearTimeout(t);
+                res();
+              },
+              { once: true }
+            );
+          });
+          m.pause();
+          duckedMedia.push(m);
+          waits.push(done);
+        }
+      });
+    } catch (_) {}
+    return Promise.all(waits);
+  }
+  function restoreMedia() {
+    const list = duckedMedia;
+    duckedMedia = [];
+    list.forEach((m) => {
+      try {
+        const p = m.play();
+        if (p && p.catch) p.catch(() => {});
+      } catch (_) {}
+    });
+  }
+
+  // ===========================================================================
+  // THE FREEZE GATE. Before ANY mic opens, guarantee NOTHING is rendering on the output device:
+  // macOS opening a capture against live output forces CoreAudio to reconfigure the output
+  // device's session, which deadlocks the single system-wide coreaudiod daemon → whole-machine
+  // beachball (full diagnosis: docs/research/voice-audio-anti-freeze.md). Every capture path —
+  // tap-to-talk, converse()/start(), nano — MUST await this first. It is the universal floor;
+  // the constrained-track / nano paths are the deeper cures layered on top.
+  // ===========================================================================
+  const OUTPUT_SETTLE_MS = 200; // CoreAudio output-stream teardown headroom before capture opens
+  const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+  async function waitSynthQuiet(maxMs = 600) {
+    if (typeof speechSynthesis === "undefined") return;
+    const t0 = nowms();
+    while (speechSynthesis.speaking && nowms() - t0 < maxMs) await delay(30);
+  }
+  async function beginListen() {
+    voice.cancelSpeech(); // 1. stop our own TTS output
+    await duckMedia(); // 2. pause page <video>/<audio> and AWAIT the real pause event
+    audio.suspend(); // 3. drop the earcon AudioContext's render thread
+    await waitSynthQuiet(); // 4. belt-and-suspenders: confirm TTS is actually silent
+    await delay(OUTPUT_SETTLE_MS); // 5. let CoreAudio tear the output stream down before capture
+    // Instrumentation: operationalize "nothing is rendering at mic-open" so a regression is
+    // visible in the logs the moment it reappears (see verification plan in the research doc).
+    let unpaused = 0;
+    try {
+      unpaused = [...document.querySelectorAll("video, audio")].filter((m) => !m.paused).length;
+    } catch (_) {}
+    const speaking = typeof speechSynthesis !== "undefined" && speechSynthesis.speaking;
+    log(`beginListen: gate open — synth.speaking=${speaking} unpausedMedia=${unpaused} constrainedSTT=${voice.isConstrained()}`);
+  }
+
+  async function handleHeard(text, gen) {
+    if (talk.gen !== gen) return; // superseded before we even processed it
     if (!text || !text.trim()) {
       audio.error();
-      talk.state = "idle";
+      if (talk.gen === gen) talk.state = "idle";
       return;
     }
     audio.captured();
     log(`heard: ${text}`);
     talk.state = "thinking";
     let reply;
+    const tAsk = nowms();
     try {
       reply = await ask(text); // progress cues fire inside the loop
     } catch (_) {
       reply = "Sorry, something went wrong.";
     }
+    log(`ask() total ${Math.round(nowms() - tAsk)}ms`);
+    if (talk.gen !== gen) return; // user started a new turn while the LLM was thinking — drop this
     talk.state = "speaking";
     audio.ready();
+    const tSpeak = nowms();
     await voice.speak(reply);
-    if (talk.state === "speaking") talk.state = "idle";
+    log(`speak() ${Math.round(nowms() - tSpeak)}ms`);
+    if (talk.state === "speaking" && talk.gen === gen) talk.state = "idle";
   }
 
   // TAP-to-talk (not hold). Press the key once and speak; recognition is NON-continuous, so
@@ -1147,22 +2103,42 @@
     if (e.code !== talk.key || e.repeat || isTextTarget(e.target)) return;
     e.preventDefault();
     e.stopPropagation();
-    if (talk.state === "speaking") {
-      voice.cancelSpeech(); // barge-in: interrupt the reply
+    // Universal barge-in: a press ALWAYS interrupts — stop talking, abort any in-flight
+    // recognition, and bump the generation so a pending LLM reply (or a listen that was about
+    // to resolve) can't speak over this new turn. This is what makes it feel intuitive: the
+    // moment you press the key, the agent goes quiet and listens.
+    talk.gen++;
+    const myGen = talk.gen;
+    voice.cancelSpeech();
+    voice.abortListen();
+    nanoAsr.abort(); // barge-in must also stop a nano recording, not just Web Speech
+    // If we were already listening, this press cancels it (toggle off) without opening a new mic.
+    if (talk.state === "listening") {
       talk.state = "idle";
-    }
-    if (talk.state !== "idle") return; // already listening/thinking
-    talk.state = "listening";
-    audio.listening();
-    let heard;
-    try {
-      heard = await voice.listenOnce(); // auto-ends on pause; browser frees the mic
-    } catch (_) {
       audio.error();
-      talk.state = "idle";
+      restoreMedia(); // we paused it when this listen started — bring it back
       return;
     }
-    await handleHeard(heard);
+    talk.state = "listening";
+    audio.listening(); // play the "listening" earcon BEFORE the gate (beginListen suspends the ctx)
+    let heard;
+    try {
+      // captureUtterance runs the freeze gate (beginListen: cancel TTS, await media pause, suspend
+      // earcons, settle) THEN opens the mic via the selected listen mode — so the tap path gets the
+      // same quiescence + listenMode (webspeech/nano) as converse()/start().
+      heard = await captureUtterance();
+    } catch (_) {
+      audio.error();
+      if (talk.gen === myGen) talk.state = "idle";
+      restoreMedia();
+      return;
+    }
+    if (talk.gen !== myGen) {
+      restoreMedia();
+      return;
+    }
+    await handleHeard(heard, myGen);
+    restoreMedia(); // resume playback after the reply (or after navigation, harmlessly)
   }
 
   function enableTalk(key) {
@@ -1204,6 +2180,16 @@
     try {
       voice.cancelSpeech();
     } catch (_) {}
+    try {
+      restoreMedia(); // never strand a video we paused for the mic (only resumes ones we paused)
+    } catch (_) {}
+    try {
+      audio.suspend(); // drop the earcon AudioContext's render thread on release
+    } catch (_) {}
+    try {
+      disarmGestureRelay(); // never leave a one-shot key trap armed when we let go
+    } catch (_) {}
+    talk.gen++; // invalidate any in-flight turn so its reply can't speak after release
     talk.state = "idle";
     state.running = false;
   }
@@ -1232,7 +2218,7 @@
     converse, // listen -> ask -> speak (one turn)
     start, // hands-free loop: greet, then listen<->respond until "stop" / silence / stop()
     stop, // end the conversation loop
-    enableTalk, // (key?) hold-to-talk + barge-in (default hold Backquote `); the primary input
+    enableTalk, // (key?) tap-to-talk + barge-in (default tap Backquote `); the primary input
     disableTalk,
     setTalkKey: enableTalk, // alias: re-bind the talk key (KeyboardEvent.code, e.g. "Backquote")
     setEarconVolume: audio.setVolume, // 0 mute … 1 default … 2 louder
@@ -1245,7 +2231,7 @@
     release: releaseAll, // panic: drop the mic + stop everything right now
     isRunning: () => state.running,
     // Arrow-key feed browsing (guided navigation with spoken descriptions).
-    startBrowse, // (announce=true) -> arms arrows: Down/Up move, Enter plays, Escape exits
+    startBrowse, // (announce=true) -> arms arrows: Down/Up move, Enter plays, Escape exits (an arrow re-arms)
     stopBrowse,
     isBrowsing: () => browseState.armed,
     feed, // (limit) -> current surface's video list
@@ -1255,17 +2241,119 @@
     setListenMode(mode) {
       state.listenMode = mode === "nano" ? "nano" : "webspeech";
       if (state.listenMode === "nano")
-        log("listen mode: nano (experimental — slower, may briefly freeze the page per turn)");
-      else log("listen mode: webspeech");
+        log(
+          "listen mode: nano — on-device audio ASR (slower per turn). This is the FREEZE-PROOF " +
+            "capture path: plain getUserMedia, no webkitSpeechRecognition, so no macOS Voice " +
+            "Processing I/O / coreaudiod contention. Needs chrome://flags/#prompt-api-for-gemini-nano-multimodal-input."
+        );
+      else log("listen mode: webspeech (cloud Web Speech; freeze-guarded by the output-quiescence gate)");
       return state.listenMode;
     },
+    // A/B the EC-off constrained-track capture for Web Speech (see docs/research/voice-audio-anti-freeze.md):
+    // ON skips macOS Voice Processing I/O when SpeechRecognition.start(track) is honored, but that API
+    // is flag-gated/undetectable so it's OFF by default. For a guaranteed freeze-proof path use nano mode.
+    setConstrainedSTT: (b) => voice.setConstrained(b),
     useEngine(fn) {
       state.engine = typeof fn === "function" ? fn : geminiEngine;
       destroySession();
       log("engine:", state.engine === geminiEngine ? "Gemini Nano (default)" : "custom");
     },
+    // Model kill switch. OFF by default. Turning it ON enables the OFF-DEVICE cloud engine if
+    // a key is configured (no freeze risk); it does NOT route to on-device Nano — that path,
+    // the one that beachballed the machine (200s `session.prompt()`, abort effectiveness
+    // UNPROVEN), is reached only by the explicit, deliberate ytAgent.setEngine("nano").
+    setModel(on) {
+      state.modelEnabled = !!on;
+      try {
+        localStorage.setItem("ytA11yModelEnabled", on ? "1" : "0");
+      } catch (_) {}
+      if (!on) destroySession(); // drop any live session; nothing should keep the model warm
+      const choice = on ? modelChoice() : "off";
+      log(
+        `model: ${
+          choice === "cloud"
+            ? "ON — cloud engine (off-device; no freeze risk; your key, your quota)"
+            : choice === "nano"
+            ? "ON — on-device Nano (explicit opt-in; watch the max main-thread freeze log; can freeze the machine)"
+            : on
+            ? "ON, but no freeze-safe engine — add a cloud key (ytAgent.setCloudKey / popup). On-device stays off unless you run ytAgent.setEngine('nano')."
+            : "OFF (deterministic-only; commands, greeting, and browse all work)"
+        }`
+      );
+      return state.modelEnabled;
+    },
+    // --- Cloud fallback (BYOK — bring your own Google AI Studio key) -------------------
+    // Dev-harness key entry. ⚠️ localStorage on youtube.com is page-readable — fine for a
+    // dev key you can revoke, wrong for production. The extension keeps the key in
+    // chrome.storage.local, read ONLY by its service worker (see extension/README.md).
+    // Free-tier note: Google may use free-tier API prompts for product improvement.
+    setCloudKey(key) {
+      state.cloudKey = key ? String(key).trim() : null;
+      lsSet("ytA11yCloudKey", state.cloudKey);
+      log(
+        state.cloudKey
+          ? `cloud key set (dev harness — localStorage; revoke it when done). Model: ${state.cloudModel}. Now run ytAgent.setModel(true).`
+          : "cloud key cleared."
+      );
+      return !!state.cloudKey;
+    },
+    setCloudModel(m) {
+      if (m) state.cloudModel = String(m).trim();
+      lsSet("ytA11yCloudModel", state.cloudModel);
+      log(`cloud model: ${state.cloudModel}`);
+      return state.cloudModel;
+    },
+    // Engine selection. "auto" (off-device cloud when configured, else a coaching reply —
+    // never on-device) | "cloud" | "nano". Choosing "nano" is the ONLY way to reach the
+    // on-device model; it is a deliberate, freeze-risky opt-in for instrumented measurement
+    // runs, and it clears the circuit breaker so a previously-tripped session can be re-armed.
+    setEngine(mode) {
+      state.engineMode = mode === "cloud" || mode === "nano" ? mode : "auto";
+      // Persist only the freeze-SAFE modes. "nano" is deliberately session-only: a
+      // machine-freezing path must never silently carry across a restart — you re-opt-in
+      // with setEngine("nano") each session.
+      if (state.engineMode === "nano") {
+        state.nanoTripped = false; // explicit re-arm
+        lsSet("ytA11yEngine", null); // don't persist nano; restart returns to "auto"
+        log("⚠️ engine: on-device Nano (this session only) — the path that can freeze the whole machine. Watch the 'max main-thread freeze' log; ytAgent.setEngine('auto') to leave.");
+      } else {
+        lsSet("ytA11yEngine", state.engineMode);
+      }
+      log(`engine mode: ${state.engineMode} (effective: ${modelChoice()})`);
+      return state.engineMode;
+    },
+    // Extension hook: route cloud calls through the MV3 service worker — the key never
+    // enters this MAIN-world context. fn({model, body}) -> Promise<{ok, text|error}>.
+    // When a transport is installed (extension), drop any dev key from MAIN-world state so
+    // the direct-fetch fallback is truly unreachable and no key sits in page memory — the
+    // extension's key lives only in the service worker (chrome.storage.local).
+    setCloudTransport(fn) {
+      state.cloudTransport = typeof fn === "function" ? fn : null;
+      if (state.cloudTransport && state.cloudKey) {
+        state.cloudKey = null;
+        log("dev cloud key in localStorage is ignored under the extension (service-worker key is used); clear it with ytAgent.setCloudKey(null) if you set it for the dev harness.");
+      }
+      log(`cloud transport: ${state.cloudTransport ? "extension service worker" : "none (direct fetch with dev key)"}`);
+      return !!state.cloudTransport;
+    },
+    cloudStatus: () => ({
+      modelEnabled: state.modelEnabled,
+      engineMode: state.engineMode,
+      effectiveEngine: modelChoice(),
+      cloudConfigured: cloudAvailable(),
+      cloudModel: state.cloudModel,
+      viaServiceWorker: !!state.cloudTransport,
+    }),
+    clearConversation: () => convo.clear(),
     speak: voice.speak,
-    listen: captureUtterance, // respects listenMode
+    // respects listenMode; runs the freeze gate, and restores ducked media after a standalone listen.
+    listen: async () => {
+      try {
+        return await captureUtterance();
+      } finally {
+        restoreMedia();
+      }
+    },
     describeImage, // (url, question?) -> spoken-friendly description via Nano vision
     // Describe the thumbnail of item `index` on the current surface (home/search/up-next).
     async describeThumbnail(index = 0, question) {
@@ -1290,7 +2378,8 @@
     listTools: () => consumer.list().concat(localTools).map((t) => ({ name: t.name, description: t.description })),
     reset() {
       destroySession();
-      log("session reset.");
+      convo.clear();
+      log("session + conversation reset.");
     },
     _state: state,
   };
@@ -1304,7 +2393,9 @@
     if (consumer.wrap()) {
       availability().then((a) =>
         log(
-          `ready. Gemini Nano: ${a}. voice: tts=${voice.supported.tts} stt=${voice.supported.stt}. ` +
+          `ready. Gemini Nano: ${a}. model: ${state.modelEnabled ? `ON (engine: ${modelChoice()})` : "OFF (kill switch — deterministic-only; ytAgent.setModel(true) to opt in)"}. ` +
+            `cloud: ${cloudAvailable() ? `configured (${state.cloudModel}${state.cloudTransport ? ", via service worker" : ", direct"})` : "not configured (ytAgent.setCloudKey or extension popup)"}. ` +
+            `voice: tts=${voice.supported.tts} stt=${voice.supported.stt}. ` +
             `Try: ytAgent.start() for hands-free voice, ytAgent.ask("...") to type, ` +
             `or ytAgent.enablePushToTalk() for a hotkey.`
         )

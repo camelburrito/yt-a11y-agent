@@ -37,7 +37,43 @@ const SEL = {
     container: "yt-lockup-view-model, ytd-compact-video-renderer",
   },
   comments: { thread: "ytd-comment-thread-renderer", content: "#content-text", author: "#author-text" },
+  shorts: {
+    next: "#navigation-button-down button, ytd-shorts #navigation-button-down button, button[aria-label='Next video' i]",
+    prev: "#navigation-button-up button, ytd-shorts #navigation-button-up button, button[aria-label='Previous video' i]",
+  },
+  guide: {
+    button: "#guide-button button, #guide-button, button[aria-label='Guide' i]",
+    menu: "ytd-guide-renderer",
+    entry: "ytd-guide-entry-renderer",
+    entryLink: "a#endpoint, a",
+    entryTitle: "yt-formatted-string.title, .title",
+  },
 };
+
+// readGuideEntries mirrored from the provider (runs in page context). Opens the native Guide
+// drawer if the full guide isn't hydrated (it isn't on /watch until clicked), then reads links.
+const READ_GUIDE = `
+(async function(G){
+  const txt = (el) => (el && el.textContent ? el.textContent.trim().replace(/\\s+/g,' ') : "");
+  if(!document.querySelector(G.menu)){
+    const b=document.querySelector(G.button); if(b) b.click();
+    await new Promise(r=>setTimeout(r,900));
+  }
+  const root=document.querySelector(G.menu);
+  if(!root) return { opened:false, entries:[] };
+  const seen=new Set(); const out=[];
+  for(const el of root.querySelectorAll(G.entry)){
+    const title = txt(el.querySelector(G.entryTitle)) || txt(el);
+    if(!title) continue;
+    const a=el.querySelector(G.entryLink);
+    let url=a?a.getAttribute("href"):null;
+    if(url && url.startsWith("/")) url="https://www.youtube.com"+url;
+    if(!url){ if(/^shorts$/i.test(title)) url="https://www.youtube.com/shorts/"; else continue; }
+    const k=title.toLowerCase(); if(seen.has(k)) continue; seen.add(k);
+    out.push({ title, url });
+  }
+  return { opened:true, entries: out };
+})`;
 
 // readVideoCards mirrored from the provider (runs in page context).
 const READ_CARDS = `
@@ -172,6 +208,28 @@ async function main() {
     } else {
       report.watch = "skipped — no search result URL resolved";
     }
+
+    // ---- SIDEBAR / GUIDE (home: hydrated inline; watch: opened via button) ----
+    await page.goto("https://www.youtube.com/?hl=en", { waitUntil: "networkidle2", timeout: 45000 });
+    await sleep(2000);
+    report.guideHome = await page.evaluate((fn, g) => eval(fn)(g), READ_GUIDE, SEL.guide);
+    if (firstUrl) {
+      await page.goto(firstUrl + "&hl=en", { waitUntil: "networkidle2", timeout: 45000 });
+      await sleep(2000);
+      report.guideWatch = await page.evaluate((fn, g) => eval(fn)(g), READ_GUIDE, SEL.guide);
+    }
+
+    // ---- SHORTS (next/prev nav buttons + the <video>) ----
+    await page.goto("https://www.youtube.com/shorts?hl=en", { waitUntil: "networkidle2", timeout: 45000 });
+    await sleep(3000);
+    report.shorts = await page.evaluate((S) => {
+      return {
+        path: location.pathname,
+        videoFound: !!document.querySelector("video"),
+        nextButton: !!document.querySelector(S.shorts.next),
+        prevButton: !!document.querySelector(S.shorts.prev),
+      };
+    }, SEL);
   } finally {
     await browser.close();
   }

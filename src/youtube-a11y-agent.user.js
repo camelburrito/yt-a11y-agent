@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent Tools (WebMCP)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.1.0
+// @version      0.9.6
 // @description  Registers WebMCP tools on YouTube so an in-browser AI agent can help users with accessibility needs navigate YouTube. Read-and-act only — never mutates the page or its accessibility tree.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -19,12 +19,15 @@
   "use strict";
 
   const LOG = "[yt-a11y]";
+  const PROVIDER_VERSION = "0.9.6"; // bump on provider changes; printed at boot so a stale
+  // content script (old build still injected in an open tab) is obvious in the console.
 
   // ---------------------------------------------------------------------------
   // WebMCP API resolution.
-  // The spec draft and Chrome's docs disagree on the namespace: some builds expose
-  // document.modelContext, others navigator.modelContext. Support both. Resolve lazily
-  // (not once at load) because the object may attach slightly after document-idle.
+  // The spec moved the getter to Document (webmcp PR #184, 2026-05-27); Chrome 149 still
+  // exposes navigator.modelContext, Chrome 150 is expected to follow the spec. Probe
+  // document first, keep the navigator fallback. Resolve lazily (not once at load)
+  // because the object may attach slightly after document-idle.
   // ---------------------------------------------------------------------------
   function getModelContext() {
     return (
@@ -104,6 +107,11 @@
       transcriptText: ".segment-text, yt-formatted-string.segment-text",
       transcriptTime: ".segment-timestamp",
       transcriptOpenButton: "button[aria-label*='transcript' i]",
+      // New tabbed transcript shell (observed live 2026-06-07): the engagement panel opens
+      // as "In this video" with Chapters/Transcript chips; the Transcript chip must be
+      // clicked before segments render. Code filters these buttons by text "Transcript".
+      transcriptTabChip:
+        "ytd-engagement-panel-section-list-renderer[target-id*='transcript'] chip-view-model button, ytd-engagement-panel-section-list-renderer[target-id*='transcript'] button",
     },
 
     watchNext: {
@@ -116,6 +124,30 @@
       content: "#content-text",
       author: "#author-text",
       pinned: "ytd-comment-thread-renderer:has(#pinned-comment-badge), ytd-comment-thread-renderer:has([pinned-comment-badge])",
+    },
+
+    // Shorts vertical-feed navigation arrows (the player overlays them). "next" = scroll DOWN
+    // to the next short, "previous" = scroll UP. We actuate the native buttons (read-and-act
+    // safe) rather than synthesizing arrow keys, which YouTube's handler ignores when untrusted.
+    // Verified live 2026-06-13 (npm run verify:selectors). Ids are volatile — re-verify if
+    // next/prev short stops working.
+    shorts: {
+      next: "#navigation-button-down button, ytd-shorts #navigation-button-down button, button[aria-label='Next video' i]",
+      prev: "#navigation-button-up button, ytd-shorts #navigation-button-up button, button[aria-label='Previous video' i]",
+    },
+
+    // Left navigation drawer ("guide"). Verified live 2026-06-13 (scripts/probe-sidebar.mjs):
+    // the full guide (`ytd-guide-renderer`) is hydrated on home/feed but ABSENT on /watch until
+    // its button is clicked — so the read tool actuates `button` first when `menu` is missing.
+    // Entries are real <a href> links (Home "/", Subscriptions "/feed/subscriptions", History
+    // "/feed/history", "You" "/feed/you", plus Explore/footer items); "Shorts" has no href (SPA
+    // endpoint) so we route it to /shorts/. "Show more"/"Show less" are href-less toggles, skipped.
+    guide: {
+      button: "#guide-button button, #guide-button, button[aria-label='Guide' i]",
+      menu: "ytd-guide-renderer",
+      entry: "ytd-guide-entry-renderer",
+      entryLink: "a#endpoint, a",
+      entryTitle: "yt-formatted-string.title, .title",
     },
   };
 
@@ -255,7 +287,10 @@
   function detectSurface(pathname) {
     if (pathname === "/" || pathname.startsWith("/feed")) return "home";
     if (pathname.startsWith("/results")) return "search";
-    if (pathname.startsWith("/watch")) return "watch";
+    // Shorts is a video surface too — it has a <video> element, so the watch tools
+    // (play/pause/seek via the generic `video` selector) work. The sidebar/transcript
+    // tools simply no-op there, which is fine.
+    if (pathname.startsWith("/watch") || pathname.startsWith("/shorts")) return "watch";
     if (
       pathname.startsWith("/@") ||
       pathname.startsWith("/channel/") ||
@@ -461,6 +496,87 @@
     };
   }
 
+  // ---- SIDEBAR / GUIDE (cross-cutting; YouTube's left navigation drawer) -----
+  // Read the guide entries live. On /watch the full guide isn't in the DOM until its button is
+  // clicked, so when `menu` is absent we actuate the native Guide button and wait for hydration.
+  // Actuating YouTube's own control is read-and-act safe; we don't inject or rewrite anything.
+  async function readGuideEntries() {
+    if (!document.querySelector(SEL.guide.menu)) {
+      actuate(SEL.guide.button);
+      await sleep(900);
+    }
+    const root = document.querySelector(SEL.guide.menu);
+    if (!root) return { opened: false, entries: [] };
+    const seen = new Set();
+    const entries = [];
+    for (const el of root.querySelectorAll(SEL.guide.entry)) {
+      const title = qsText(el, SEL.guide.entryTitle) || txt(el);
+      if (!title) continue;
+      const a = el.querySelector(SEL.guide.entryLink);
+      let url = a ? a.getAttribute("href") : null;
+      if (url && url.startsWith("/")) url = "https://www.youtube.com" + url;
+      // "Shorts" is an href-less SPA endpoint; route it to the feed. Skip href-less toggles
+      // ("Show more"/"Show less") and anything else we can't navigate to.
+      if (!url) {
+        if (/^shorts$/i.test(title)) url = "https://www.youtube.com/shorts/";
+        else continue;
+      }
+      const key = title.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      entries.push({ title, url });
+    }
+    return { entries };
+  }
+  function sidebarTools() {
+    // Friendly aliases for items whose spoken name differs from YouTube's label.
+    const ALIAS = { library: "you", "your stuff": "you", "my channel": "you" };
+    return [
+      {
+        name: "list_sidebar",
+        description:
+          "List the items in YouTube's left navigation menu (the 'guide' drawer) — Home, Shorts, Subscriptions, History, and so on — as a spoken-friendly sentence. Call this when the user asks what's in the menu / sidebar, or which sections they can go to. On a watch page this briefly opens the native menu drawer to read it.",
+        inputSchema: { type: "object", properties: {} },
+        async execute() {
+          const { entries } = await readGuideEntries();
+          if (!entries.length) return ok("I couldn't read the navigation menu on this page.");
+          const names = entries.map((e) => e.title);
+          return ok(
+            `The menu has: ${names.join(", ")}. Say, for example, "open Subscriptions" or "go to History".`
+          );
+        },
+      },
+      {
+        name: "open_sidebar_item",
+        description:
+          "Navigate to an item in YouTube's left navigation menu by name (e.g. 'Subscriptions', 'History', 'Shorts', 'Home'). `name` is matched leniently against the menu labels. Use after list_sidebar, or directly when the user says 'go to subscriptions', 'open my history', etc.",
+        inputSchema: {
+          type: "object",
+          properties: { name: { type: "string", description: "Menu item to open, e.g. 'Subscriptions'." } },
+          required: ["name"],
+        },
+        async execute({ name } = {}) {
+          const want = String(name || "").trim().toLowerCase();
+          if (!want) return ok("Which menu item? Say, for example, open Subscriptions.");
+          const { entries } = await readGuideEntries();
+          if (!entries.length) return ok("I couldn't read the navigation menu on this page.");
+          const target = ALIAS[want] || want;
+          const hit =
+            entries.find((e) => e.title.toLowerCase() === target) ||
+            entries.find((e) => e.title.toLowerCase().includes(target)) ||
+            entries.find((e) => target.includes(e.title.toLowerCase()));
+          if (!hit) {
+            const names = entries.map((e) => e.title).join(", ");
+            return ok(`I couldn't find "${name}" in the menu. It has: ${names}.`);
+          }
+          pend(`You're on ${hit.title}.`);
+          window.location.href = hit.url;
+          return ok(`Opening ${hit.title}.`);
+        },
+      },
+    ];
+  }
+
   // ===========================================================================
   // OTHER JOURNEYS — implemented. Selectors live in SEL; logic mirrors the verified
   // home reader. NOTE: search/watch/comments selectors are best-effort and should be
@@ -593,6 +709,15 @@
           if (lines.length === 0) {
             const opened = actuate(SEL.watch.transcriptOpenButton);
             await sleep(1200);
+            // New tabbed shell (2026-06): the panel can open on "Chapters" — click the
+            // "Transcript" chip if present, then re-read.
+            const chip = Array.from(document.querySelectorAll(SEL.watch.transcriptTabChip)).find((b) =>
+              /^transcript$/i.test(txt(b))
+            );
+            if (chip) {
+              chip.click();
+              await sleep(1200);
+            }
             lines = readTranscript(limit);
             if (lines.length === 0) {
               return ok(
@@ -853,19 +978,27 @@
           const v = getVideo();
           if (!v) return ok("No video found on this page.");
           if (document.pictureInPictureElement) return ok("Already in Picture-in-Picture.");
-          // Open question (c): requestPictureInPicture needs transient user activation.
-          // Measure it, then fall back to actuating the native button if the API refuses.
+          // RESOLVED open question (c), measured live 2026-06-07 (scripts/verify-gestures.mjs):
+          // requestPictureInPicture needs TRANSIENT user activation (~5s window). It succeeds
+          // right after a real keypress and fails after voice latency (~6s) — and the native
+          // PiP button is equally gated, so the el.click() fallback is only a backstop. The
+          // consumer's gesture relay ("picture in picture" voice command) runs this tool
+          // inside a fresh trusted keydown, which is the path that actually works.
           const active = !!(navigator.userActivation && navigator.userActivation.isActive);
           try {
             await v.requestPictureInPicture();
-            return ok(`Entered Picture-in-Picture. (userActivation.isActive was ${active})`);
+            console.log(`${LOG} enter_pip: direct API ok (userActivation.isActive=${active})`);
+            return ok("The video is now in a floating window. Say exit picture in picture to bring it back.");
           } catch (e) {
             const clicked = actuate(SEL.watch.pipButton);
+            await sleep(500);
+            const inPip = !!document.pictureInPictureElement;
+            console.log(
+              `${LOG} enter_pip: direct API failed (userActivation.isActive=${active}: ${e.message}); button fallback clicked=${clicked} inPip=${inPip}`
+            );
+            if (inPip) return ok("The video is now in a floating window. Say exit picture in picture to bring it back.");
             return ok(
-              `Direct Picture-in-Picture failed (userActivation.isActive=${active}: ${e.message}). ` +
-                (clicked
-                  ? "I clicked the native PiP button instead — let me know if it worked."
-                  : "No native PiP button was found.")
+              "I couldn't pop the video out — the browser needs a fresh key press for that. Say picture in picture again, and press Enter when I ask."
             );
           }
         },
@@ -887,6 +1020,41 @@
     ];
   }
 
+  // ---- SHORTS (vertical feed; resolves to the "watch" surface) --------------
+  // Shorts share the watch surface (play/pause/seek work via the generic <video>), but moving
+  // between shorts is a vertical-feed action with no transcript/sidebar. These two tools
+  // actuate YouTube's native up/down navigation arrows; they no-op off /shorts (like the
+  // transcript tools), so registering them on every watch route is harmless.
+  function onShortsPath() {
+    return location.pathname.startsWith("/shorts");
+  }
+  function shortsTools() {
+    return [
+      {
+        name: "next_short",
+        description:
+          "On the Shorts feed, advance to the NEXT short (scrolls down the vertical feed). Call this when the user says 'next', 'next short', or 'skip' while watching Shorts.",
+        inputSchema: { type: "object", properties: {} },
+        async execute() {
+          if (!onShortsPath()) return ok("Next short only works on the Shorts feed.");
+          if (actuate(SEL.shorts.next)) return ok("Next short.");
+          return ok("I couldn't find the next-short control on this page.");
+        },
+      },
+      {
+        name: "prev_short",
+        description:
+          "On the Shorts feed, go back to the PREVIOUS short (scrolls up the vertical feed). Call this when the user says 'previous', 'back', or 'previous short' while watching Shorts.",
+        inputSchema: { type: "object", properties: {} },
+        async execute() {
+          if (!onShortsPath()) return ok("Previous short only works on the Shorts feed.");
+          if (actuate(SEL.shorts.prev)) return ok("Previous short.");
+          return ok("You're at the first short, or I couldn't find the previous-short control.");
+        },
+      },
+    ];
+  }
+
   // ===========================================================================
   // Route-scoped registration backbone.
   // Each route gets its own AbortController. Registering with { signal } means
@@ -897,8 +1065,8 @@
   let currentSurface = null;
 
   function toolsForSurface(surface) {
-    // where_am_i and get_account are registered everywhere.
-    const tools = [whereAmITool(), accountTool()];
+    // where_am_i, get_account, and the sidebar/guide tools are registered everywhere.
+    const tools = [whereAmITool(), accountTool(), ...sidebarTools()];
     switch (surface) {
       case "home":
         tools.push(...homeTools());
@@ -907,7 +1075,7 @@
         tools.push(...searchTools());
         break;
       case "watch":
-        tools.push(...watchTools(), ...watchNextTools(), ...commentsTools(), ...pipTools());
+        tools.push(...watchTools(), ...watchNextTools(), ...commentsTools(), ...pipTools(), ...shortsTools());
         break;
       case "channel":
       case "other":
@@ -940,13 +1108,37 @@
     const { signal } = currentController;
 
     const tools = toolsForSurface(surface);
+
+    // Spec-current metadata (WebMCP draft, 2026-06): `title` is a human-readable label for
+    // future browser UI, and `annotations.readOnlyHint` marks tools that only READ the page
+    // — cautious consumers can call them without confirmation. Unknown dictionary members
+    // are ignored by builds that predate them (WebIDL), so this is safe everywhere.
+    const READ_ONLY = new Set([
+      "where_am_i", "get_account", "list_home_feed", "describe_home", "list_categories",
+      "list_results", "get_video_info", "get_transcript", "summarize_video",
+      "plain_language_summary", "list_up_next", "get_comments", "summarize_comments",
+      "get_pinned_comment",
+    ]);
+    for (const tool of tools) {
+      if (!tool.title) tool.title = tool.name.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+      if (READ_ONLY.has(tool.name)) tool.annotations = { readOnlyHint: true, ...(tool.annotations || {}) };
+    }
+
     const registered = [];
     for (const tool of tools) {
       try {
         api.registerTool(tool, { signal });
         registered.push(tool.name);
       } catch (err) {
-        console.error(`${LOG} failed to register tool "${tool.name}":`, err);
+        // Chrome's experimental ModelContext (behind #enable-webmcp-testing) does NOT reliably
+        // unregister tools when their AbortSignal fires, so a re-register can throw
+        // "Duplicate tool name". The tool IS present in the page's registry (and the consumer
+        // captured it before this throw), so treat it as registered rather than spamming errors.
+        if (String((err && err.message) || err).includes("Duplicate tool name")) {
+          registered.push(tool.name);
+        } else {
+          console.error(`${LOG} failed to register tool "${tool.name}":`, err);
+        }
       }
     }
 
@@ -960,17 +1152,18 @@
   //   1. yt-navigate-finish  — YouTube's own "done navigating" event (primary)
   //   2. popstate            — back/forward
   //   3. 1s URL poll         — fallback for anything the above miss
-  // We only re-register when the resolved surface actually changes.
+  // We only re-register when the resolved SURFACE changes — NOT on every path tweak. This is
+  // critical: scrolling between Shorts (/shorts/A -> /shorts/B) or switching videos
+  // (/watch?v=A -> /watch?v=B) keeps the same surface, and the tools read the DOM live, so
+  // re-registering would only churn (and, given Chrome's abort-doesn't-unregister behavior,
+  // produce "Duplicate tool name" storms) for no benefit.
   // ---------------------------------------------------------------------------
   let lastSurface = null;
-  let lastPath = null;
 
   function onMaybeRouteChange() {
-    const path = location.pathname;
-    const surface = detectSurface(path);
-    if (surface === lastSurface && path === lastPath) return;
+    const surface = detectSurface(location.pathname);
+    if (surface === lastSurface) return;
     lastSurface = surface;
-    lastPath = path;
     registerForRoute();
   }
 
@@ -994,5 +1187,5 @@
     setTimeout(() => bootstrap(attempt + 1), 500);
   })(0);
 
-  console.log(`${LOG} userscript loaded (MAIN world). Awaiting WebMCP API…`);
+  console.log(`${LOG} provider v${PROVIDER_VERSION} loaded (MAIN world). Awaiting WebMCP API…`);
 })();
