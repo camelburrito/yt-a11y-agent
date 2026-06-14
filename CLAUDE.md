@@ -71,17 +71,31 @@ user's existing assistive tech reports stays authoritative.
 | home    | `/` or `/feed*`              | `list_home_feed`, `describe_home`, `open_video`, `load_more_home`, `list_categories`, `select_category` ✅ verified live (chips: `ytd-feed-filter-chip-bar-renderer yt-chip-cloud-chip-renderer`) |
 | search  | `/results`                   | `run_search`, `list_results`, `refine_search`, `open_result` ✅ verified live |
 | watch   | `/watch` **or `/shorts`**    | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` ✅ verified live (transcript-open best-effort). Shorts resolves here so play/pause/seek (generic `video` selector) work; sidebar/transcript tools no-op on Shorts. |
+| shorts  | `/shorts` (same surface)     | `next_short`, `prev_short` — actuate YouTube's native up/down feed-nav arrows (`SEL.shorts`); registered on every watch route but **no-op off `/shorts`** (like transcript tools). ✅ buttons verified live 2026-06-13 (`npm run verify:selectors`); ids are volatile so re-verify if next/prev short stops moving. Agent: "watch shorts" navigates to `/shorts/`; on `/shorts`, "next"/"previous" route here (not `play_next`). |
 | watch-next | `/watch` (same surface)   | `list_up_next`, `play_next`, `set_autoplay` ✅ verified live |
 | comments | `/watch` (same surface)    | `get_comments`, `summarize_comments`, `get_pinned_comment` ✅ verified live |
 | pip     | `/watch` (same surface)      | `enter_pip`, `exit_pip` ✅ gesture path measured live (2026-06-07): needs ≤5s-fresh activation, button fallback equally gated → agent's **gesture relay** ("picture in picture" → press Enter) is the working path |
 | channel | `/@*`, `/channel/*`, `/c/*`  | (cross-cutting only for now) |
 | other   | anything else                | (cross-cutting only) |
 
-`where_am_i` and `get_account` are **cross-cutting** — registered on every route.
+`where_am_i`, `get_account`, and the sidebar/guide tools (`list_sidebar`, `open_sidebar_item`)
+are **cross-cutting** — registered on every route.
 `where_am_i` returns surface + pathname; `get_account` returns `{signedIn, name}`.
 **`signedIn` is reliable; `name` is usually `null`** — YouTube only renders the account name
 after the account menu is opened, and we won't open it (AT-safe). So greet signed-in users
 warmly *without* a name ("Welcome back!"); use the name only if present.
+
+**Sidebar / guide (`SEL.guide`) ✅ verified live 2026-06-13 (`npm run verify:selectors`).**
+`list_sidebar` reads YouTube's left navigation drawer (`ytd-guide-renderer` →
+`ytd-guide-entry-renderer`) as a spoken sentence; `open_sidebar_item({name})` navigates to a
+menu item by lenient name match (`pend()` + `location.href`). The full guide is hydrated inline
+on home/feed but **absent on `/watch` until its button is clicked** — so `readGuideEntries`
+actuates the native Guide button (`SEL.guide.button`) and waits ~900ms when `SEL.guide.menu` is
+missing (read-and-act safe; YouTube's own drawer, not an injected overlay; this leaves the drawer
+open, which usefully moves AT focus into the menu the user asked for). Href-less "Shorts" routes
+to `/shorts/`; href-less "Show more"/"Show less" toggles are skipped. Agent commands: "menu" /
+"sidebar" → `list_sidebar`; "go to subscriptions" / "open history" → `open_sidebar_item`
+(matched **before** open-by-number so "open subscriptions" isn't read as "open N").
 
 **Arrow-key browsing** (agent-side, `ytAgent.startBrowse`): on the home feed and search
 results the extension arms arrow keys so the user steps through videos hearing each

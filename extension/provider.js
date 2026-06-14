@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent Tools (WebMCP)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.9.5
+// @version      0.9.6
 // @description  Registers WebMCP tools on YouTube so an in-browser AI agent can help users with accessibility needs navigate YouTube. Read-and-act only — never mutates the page or its accessibility tree.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG = "[yt-a11y]";
-  const PROVIDER_VERSION = "0.9.5"; // bump on provider changes; printed at boot so a stale
+  const PROVIDER_VERSION = "0.9.6"; // bump on provider changes; printed at boot so a stale
   // content script (old build still injected in an open tab) is obvious in the console.
 
   // ---------------------------------------------------------------------------
@@ -125,6 +125,30 @@
       content: "#content-text",
       author: "#author-text",
       pinned: "ytd-comment-thread-renderer:has(#pinned-comment-badge), ytd-comment-thread-renderer:has([pinned-comment-badge])",
+    },
+
+    // Shorts vertical-feed navigation arrows (the player overlays them). "next" = scroll DOWN
+    // to the next short, "previous" = scroll UP. We actuate the native buttons (read-and-act
+    // safe) rather than synthesizing arrow keys, which YouTube's handler ignores when untrusted.
+    // Verified live 2026-06-13 (npm run verify:selectors). Ids are volatile — re-verify if
+    // next/prev short stops working.
+    shorts: {
+      next: "#navigation-button-down button, ytd-shorts #navigation-button-down button, button[aria-label='Next video' i]",
+      prev: "#navigation-button-up button, ytd-shorts #navigation-button-up button, button[aria-label='Previous video' i]",
+    },
+
+    // Left navigation drawer ("guide"). Verified live 2026-06-13 (scripts/probe-sidebar.mjs):
+    // the full guide (`ytd-guide-renderer`) is hydrated on home/feed but ABSENT on /watch until
+    // its button is clicked — so the read tool actuates `button` first when `menu` is missing.
+    // Entries are real <a href> links (Home "/", Subscriptions "/feed/subscriptions", History
+    // "/feed/history", "You" "/feed/you", plus Explore/footer items); "Shorts" has no href (SPA
+    // endpoint) so we route it to /shorts/. "Show more"/"Show less" are href-less toggles, skipped.
+    guide: {
+      button: "#guide-button button, #guide-button, button[aria-label='Guide' i]",
+      menu: "ytd-guide-renderer",
+      entry: "ytd-guide-entry-renderer",
+      entryLink: "a#endpoint, a",
+      entryTitle: "yt-formatted-string.title, .title",
     },
   };
 
@@ -471,6 +495,87 @@
         return okJSON({ signedIn, name: name || null });
       },
     };
+  }
+
+  // ---- SIDEBAR / GUIDE (cross-cutting; YouTube's left navigation drawer) -----
+  // Read the guide entries live. On /watch the full guide isn't in the DOM until its button is
+  // clicked, so when `menu` is absent we actuate the native Guide button and wait for hydration.
+  // Actuating YouTube's own control is read-and-act safe; we don't inject or rewrite anything.
+  async function readGuideEntries() {
+    if (!document.querySelector(SEL.guide.menu)) {
+      actuate(SEL.guide.button);
+      await sleep(900);
+    }
+    const root = document.querySelector(SEL.guide.menu);
+    if (!root) return { opened: false, entries: [] };
+    const seen = new Set();
+    const entries = [];
+    for (const el of root.querySelectorAll(SEL.guide.entry)) {
+      const title = qsText(el, SEL.guide.entryTitle) || txt(el);
+      if (!title) continue;
+      const a = el.querySelector(SEL.guide.entryLink);
+      let url = a ? a.getAttribute("href") : null;
+      if (url && url.startsWith("/")) url = "https://www.youtube.com" + url;
+      // "Shorts" is an href-less SPA endpoint; route it to the feed. Skip href-less toggles
+      // ("Show more"/"Show less") and anything else we can't navigate to.
+      if (!url) {
+        if (/^shorts$/i.test(title)) url = "https://www.youtube.com/shorts/";
+        else continue;
+      }
+      const key = title.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      entries.push({ title, url });
+    }
+    return { entries };
+  }
+  function sidebarTools() {
+    // Friendly aliases for items whose spoken name differs from YouTube's label.
+    const ALIAS = { library: "you", "your stuff": "you", "my channel": "you" };
+    return [
+      {
+        name: "list_sidebar",
+        description:
+          "List the items in YouTube's left navigation menu (the 'guide' drawer) — Home, Shorts, Subscriptions, History, and so on — as a spoken-friendly sentence. Call this when the user asks what's in the menu / sidebar, or which sections they can go to. On a watch page this briefly opens the native menu drawer to read it.",
+        inputSchema: { type: "object", properties: {} },
+        async execute() {
+          const { entries } = await readGuideEntries();
+          if (!entries.length) return ok("I couldn't read the navigation menu on this page.");
+          const names = entries.map((e) => e.title);
+          return ok(
+            `The menu has: ${names.join(", ")}. Say, for example, "open Subscriptions" or "go to History".`
+          );
+        },
+      },
+      {
+        name: "open_sidebar_item",
+        description:
+          "Navigate to an item in YouTube's left navigation menu by name (e.g. 'Subscriptions', 'History', 'Shorts', 'Home'). `name` is matched leniently against the menu labels. Use after list_sidebar, or directly when the user says 'go to subscriptions', 'open my history', etc.",
+        inputSchema: {
+          type: "object",
+          properties: { name: { type: "string", description: "Menu item to open, e.g. 'Subscriptions'." } },
+          required: ["name"],
+        },
+        async execute({ name } = {}) {
+          const want = String(name || "").trim().toLowerCase();
+          if (!want) return ok("Which menu item? Say, for example, open Subscriptions.");
+          const { entries } = await readGuideEntries();
+          if (!entries.length) return ok("I couldn't read the navigation menu on this page.");
+          const target = ALIAS[want] || want;
+          const hit =
+            entries.find((e) => e.title.toLowerCase() === target) ||
+            entries.find((e) => e.title.toLowerCase().includes(target)) ||
+            entries.find((e) => target.includes(e.title.toLowerCase()));
+          if (!hit) {
+            const names = entries.map((e) => e.title).join(", ");
+            return ok(`I couldn't find "${name}" in the menu. It has: ${names}.`);
+          }
+          pend(`You're on ${hit.title}.`);
+          window.location.href = hit.url;
+          return ok(`Opening ${hit.title}.`);
+        },
+      },
+    ];
   }
 
   // ===========================================================================
@@ -916,6 +1021,41 @@
     ];
   }
 
+  // ---- SHORTS (vertical feed; resolves to the "watch" surface) --------------
+  // Shorts share the watch surface (play/pause/seek work via the generic <video>), but moving
+  // between shorts is a vertical-feed action with no transcript/sidebar. These two tools
+  // actuate YouTube's native up/down navigation arrows; they no-op off /shorts (like the
+  // transcript tools), so registering them on every watch route is harmless.
+  function onShortsPath() {
+    return location.pathname.startsWith("/shorts");
+  }
+  function shortsTools() {
+    return [
+      {
+        name: "next_short",
+        description:
+          "On the Shorts feed, advance to the NEXT short (scrolls down the vertical feed). Call this when the user says 'next', 'next short', or 'skip' while watching Shorts.",
+        inputSchema: { type: "object", properties: {} },
+        async execute() {
+          if (!onShortsPath()) return ok("Next short only works on the Shorts feed.");
+          if (actuate(SEL.shorts.next)) return ok("Next short.");
+          return ok("I couldn't find the next-short control on this page.");
+        },
+      },
+      {
+        name: "prev_short",
+        description:
+          "On the Shorts feed, go back to the PREVIOUS short (scrolls up the vertical feed). Call this when the user says 'previous', 'back', or 'previous short' while watching Shorts.",
+        inputSchema: { type: "object", properties: {} },
+        async execute() {
+          if (!onShortsPath()) return ok("Previous short only works on the Shorts feed.");
+          if (actuate(SEL.shorts.prev)) return ok("Previous short.");
+          return ok("You're at the first short, or I couldn't find the previous-short control.");
+        },
+      },
+    ];
+  }
+
   // ===========================================================================
   // Route-scoped registration backbone.
   // Each route gets its own AbortController. Registering with { signal } means
@@ -926,8 +1066,8 @@
   let currentSurface = null;
 
   function toolsForSurface(surface) {
-    // where_am_i and get_account are registered everywhere.
-    const tools = [whereAmITool(), accountTool()];
+    // where_am_i, get_account, and the sidebar/guide tools are registered everywhere.
+    const tools = [whereAmITool(), accountTool(), ...sidebarTools()];
     switch (surface) {
       case "home":
         tools.push(...homeTools());
@@ -936,7 +1076,7 @@
         tools.push(...searchTools());
         break;
       case "watch":
-        tools.push(...watchTools(), ...watchNextTools(), ...commentsTools(), ...pipTools());
+        tools.push(...watchTools(), ...watchNextTools(), ...commentsTools(), ...pipTools(), ...shortsTools());
         break;
       case "channel":
       case "other":

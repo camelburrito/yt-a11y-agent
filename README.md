@@ -30,6 +30,7 @@ PiP gesture relay by voice.
 | Search       | `run_search`, `list_results`, `refine_search`, `open_result` | ✅ verified live |
 | Watch        | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` | ✅ verified live¹ |
 | Watch Next   | `list_up_next`, `play_next`, `set_autoplay` | ✅ verified live |
+| Shorts       | `next_short`, `prev_short` (+ say "watch shorts" to open the feed) | ✅ verified live³ |
 | Comments     | `get_comments`, `summarize_comments`, `get_pinned_comment` | ✅ verified live |
 | Picture-in-Picture | `enter_pip`, `exit_pip` | ✅ gesture path measured live² |
 
@@ -44,9 +45,16 @@ button is gated the same way. So the agent uses a **gesture relay**: say "pictur
 picture", then press Enter — the tool runs inside that fresh keypress and succeeds.
 `get_video_info` flags `adPlaying` so the agent doesn't read a preroll ad's timing as the
 video's.
+³ Shorts shares the Watch surface (play/pause/seek work via the generic `<video>`).
+`next_short`/`prev_short` actuate YouTube's native up/down feed-nav arrows and no-op off
+`/shorts`; on the Shorts feed "next"/"previous" route to them. Buttons verified live
+2026-06-13 (`npm run verify:selectors`); the arrow ids are volatile, so re-verify if
+next/previous stops moving between shorts.
 
-`where_am_i` works everywhere and tells the agent which surface you're on. Direct commands
-(play, pause, search, browse…) are **deterministic — no AI involved**. For conversational
+`where_am_i` works everywhere and tells the agent which surface you're on. So do the sidebar
+tools: `list_sidebar` reads YouTube's left navigation menu (Home, Shorts, Subscriptions,
+History…) aloud, and `open_sidebar_item` navigates to one by name ("go to subscriptions").
+Direct commands (play, pause, search, browse…) are **deterministic — no AI involved**. For conversational
 replies the agent can use **Chrome's on-device Gemini Nano** (no API key) or an optional
 **bring-your-own-key Gemini API fallback** (your key, stored only in your browser); both
 are **off by default** behind a kill switch — see [`src/agent/`](src/agent/).

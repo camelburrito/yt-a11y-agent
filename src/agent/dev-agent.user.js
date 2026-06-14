@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube A11y Agent — Dev Consumer + Voice (Gemini Nano)
 // @namespace    https://github.com/camelburrito/yt-a11y-agent
-// @version      0.10.1
+// @version      0.10.2
 // @description  In-page DEV harness that consumes the WebMCP tools registered by the provider userscript and drives them with Chrome's built-in on-device Gemini Nano (Prompt API) + Web Speech, with an opt-in BYOK cloud-Gemini fallback. Simulates the browser/AT opt-in handoff via ytAgent.activate(). Not the production client — see docs/HANDOFF.md.
 // @author       camelburrito
 // @match        https://www.youtube.com/*
@@ -1308,9 +1308,11 @@
     return null;
   }
   function helpText() {
-    if (location.pathname.startsWith("/watch") || location.pathname.startsWith("/shorts"))
+    if (location.pathname.startsWith("/shorts"))
+      return "On Shorts you can say: next or previous to move between shorts, play, pause, skip forward, skip back, captions on or off, or go home. Say repeat to hear something again, or slower and faster to change my speed.";
+    if (location.pathname.startsWith("/watch"))
       return "On this video you can say: play, pause, skip forward, skip back, captions on, captions off, next video, picture in picture, or go home. Say repeat to hear something again, or slower and faster to change my speed.";
-    return "You can say: list videos, open and a number, next, previous, search for something, load more, or go home. Say a category name like Music to filter. Say repeat, slower, or faster anytime.";
+    return "You can say: list videos, open and a number, next, previous, search for something, watch shorts, load more, or go home. Say a category name like Music to filter. Say repeat, slower, or faster anytime.";
   }
   // Strip emoji/symbols and trim over-long tails so spoken replies stay short and the local TTS
   // engine doesn't grind (a wall of long, mixed-script + emoji titles was a ~6s utterance).
@@ -1413,6 +1415,7 @@
     if (t.startsWith("[")) return "";
     const path = location.pathname;
     const onWatch = path.startsWith("/watch") || path.startsWith("/shorts");
+    const onShorts = path.startsWith("/shorts");
     const onList = path === "/" || path.startsWith("/feed") || path.startsWith("/results");
 
     // Ergonomics (any surface)
@@ -1427,6 +1430,14 @@
     // Navigation
     if (/^(go )?home$|take me home/.test(t)) { try { sessionStorage.setItem("ytA11yPending", "You're on the home page."); } catch (_) {} await voice.speak("Going home."); location.href = "https://www.youtube.com/"; return ""; }
     if (/^(go back|previous page)$/.test(t)) { await voice.speak("Going back."); history.back(); return ""; }
+    // Open the Shorts feed from any surface. /shorts/ redirects to the first short; the pending
+    // message coaches the next/previous gesture on arrival (sessionStorage survives the load).
+    if (/^(open |go to |watch |show |play )?shorts( feed)?$/.test(t)) {
+      try { sessionStorage.setItem("ytA11yPending", "You're on Shorts. Say next or previous to move between videos, play or pause to control this one, or go home to leave."); } catch (_) {}
+      await voice.speak("Opening Shorts.");
+      location.href = "https://www.youtube.com/shorts/";
+      return "";
+    }
     {
       const m = t.match(/^(?:search(?: for)?|find|look up|search up) (.+)$/);
       if (m) {
@@ -1442,6 +1453,17 @@
         location.href = url;
         return "";
       }
+    }
+
+    // Sidebar / guide menu. MUST be matched before "open by number" below, or "open
+    // subscriptions" gets swallowed by the open-N handler ("open" + onList → "which number?").
+    if (/^(open |show |read |what'?s in )?(the )?(side ?bar|side menu|main menu|guide menu|nav(igation)? menu|menu)$/.test(t))
+      return await callText("list_sidebar");
+    {
+      const m = t.match(
+        /^(?:go to|open|show|take me to)\s+(?:my\s+)?(subscriptions?|history|library|watch later|liked(?: videos)?|playlists?|your videos|trending|explore|music|movies?(?: & tv| and tv)?|premium)$/
+      );
+      if (m) return await callText("open_sidebar_item", { name: m[1] });
     }
 
     // Open by number (home / search / up-next)
@@ -1501,6 +1523,14 @@
       if (!consumer.has("enter_pip")) return "That isn't available on this page.";
       armGestureRelay("enter_pip");
       return "Press the Enter key and I'll pop the video out into a floating window.";
+    }
+
+    // Shorts vertical feed: next/previous move BETWEEN shorts (not the up-next sidebar, which is
+    // empty here). Matched before the generic `next`→play_next handler below so Shorts wins on
+    // /shorts. play/pause/seek still fall through to the playback block and control the short.
+    if (onShorts) {
+      if (/^(next|next short|next one|next video|skip|down|forward)$/.test(t)) return await callText("next_short");
+      if (/^(previous|previous short|prev|back|back one|up|go up|last( one)?)$/.test(t)) return await callText("prev_short");
     }
 
     // Playback controls — handled on EVERY surface, never gated behind onWatch. A missed media
@@ -1617,7 +1647,9 @@
       const feedLine = items.length ? ` Top videos: ${items.slice(0, 3).map((v) => speakableTitle(v.title)).join("; ")}.` : "";
       const catLine = cats.length ? ` Categories you can pick: ${cats.slice(0, 6).join(", ")}.` : "";
       reply = `${hello} You're on the YouTube home page.${feedLine}${catLine} Use the up and down arrow keys to browse videos one at a time, name a category to filter, or say "search" and what you're looking for. What would you like to do?`;
-    } else if (path.startsWith("/watch") || path.startsWith("/shorts")) {
+    } else if (path.startsWith("/shorts")) {
+      reply = `${hello} You're on Shorts. Say next or previous to move between shorts, play or pause to control this one, captions on or off, or go home. What would you like to do?`;
+    } else if (path.startsWith("/watch")) {
       reply = `${hello} You're on a video. Say play, pause, skip forward, skip back, captions on or off, next video, or go home. What would you like to do?`;
     } else if (path.startsWith("/results")) {
       reply = `${hello} You're on the search results. Use the up and down arrow keys to browse results, say "open" with a number, or search for something else. What would you like to do?`;

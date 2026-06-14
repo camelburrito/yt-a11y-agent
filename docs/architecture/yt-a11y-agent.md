@@ -93,6 +93,8 @@ flowchart TB
       wnext[watchNextTools]
       comments[commentsTools]
       pip[pipTools]
+      shorts[shortsTools]
+      sidebar[sidebarTools]
       whoami[whereAmITool]
     end
   end
@@ -106,7 +108,9 @@ flowchart TB
   goes blank, `SEL` is the first place to look (YouTube renames classes often).
 - **`detectSurface(pathname)`** — `/`|`/feed*`→home, `/results`→search, `/watch`|`/shorts`→watch,
   `/@`·`/channel/`·`/c/`→channel, else other. (Shorts maps to watch: it has a `<video>`, so
-  `playback_control` works via the generic `video` selector; sidebar/transcript tools no-op.)
+  `playback_control` works via the generic `video` selector; sidebar/transcript tools no-op.
+  Shorts also gets `next_short`/`prev_short`, which actuate YouTube's native up/down feed-nav
+  arrows and no-op off `/shorts`.)
 - **Route-scoped registration** — see next diagram.
 
 ### Route-scoped registration (AbortController)
@@ -138,11 +142,12 @@ bookkeeping. Tools are re-created fresh each route via the `*Tools()` factories.
 
 | Surface | Tools |
 |---------|-------|
-| every route | `where_am_i`, `get_account` |
+| every route | `where_am_i`, `get_account`, `list_sidebar`, `open_sidebar_item` |
 | home (`/`, `/feed*`) | `list_home_feed`, `describe_home`, `open_video`, `load_more_home`, `list_categories`, `select_category` |
 | search (`/results`) | `run_search`, `list_results`, `refine_search`, `open_result` |
 | watch (`/watch` or `/shorts`) | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` |
 | watch-next (`/watch`) | `list_up_next`, `play_next`, `set_autoplay` |
+| shorts (`/shorts`) | `next_short`, `prev_short` (registered on every watch route; no-op off `/shorts`) |
 | comments (`/watch`) | `get_comments`, `summarize_comments`, `get_pinned_comment` |
 | pip (`/watch`) | `enter_pip`, `exit_pip` |
 

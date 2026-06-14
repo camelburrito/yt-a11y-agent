@@ -199,9 +199,10 @@ control (offer, don't autoplay).**
 | search | `/results` | `run_search`, `list_results`, `refine_search`, `open_result` | ✅ verified live |
 | watch | `/watch` or `/shorts` | `get_video_info`, `get_transcript`, `summarize_video`, `plain_language_summary`, `jump_to`, `playback_control`, `set_captions` | ✅ verified live (transcript-open best-effort). Shorts resolves to this surface (generic `video` selector → play/pause/seek work; sidebar/transcript no-op). |
 | watch-next | `/watch` | `list_up_next`, `play_next`, `set_autoplay` | ✅ verified live |
+| shorts | `/shorts` (same surface) | `next_short`, `prev_short` — actuate YouTube's native up/down feed-nav arrows (`SEL.shorts`); registered on every watch route, no-op off `/shorts`. Agent: "watch shorts" → `/shorts/`; on `/shorts` "next"/"previous" route here (not `play_next`). | ✅ buttons verified live 2026-06-13 (`npm run verify:selectors`); volatile ids — re-verify if next/prev stops moving |
 | comments | `/watch` | `get_comments`, `summarize_comments`, `get_pinned_comment` | ✅ verified live |
 | pip | `/watch` | `enter_pip`, `exit_pip` | ✅ gesture path measured (q. c resolved); voice flow = "picture in picture" → press Enter (gesture relay) |
-| (every route) | — | `where_am_i` ✅; `get_account` ✅ (`signedIn` reliable; `name` is null — only in the account menu, which we don't open) | ✅ |
+| (every route) | — | `where_am_i` ✅; `get_account` ✅ (`signedIn` reliable; `name` is null — only in the account menu, which we don't open); `list_sidebar` / `open_sidebar_item` (`SEL.guide` — reads/navigates the left guide drawer; opens the native drawer on `/watch` where it's not hydrated) | ✅ verified live 2026-06-13 |
 | (agent, list surfaces) | home + search | arrow-key browse mode (`startBrowse`): Down/Up move, Enter plays, Escape exits (an arrow re-arms — never a keyboard dead end); + personalized welcome (`get_account`) | new — verify interactively |
 | home (planned) | | `list_categories`, `open_category` (filter chip bar) | ⬜ |
 

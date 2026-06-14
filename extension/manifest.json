@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "YouTube A11y Agent (WebMCP)",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "In-browser accessibility agent for YouTube: WebMCP tools + voice control, with optional on-device Gemini Nano or bring-your-own-key Gemini API. Read-and-act only; never mutates the page or its a11y tree.",
   "permissions": ["storage"],
   "host_permissions": [
